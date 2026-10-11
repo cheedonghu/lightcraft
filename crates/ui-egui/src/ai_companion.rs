@@ -1,63 +1,101 @@
-//! A native, single-round Photo Companion prototype. Only the local backend knows the model.
+//! Photo-bound conversations and the native Photo Companion round protocol.
+mod archive;
+#[cfg(test)]
+#[path = "ai_companion/disconnect_tests.rs"]
+mod disconnect_tests;
+mod network;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use base64ct::{Base64, Encoding};
 use lightcraft_catalog::PhotoId;
 use lightcraft_develop::DevelopSettings;
-use lightcraft_engine::media::RenderJob;
+use lightcraft_engine::media::{RenderJob, RenderResult};
 use serde_json::{Value, json};
 
 use crate::LightcraftApp;
 
-#[derive(Default)]
 pub struct State {
     open: bool,
     consent: bool,
     prompt: String,
     pub text: String,
-    job: Option<Job>,
-    last: Option<Checkpoint>,
+    generation: u64,
     serial: u64,
-    worker_alive: Option<Arc<AtomicBool>>,
+    connection: Option<network::Connection>,
+    conversations: BTreeMap<PhotoId, Conversation>,
+    jobs: BTreeMap<PhotoId, Job>,
+    workers: BTreeMap<PhotoId, Arc<AtomicBool>>,
+    tx: mpsc::SyncSender<WorkerMessage>,
+    rx: mpsc::Receiver<WorkerMessage>,
 }
-
+impl Default for State {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::sync_channel(8);
+        Self {
+            open: false,
+            consent: false,
+            prompt: String::new(),
+            text: String::new(),
+            generation: 0,
+            serial: 0,
+            connection: None,
+            conversations: BTreeMap::new(),
+            jobs: BTreeMap::new(),
+            workers: BTreeMap::new(),
+            tx,
+            rx,
+        }
+    }
+}
+#[derive(Default)]
+struct Conversation {
+    messages: Vec<Value>,
+    rounds: Vec<Value>,
+    pending: BTreeMap<String, String>,
+    notice: String,
+    checkpoint: Option<Checkpoint>,
+}
+#[derive(Clone)]
 struct Checkpoint {
     photo: PhotoId,
     generation: u64,
     original: Arc<DevelopSettings>,
     expected: Arc<DevelopSettings>,
+    revision: u64,
     content: String,
+    eligible: bool,
 }
-
 struct Job {
+    seq: u64,
+    round: String,
+    state: String,
+    prompt: String,
+    user_message: usize,
+    history: Vec<Value>,
     checkpoint: Checkpoint,
     cancel: Arc<AtomicBool>,
-    rx: mpsc::Receiver<Message>,
-    started: Instant,
+    snapshot: Option<Arc<Snapshot>>,
+    plans: BTreeMap<String, Value>,
+    stopped: bool,
+    inflight_plan: Option<String>,
 }
-
 impl Drop for Job {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 }
-
-enum Message {
-    Applied { settings: Arc<DevelopSettings>, text: String, ack: mpsc::Sender<bool> },
-    Finished(Result<String, String>),
+struct Snapshot {
+    result: RenderResult,
+    preview: Value,
+    context: lightcraft_engine::companion::CandidateContext,
 }
-
-impl State {
-    pub fn busy_photo(&self) -> Option<PhotoId> {
-        self.job.as_ref().map(|j| j.checkpoint.photo)
-    }
-
-    fn worker_busy(&self) -> bool {
-        self.worker_alive.as_ref().is_some_and(|alive| alive.load(Ordering::Relaxed))
-    }
+enum WorkerMessage {
+    Prepared { photo: PhotoId, generation: u64, seq: u64, plan: Option<Value>, settings: Arc<DevelopSettings>, result: Result<Snapshot, String> },
 }
-
 struct WorkerAlive(Arc<AtomicBool>);
 impl Drop for WorkerAlive {
     fn drop(&mut self) {
@@ -65,103 +103,715 @@ impl Drop for WorkerAlive {
     }
 }
 
-pub fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
-    if !app.ai.open && !matches!(app.ui.right, crate::state::RightPanel::Edit) {
-        return;
+impl State {
+    pub fn is_busy(&self, photo: PhotoId) -> bool {
+        self.jobs.get(&photo).is_some_and(|j| !j.stopped)
     }
-    egui::Frame::NONE.inner_margin(egui::Margin::same(16)).show(ui, |ui| {
-        let response = ui.button("AI 点评并优化");
-        crate::widgets::register(ui.ctx(), "button:aiOpen", response.rect);
-        if response.clicked() {
-            let _ = app.run("ai.open", json!({}));
+    fn worker_busy(&self, photo: PhotoId) -> bool {
+        self.workers.get(&photo).is_some_and(|a| a.load(Ordering::Relaxed))
+    }
+    fn send(&self, path: String, body: Value, submission: u64, round: String) -> Result<(), String> {
+        self.connection
+            .as_ref()
+            .ok_or("AI 事件连接尚未建立。")?
+            .requests
+            .try_send(network::Request { path, body, submission, round })
+            .map_err(|_| "AI 请求交付积压，请稍候；未自动重试。".into())
+    }
+    fn start(&mut self, app: &mut LightcraftApp) -> Result<Value, String> {
+        if cfg!(target_arch = "wasm32") {
+            return Err("AI 助手目前仅支持桌面版。".into());
         }
-        if !app.ai.open {
-            return;
+        if !self.consent {
+            return Err("请先同意发送压缩预览。".into());
         }
-        ui.label("理解照片并自然优化。本次仅调整曝光，保留其他编辑。");
-        let input =
-            ui.add_enabled(app.ai.job.is_none(), egui::TextEdit::multiline(&mut app.ai.prompt).desired_rows(2).hint_text("例如：让画面自然明亮一些"));
-        crate::widgets::register(ui.ctx(), "field:aiPrompt", input.rect);
-        if app.ai.job.is_none() {
-            let response = ui.checkbox(&mut app.ai.consent, "同意将压缩预览发送给云端模型；原始照片留在本机");
-            crate::widgets::register(ui.ctx(), "checkbox:aiConsent", response.rect);
-            let start = ui.add_enabled(app.ai.consent && !app.ai.worker_busy() && !cfg!(target_arch = "wasm32"), egui::Button::new("点评并优化"));
-            crate::widgets::register(ui.ctx(), "button:aiStart", start.rect);
-            if start.clicked()
-                && let Err(e) = app.run("ai.start", json!({}))
-            {
-                app.ai.text = e;
-            }
-            if app.ai.worker_busy() {
-                ui.label("正在结束上一轮处理…");
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
-            }
-            if app.ai.last.as_ref().is_some_and(|c| c.photo == photo) {
-                let undo = ui.button("撤回本轮");
-                crate::widgets::register(ui.ctx(), "button:aiUndo", undo.rect);
-                if undo.clicked()
-                    && let Err(e) = app.run("ai.undo", json!({}))
-                {
-                    app.ai.text = e;
+        let photo = app.session.active().ok_or("请先选择一张照片。")?;
+        if self.jobs.contains_key(&photo) || self.worker_busy(photo) {
+            return Err("此照片仍在处理，请停止或等待结束。".into());
+        }
+        if self.jobs.len() >= 16 {
+            return Err("本机等待照片已满，请稍候。".into());
+        }
+        let history = self.history(app, photo)?;
+        app.session.end_interaction().map_err(|e| e.to_string())?;
+        let original = app.session.develop_of(photo).ok_or("照片不存在。")?;
+        let content = app.session.catalog.photo(photo).map(|p| lightcraft_engine::media::content_key(p)).ok_or("照片不存在。")?;
+        let prompt = if self.prompt.trim().is_empty() { "请点评这张照片，并自然优化。".into() } else { self.prompt.clone() };
+        if prompt.len() > 4096 {
+            return Err("请求过长。".into());
+        }
+        if self.connection.as_ref().is_some_and(|c| !c.alive.load(Ordering::Relaxed)) {
+            self.connection = None;
+        }
+        if self.connection.is_none() {
+            self.connection = Some(network::connect(&std::env::var("PHOTO_COMPANION_ADDR").unwrap_or_else(|_| "127.0.0.1:18080".into()))?);
+        }
+        self.serial = self.serial.checked_add(1).ok_or("AI 提交编号耗尽，请重新启动客户端。")?;
+        let generation = app.session.library_generation();
+        let revision = app.session.photo_revision(photo);
+        self.send(
+            "/v1/rounds".into(),
+            json!({"submission_seq":self.serial,"photo_ref":{"library_generation":generation,"photo_id":photo.0},"photo_revision":revision}),
+            self.serial,
+            String::new(),
+        )?;
+        self.jobs.insert(
+            photo,
+            Job {
+                seq: self.serial,
+                round: String::new(),
+                state: "submitting".into(),
+                prompt: prompt.clone(),
+                user_message: self.conversations.get(&photo).map(|c| c.messages.len()).unwrap_or(0),
+                history,
+                checkpoint: Checkpoint { photo, generation, original: original.clone(), expected: original, revision, content, eligible: true },
+                cancel: Arc::new(AtomicBool::new(false)),
+                snapshot: None,
+                plans: BTreeMap::new(),
+                stopped: false,
+                inflight_plan: None,
+            },
+        );
+        let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+        conversation.messages.push(json!({"role":"user","text":prompt}));
+        conversation.notice = "正在提交…".into();
+        self.save(app, photo)?;
+        Ok(json!({"started":true,"photo":photo.0}))
+    }
+    fn spawn(&mut self, app: &mut LightcraftApp, photo: PhotoId, plan: Option<Value>, settings: Arc<DevelopSettings>) -> Result<(), String> {
+        if self.worker_busy(photo) || self.workers.values().filter(|a| a.load(Ordering::Relaxed)).count() >= 4 {
+            return Err("本机渲染资源忙，请稍后重新发起。".into());
+        }
+        let job = self.jobs.get(&photo).ok_or("AI 轮次不存在。")?;
+        let mut render = app.session.candidate_job(photo, settings.clone(), 640)?;
+        render.request_id = self.serial;
+        let seq = job.seq;
+        let generation = job.checkpoint.generation;
+        let cancel = job.cancel.clone();
+        let tx = self.tx.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let guard = WorkerAlive(alive.clone());
+        std::thread::Builder::new()
+            .name("photo-companion-render".into())
+            .spawn(move || {
+                let _guard = guard;
+                let result = render_snapshot(render, &cancel);
+                let message = WorkerMessage::Prepared { photo, generation, seq, plan, settings, result };
+                // At most four workers and eight result slots; never wait on a stopped UI.
+                if tx.try_send(message).is_err() {
+                    cancel.store(true, Ordering::Relaxed);
                 }
+            })
+            .map_err(|_| "无法启动 AI 渲染。")?;
+        self.workers.insert(photo, alive);
+        Ok(())
+    }
+    fn stop(&mut self, photo: PhotoId) -> Result<Value, String> {
+        let round = if let Some(job) = self.jobs.get_mut(&photo) {
+            job.stopped = true;
+            job.cancel.store(true, Ordering::Relaxed);
+            job.round.clone()
+        } else {
+            return Ok(Value::Null);
+        };
+        if !round.is_empty() {
+            if self.send(format!("/v1/rounds/{round}/stop"), json!({"reason":"user_stop"}), 0, round).is_err() {
+                self.connection = None;
             }
         } else {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("正在分析、渲染或复查…");
-                let stop = ui.button("停止生成");
-                crate::widgets::register(ui.ctx(), "button:aiStop", stop.rect);
-                if stop.clicked() {
-                    let _ = app.run("ai.stop", json!({}));
+            // Keep the submission identity until its admission event supplies
+            // the round id. A new request cannot overtake its cancellation.
+            if let Some(conversation) = self.conversations.get_mut(&photo) {
+                conversation.pending.clear();
+                close_pending_tools(&mut conversation.messages);
+                conversation.notice = "已停止生成，正在确认取消提交。".into();
+            }
+            return Ok(Value::Null);
+        }
+        self.finish(photo, "已停止生成，保留最近一次完整结果。");
+        Ok(Value::Null)
+    }
+    fn finish(&mut self, photo: PhotoId, notice: &str) {
+        if let Some(job) = self.jobs.remove(&photo)
+            && let Some(conversation) = self.conversations.get_mut(&photo)
+        {
+            if !job.plans.is_empty() {
+                conversation.checkpoint = Some(job.checkpoint.clone());
+            }
+            conversation.pending.clear();
+            close_pending_tools(&mut conversation.messages);
+            conversation.notice = notice.into();
+        }
+    }
+    fn server(&mut self, app: &mut LightcraftApp, ctx: &egui::Context, kind: &str, data: &Value) -> Result<(), String> {
+        let round = data.get("round_id").and_then(Value::as_str).ok_or("AI 事件缺少轮次。")?;
+        let payload = data.get("payload").ok_or("AI 事件缺少内容。")?;
+        let photo = if kind == "round.state" {
+            let seq = payload.get("submission_seq").and_then(Value::as_u64).ok_or("AI 提交关联无效。")?;
+            let Some(photo) = self.jobs.iter().find_map(|(p, j)| (j.seq == seq).then_some(*p)) else {
+                return Ok(());
+            };
+            let job = self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?;
+            if payload.pointer("/photo_ref/photo_id").and_then(Value::as_u64) != Some(photo.0)
+                || payload.pointer("/photo_ref/library_generation").and_then(Value::as_u64) != Some(job.checkpoint.generation)
+                || (!job.round.is_empty() && job.round != round)
+            {
+                return Err("AI 状态属于其他照片。".into());
+            }
+            job.round = round.into();
+            if job.stopped {
+                if self.send(format!("/v1/rounds/{round}/stop"), json!({"reason":"user_stop"}), 0, round.into()).is_err() {
+                    self.connection = None;
                 }
-            });
-        }
-        if !app.ai.text.is_empty() {
-            ui.label(&app.ai.text);
-        }
-    });
-}
-
-pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
-    match id {
-        "ai.open" => {
-            app.ai.open = true;
-            Some(Ok(Value::Null))
-        }
-        "ai.status" => Some(Ok(
-            json!({"busy":app.ai.job.is_some(),"workerBusy":app.ai.worker_busy(),"photo":app.ai.busy_photo().map(|p|p.0),"text":app.ai.text}),
-        )),
-        "ai.start" => {
-            if params.get("consent").and_then(Value::as_bool) == Some(true) {
-                app.ai.consent = true;
+                self.finish(photo, "已停止生成，保留最近一次完整结果。");
+                self.save(app, photo)?;
+                return Ok(());
             }
-            if let Some(prompt) = params.get("prompt").and_then(Value::as_str) {
-                app.ai.prompt = prompt.into();
-            }
-            Some(start(app))
+            photo
+        } else {
+            let Some(photo) = self.jobs.iter().find_map(|(p, j)| (j.round == round).then_some(*p)) else {
+                return Ok(());
+            };
+            photo
+        };
+        if self.jobs.get(&photo).is_none_or(|j| !current(app, &j.checkpoint) || j.stopped) {
+            let _ = self.stop(photo);
+            return Ok(());
         }
-        "ai.stop" => {
-            if let Some(job) = app.ai.job.take() {
-                app.ai.last = Some(clone_checkpoint(&job.checkpoint));
+        match kind {
+            "round.state" => {
+                let state = payload.get("state").and_then(Value::as_str).ok_or("AI 状态无效。")?.to_owned();
+                let job = self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?;
+                let old = std::mem::replace(&mut job.state, state.clone());
+                if state == "awaiting_input" && old != state {
+                    let settings = job.checkpoint.expected.clone();
+                    self.spawn(app, photo, None, settings)?;
+                }
             }
-            app.ai.text.push_str("\n已停止生成，保留最近一次完整结果。");
-            Some(Ok(Value::Null))
+            "text.delta" => {
+                let id = payload.get("message_id").and_then(Value::as_str).ok_or("AI 消息编号缺失。")?;
+                let delta = payload.get("delta").and_then(Value::as_str).ok_or("AI 消息内容缺失。")?;
+                if delta.len() > 8192 {
+                    return Err("AI 文字增量过大。".into());
+                }
+                let message = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?.pending.entry(id.into()).or_default();
+                if message.len().saturating_add(delta.len()) > 1024 * 1024 {
+                    return Err("AI 文字超过限制。".into());
+                }
+                message.push_str(delta);
+            }
+            "message.completed" => {
+                let id = payload.get("message_id").and_then(Value::as_str).ok_or("AI 消息编号缺失。")?;
+                let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+                let text = conversation.pending.remove(id).unwrap_or_default();
+                let calls = payload.get("tool_calls").filter(|v| !v.is_null()).cloned().unwrap_or_else(|| json!([]));
+                if !calls.is_array() {
+                    return Err("AI 工具消息无效。".into());
+                }
+                conversation.messages.push(json!({"role":"assistant","text":text,"tool_calls":calls}));
+                self.save(app, photo)?;
+            }
+            "tool.request" => {
+                self.tool(app, photo, payload)?;
+            }
+            "edit.plan" => {
+                let plan_id = payload.get("plan_id").and_then(Value::as_str).ok_or("AI 方案编号缺失。")?;
+                if let Some(previous) = self.jobs.get(&photo).and_then(|j| j.plans.get(plan_id)).cloned() {
+                    return self.send(format!("/v1/rounds/{round}/execution"), previous, 0, round.into());
+                }
+                let job = self.jobs.get(&photo).ok_or("AI 轮次已结束。")?;
+                if job.inflight_plan.as_deref() == Some(plan_id) {
+                    return Ok(());
+                }
+                if job.inflight_plan.is_some()
+                    || job.plans.len() >= 2
+                    || !matches!(job.state.as_str(), "awaiting_initial_execution" | "awaiting_correction_execution")
+                {
+                    return Err("AI 方案阶段或次数不匹配。".into());
+                }
+                if payload.get("expected_revision").and_then(Value::as_u64) != Some(job.checkpoint.revision)
+                    || payload.get("capability_version").and_then(Value::as_str) != Some("lightcraft-v2")
+                {
+                    return Err("AI 方案与当前照片状态不匹配。".into());
+                }
+                let snapshot = job.snapshot.as_ref().ok_or("当前预览未就绪。")?;
+                let candidate = lightcraft_engine::companion::candidate(&job.checkpoint.expected, payload, &snapshot.context)?;
+                self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?.inflight_plan = Some(plan_id.into());
+                if let Some(id) = payload.get("tool_call_id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    self.conversations
+                        .get_mut(&photo)
+                        .ok_or("AI 会话不存在。")?
+                        .messages
+                        .push(json!({"role":"tool","text":"plan_proposed; await actual client execution feedback","tool_call_id":id}));
+                }
+                self.spawn(app, photo, Some(payload.clone()), Arc::new(candidate))?;
+            }
+            "round.ended" => {
+                let state = payload.get("terminal_state").and_then(Value::as_str).unwrap_or("failed");
+                let reason = payload.get("reason_code").and_then(Value::as_str).unwrap_or("unknown");
+                let trace = data.get("trace_id").and_then(Value::as_str).unwrap_or("-");
+                let notice = if state == "completed" {
+                    "本轮完成。".to_owned()
+                } else if reason == "context_full" {
+                    format!("上下文满了，本轮已结束；未自动删减或重试。traceId={trace}")
+                } else {
+                    format!("处理未完成：{reason}; traceId={trace}。保留最近一次完整结果。")
+                };
+                self.finish(photo, &notice);
+                self.save(app, photo)?;
+            }
+            _ => return Err("AI 事件类型不支持。".into()),
         }
-        "ai.undo" => Some(undo(app)),
-        _ => None,
+        ctx.request_repaint();
+        Ok(())
+    }
+    fn tool(&mut self, app: &mut LightcraftApp, photo: PhotoId, payload: &Value) -> Result<(), String> {
+        let job = self.jobs.get(&photo).ok_or("AI 轮次已结束。")?;
+        let request = payload.get("tool_request_id").and_then(Value::as_str).ok_or("AI 工具编号缺失。")?;
+        if payload.get("expected_revision").and_then(Value::as_u64) != Some(job.checkpoint.revision) {
+            return Err("AI 读取版本不匹配。".into());
+        }
+        let snapshot = job.snapshot.as_ref().ok_or("实际照片预览尚未就绪。")?;
+        let name = payload.get("tool_name").and_then(Value::as_str).ok_or("AI 工具名称缺失。")?;
+        let mut images = json!([]);
+        let text = match name {
+            "get_photo_state" => json!({"photo_revision":job.checkpoint.revision,"settings":job.checkpoint.expected}),
+            "list_edit_controls" => {
+                json!({"controls":lightcraft_engine::companion::control_list(&job.checkpoint.expected,&snapshot.context.info),"edit_schemas":lightcraft_engine::companion::operation_schemas(&job.checkpoint.expected),"frame_id":snapshot.context.frame_id})
+            }
+            "get_current_preview" => {
+                images = json!([{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]);
+                json!({"photo_revision":job.checkpoint.revision,"width":snapshot.preview["width"],"height":snapshot.preview["height"],"frame_id":snapshot.context.frame_id})
+            }
+            "get_photo_histogram" => {
+                let rendered = snapshot.result.rendered.as_ref().map_err(Clone::clone)?;
+                let (shadow, highlight) = rendered.histogram.clipping();
+                json!({"photo_revision":job.checkpoint.revision,"space":"display_srgb","histogram":rendered.histogram,"mean_luma":rendered.histogram.mean_luma(),"shadow_clipped":shadow,"highlight_clipped":highlight})
+            }
+            "list_manual_masks" => {
+                json!({"masks":job.checkpoint.expected.masks.iter().filter(|m|lightcraft_engine::companion::is_manual(m)).map(|m|json!({"ref":format!("mask-{}",m.id),"mask":m})).collect::<Vec<_>>(),"frame_id":snapshot.context.frame_id,"coordinate_space":"native_normalized"})
+            }
+            "sample_photo_color" => {
+                let args = payload.get("args").ok_or("取样参数缺失。")?;
+                lightcraft_engine::companion::sample(&snapshot.context, &job.checkpoint.expected, args)?
+            }
+            _ => return Err("AI 请求了未开放的工具。".into()),
+        };
+        let result = json!({"text":text.to_string(),"images":images});
+        let round = job.round.clone();
+        let revision = job.checkpoint.revision;
+        self.send(
+            format!("/v1/rounds/{round}/tool-results"),
+            json!({"tool_request_id":request,"photo_revision":revision,"outcome":"succeeded","result":result}),
+            0,
+            round,
+        )?;
+        let id = payload.get("tool_call_id").and_then(Value::as_str).ok_or("AI 工具关联缺失。")?;
+        self.conversations
+            .get_mut(&photo)
+            .ok_or("AI 会话不存在。")?
+            .messages
+            .push(json!({"role":"tool","text":result["text"],"images":result["images"],"tool_call_id":id}));
+        self.save(app, photo)
+    }
+    fn prepared(&mut self, app: &mut LightcraftApp, ctx: &egui::Context, message: WorkerMessage) -> Result<(), String> {
+        let WorkerMessage::Prepared { photo, generation, seq, plan, settings, result } = message;
+        let Some(job) = self.jobs.get(&photo) else {
+            return Ok(());
+        };
+        if job.seq != seq || job.checkpoint.generation != generation {
+            return Ok(());
+        }
+        if job.cancel.load(Ordering::Relaxed) || !current(app, &job.checkpoint) {
+            self.stop(photo)?;
+            return Ok(());
+        }
+        if self.connection.as_ref().is_none_or(|connection| !connection.alive.load(Ordering::Relaxed)) {
+            return Err("AI 事件连接已结束，未发布迟到候选。".into());
+        }
+        let snapshot = match result {
+            Ok(mut s) => {
+                app.session.accept(&s.result);
+                s.result.loaded = None;
+                Arc::new(s)
+            }
+            Err(error) => {
+                if let Some(plan) = &plan {
+                    let round = job.round.clone();
+                    self.send(
+                        format!("/v1/rounds/{round}/execution"),
+                        json!({"plan_id":plan["plan_id"],"outcome":"failed","photo_revision":job.checkpoint.revision,"reason_code":"render_failed"}),
+                        0,
+                        round,
+                    )?;
+                }
+                self.finish(photo, &format!("处理未完成：{error}。保留最近完整结果。"));
+                return self.save(app, photo);
+            }
+        };
+        let round = job.round.clone();
+        let revision = job.checkpoint.revision;
+        if let Some(plan) = plan {
+            let rendered = snapshot.result.rendered.as_ref().map_err(Clone::clone)?;
+            let op = app.session.develop_op(photo, (*settings).clone(), "AI edit plan").ok_or("照片不存在。")?;
+            app.session.commit("AI edit plan", op).map_err(|e| e.to_string())?;
+            app.session.accept(&snapshot.result);
+            app.renderer.publish_companion(ctx, photo, snapshot.result.key, rendered, app.session.active() == Some(photo));
+            let new_revision = app.session.photo_revision(photo);
+            let feedback = json!({"plan_id":plan["plan_id"],"outcome":"succeeded","photo_revision":new_revision,"actual_state":settings,"preview":snapshot.preview});
+            let job = self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?;
+            job.checkpoint.expected = settings.clone();
+            job.checkpoint.revision = new_revision;
+            let plan_id = plan.get("plan_id").and_then(Value::as_str).ok_or("AI 方案编号缺失。")?.to_owned();
+            job.plans.insert(plan_id.clone(), feedback.clone());
+            job.snapshot = Some(snapshot.clone());
+            job.inflight_plan = None;
+            let checkpoint = job.checkpoint.clone();
+            let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+            conversation.checkpoint = Some(checkpoint.clone());
+            conversation.messages.push(json!({"role":"user","text":format!("Actual execution feedback: {}",json!({"outcome":"succeeded","actual_state":settings,"photo_revision":new_revision})),"images":[{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]}));
+            conversation.rounds.push(
+                json!({"round_id":round,"plan_id":plan_id,"original":checkpoint.original,"actual_state":settings,"operations":plan["operations"]}),
+            );
+            // A failed POST retains the actual visible result; never roll back on network failure.
+            self.send(format!("/v1/rounds/{round}/execution"), feedback, 0, round)?;
+            self.save(app, photo)?;
+        } else {
+            let job = self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?;
+            job.snapshot = Some(snapshot.clone());
+            let input = json!({"input_id":format!("input-{seq}"),"photo_revision":revision,"prompt":job.prompt,"current_state":settings,"preview":snapshot.preview,"history":job.history,"capabilities":capabilities(&settings)});
+            let message =
+                self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?.messages.get_mut(job.user_message).ok_or("AI 用户请求缺失。")?;
+            *message = json!({"role":"user","text":format!("{}\nActual photo state: {}",job.prompt,settings.to_json()),"images":[{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]});
+            self.send(format!("/v1/rounds/{round}/input"), input, 0, round)?;
+            self.save(app, photo)?;
+        }
+        Ok(())
+    }
+    fn poll_inner(&mut self, app: &mut LightcraftApp, ctx: &egui::Context) {
+        let generation = app.session.library_generation();
+        if self.generation != generation {
+            let photos: Vec<_> = self.jobs.keys().copied().collect();
+            for photo in photos {
+                let _ = self.stop(photo);
+            }
+            self.conversations.clear();
+            self.generation = generation;
+        }
+        self.workers.retain(|_, alive| alive.load(Ordering::Relaxed));
+        if self.open
+            && let Some(photo) = app.session.active()
+            && let Err(error) = self.load(app, photo)
+        {
+            self.text = error;
+        }
+        loop {
+            let event = self.connection.as_ref().and_then(|c| c.events.try_recv().ok());
+            let Some(event) = event else {
+                break;
+            };
+            let result = match event {
+                network::Event::Connected { client, connection } => {
+                    let _ = (client, connection);
+                    Ok(())
+                }
+                network::Event::Server { kind, data } => {
+                    let target = self.jobs.iter().find_map(|(p, j)| {
+                        (data.get("round_id").and_then(Value::as_str) == Some(j.round.as_str())
+                            || data.pointer("/payload/submission_seq").and_then(Value::as_u64) == Some(j.seq))
+                        .then_some(*p)
+                    });
+                    if let Err(error) = self.server(app, ctx, &kind, &data) {
+                        if let Some(photo) = target {
+                            self.fail_one(app, photo, &error);
+                        } else {
+                            self.text = error;
+                        }
+                    }
+                    Ok(())
+                }
+                network::Event::Response { submission, round, path, result } => {
+                    if let Err(error) = result {
+                        if path.ends_with("/stop") || (submission != 0 && !error.rejected) {
+                            // A failed creation POST may have been accepted. Disconnect
+                            // rather than abandon an unidentifiable server task.
+                            self.connection = None;
+                        }
+                        let photo = self
+                            .jobs
+                            .iter()
+                            .find_map(|(p, j)| ((submission != 0 && j.seq == submission) || (!round.is_empty() && j.round == round)).then_some(*p));
+                        if let Some(photo) = photo {
+                            if !round.is_empty() {
+                                let _ = self.stop(photo);
+                            }
+                            self.finish(photo, &format!("处理未完成：{error}。保留最近完整结果。"));
+                            if let Some(conversation) = self.conversations.get_mut(&photo) {
+                                conversation.notice = format!("处理未完成：{error}。保留最近完整结果。");
+                            }
+                            let _ = self.save(app, photo);
+                        }
+                    } else if path == "/v1/rounds" {
+                        // SSE owns admission and uploads; a receipt alone cannot trigger work.
+                    }
+                    Ok(())
+                }
+                network::Event::Closed(error) => {
+                    let photos: Vec<_> = self.jobs.keys().copied().collect();
+                    for photo in photos {
+                        self.finish(photo, &error);
+                        let _ = self.save(app, photo);
+                    }
+                    self.text = error;
+                    Ok(())
+                }
+            };
+            if let Err(error) = result {
+                self.text = error;
+            }
+        }
+        while let Ok(message) = self.rx.try_recv() {
+            let WorkerMessage::Prepared { photo, .. } = &message;
+            let photo = *photo;
+            if let Err(error) = self.prepared(app, ctx, message) {
+                self.fail_one(app, photo, &error);
+            }
+        }
+        if self.connection.as_ref().is_none_or(|c| !c.alive.load(Ordering::Relaxed)) && !self.jobs.is_empty() {
+            let photos: Vec<_> = self.jobs.keys().copied().collect();
+            for photo in photos {
+                self.finish(photo, "AI 事件连接已断开，保留最近完整结果。");
+                let _ = self.save(app, photo);
+            }
+        }
+        let stale: Vec<_> = self
+            .conversations
+            .iter()
+            .filter_map(|(p, c)| c.checkpoint.as_ref().filter(|c| c.eligible && !current(app, c) && !self.jobs.contains_key(p)).map(|_| *p))
+            .collect();
+        for photo in stale {
+            if let Some(c) = self.conversations.get_mut(&photo).and_then(|c| c.checkpoint.as_mut()) {
+                c.eligible = false;
+            }
+            let _ = self.save(app, photo);
+        }
+        if !self.jobs.is_empty() || !self.workers.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+    fn fail_one(&mut self, app: &mut LightcraftApp, photo: PhotoId, error: &str) {
+        let _ = self.stop(photo);
+        if let Some(c) = self.conversations.get_mut(&photo) {
+            c.notice = format!("处理未完成：{error}。保留最近完整结果。");
+        }
+        let _ = self.save(app, photo);
     }
 }
 
-fn clone_checkpoint(c: &Checkpoint) -> Checkpoint {
-    Checkpoint { photo: c.photo, generation: c.generation, original: c.original.clone(), expected: c.expected.clone(), content: c.content.clone() }
+fn current(app: &LightcraftApp, c: &Checkpoint) -> bool {
+    app.session.library_generation() == c.generation
+        && app.session.photo_revision(c.photo) == c.revision
+        && app.session.catalog.photo(c.photo).is_some_and(|p| !p.deleted && lightcraft_engine::media::content_key(p) == c.content)
+        && app.session.develop_of(c.photo).is_some_and(|d| *d == *c.expected)
+}
+fn render_snapshot(mut job: RenderJob, cancel: &AtomicBool) -> Result<Snapshot, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("已停止生成。".into());
+    }
+    job.cache = None;
+    job.view_cache = None;
+    job.stages = None;
+    let source = job.source.load_source()?;
+    let info = source.info_or(job.info.clone());
+    let context = lightcraft_engine::companion::CandidateContext::new(
+        source.image_for(job.settings.denoise_amount()),
+        info,
+        &job.settings,
+        &format!("frame-{}-{}-{}", job.photo.0, job.request_id, job.key),
+    );
+    job.source = lightcraft_engine::media::SourceRef::Loaded(Box::new(source.clone()));
+    let mut result = job.run();
+    result.loaded = Some(source);
+    let rendered = result.rendered.as_ref().map_err(Clone::clone)?;
+    let options = lightcraft_engine::export::ExportOptions {
+        format: lightcraft_engine::export::ExportFormat::Jpeg,
+        quality: 75,
+        metadata: lightcraft_engine::export::MetadataPolicy::None,
+        ..Default::default()
+    };
+    let data = lightcraft_engine::export::encode_image(&rendered.image, &options)?;
+    if data.len() > 128 * 1024 {
+        return Err("压缩预览超过服务限制。".into());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("已停止生成。".into());
+    }
+    let preview = json!({"mime_type":"image/jpeg","width":rendered.image.width,"height":rendered.image.height,"frame_id":context.frame_id,"data_base64":Base64::encode_string(&data)});
+    Ok(Snapshot { result, preview, context })
+}
+fn capabilities(settings: &DevelopSettings) -> Value {
+    let tools: [(&str, &str); 5] = [
+        ("get_photo_state", "读取目标照片的实际编辑状态"),
+        ("list_edit_controls", "读取本轮允许的参数范围和当前值"),
+        ("get_current_preview", "读取目标照片当前实际 JPEG 预览"),
+        ("get_photo_histogram", "读取实际预览的 sRGB 显示统计"),
+        ("list_manual_masks", "读取目标照片的蒙版，未开放的类型不能编辑"),
+    ];
+    let mut tools:Vec<_>=tools.iter().map(|(name,description)|json!({"name":name,"description":description,"parameters":{"type":"object","properties":{},"additionalProperties":false}})).collect();
+    tools.push(json!({"name":"sample_photo_color","description":"在本阶段冻结预览上从源图纯取样；返回 Point Color OkLCh、ColorRange OkLab 或白平衡数值，不写入照片。","parameters":{"type":"object","additionalProperties":false,"required":["purpose","point","frame_id","coordinate_space"],"properties":{"purpose":{"type":"string","enum":["point_color","color_range","white_balance"]},"point":{"type":"object","additionalProperties":false,"required":["x","y"],"properties":{"x":{"type":"number","minimum":0,"maximum":1},"y":{"type":"number","minimum":0,"maximum":1}}},"frame_id":{"type":"string","minLength":1,"maxLength":128},"coordinate_space":{"type":"string","enum":["native_normalized","preview_normalized"]}}}}));
+    json!({"capability_version":"lightcraft-v2","controls":lightcraft_engine::companion::control_ranges(settings),"edit_schemas":lightcraft_engine::companion::operation_schemas(settings),"tools":tools})
 }
 
-pub fn blocks_edit(app: &LightcraftApp, command: &str, params: &Value) -> bool {
-    let Some(target) = app.ai.busy_photo() else {
-        return false;
+fn close_pending_tools(messages: &mut Vec<Value>) {
+    let mut pending = BTreeSet::new();
+    for message in messages.iter() {
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    pending.insert(id.to_owned());
+                }
+            }
+        }
+        if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+            pending.remove(id);
+        }
+    }
+    for id in pending {
+        messages.push(json!({"role":"tool","tool_call_id":id,"text":"cancelled or failed before confirmed tool completion"}));
+    }
+}
+
+pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
+    let mut state = std::mem::take(&mut app.ai);
+    state.poll_inner(app, ctx);
+    app.ai = state;
+}
+pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
+    let mut state = std::mem::take(&mut app.ai);
+    let result = (|| {
+        let photos: Vec<_> = state.jobs.keys().copied().collect();
+        for photo in photos {
+            // Close unfinished tool messages while the old library still owns them.
+            let _ = state.stop(photo);
+            state.finish(photo, "图库已关闭，保留最近一次完整结果。");
+            state.save(app, photo)?;
+        }
+        state.connection = None;
+        Ok(())
+    })();
+    app.ai = state;
+    result
+}
+pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
+    if !id.starts_with("ai.") {
+        return None;
+    }
+    let mut state = std::mem::take(&mut app.ai);
+    // Commands may arrive before the next UI frame after a library change.
+    if state.generation != app.session.library_generation() {
+        let photos: Vec<_> = state.jobs.keys().copied().collect();
+        for photo in photos {
+            let _ = state.stop(photo);
+        }
+        state.conversations.clear();
+        state.generation = app.session.library_generation();
+    }
+    let photo = params.get("photo").and_then(Value::as_u64).map(PhotoId).or_else(|| app.session.active());
+    let result = match id {
+        "ai.open" => {
+            state.open = true;
+            Ok(Value::Null)
+        }
+        "ai.start" => {
+            if params.get("consent").and_then(Value::as_bool) == Some(true) {
+                state.consent = true;
+            }
+            if let Some(prompt) = params.get("prompt").and_then(Value::as_str) {
+                state.prompt = prompt.into();
+            }
+            state.start(app)
+        }
+        "ai.stop" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
+            state.stop(p)?;
+            state.save(app, p)?;
+            Ok(Value::Null)
+        }),
+        "ai.status" => {
+            if let Some(photo) = photo
+                && let Err(error) = state.load(app, photo)
+            {
+                app.ai = state;
+                return Some(Err(error));
+            }
+            let conversation = photo.and_then(|p| state.conversations.get(&p));
+            Ok(
+                json!({"busy":photo.is_some_and(|p|state.jobs.contains_key(&p)),"workerBusy":photo.is_some_and(|p|state.worker_busy(p)),"photo":photo.map(|p|p.0),"round":photo.and_then(|p|state.jobs.get(&p)).map(|j|j.round.clone()),"text":conversation.map(display_text).unwrap_or_else(||state.text.clone()),"activePhotos":state.jobs.keys().map(|p|p.0).collect::<Vec<_>>()}),
+            )
+        }
+        "ai.undo" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| undo(&mut state, app, p)),
+        "ai.clear" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| clear(&mut state, app, p)),
+        _ => {
+            app.ai = state;
+            return None;
+        }
     };
+    app.ai = state;
+    Some(result)
+}
+fn undo(state: &mut State, app: &mut LightcraftApp, photo: PhotoId) -> Result<Value, String> {
+    if state.jobs.contains_key(&photo) || state.worker_busy(photo) {
+        return Err("请先停止并等待此照片处理结束。".into());
+    }
+    state.load(app, photo)?;
+    let checkpoint = state.conversations.get(&photo).and_then(|c| c.checkpoint.clone()).ok_or("此照片没有可撤回的 AI 轮次。")?;
+    if !checkpoint.eligible || !current(app, &checkpoint) {
+        return Err("照片已有后续编辑，请使用历史恢复，未覆盖当前照片。".into());
+    }
+    let op = app.session.develop_op(photo, (*checkpoint.original).clone(), "Undo AI round").ok_or("照片不存在。")?;
+    app.session.commit("Undo AI round", op).map_err(|e| e.to_string())?;
+    let conversation = state.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+    if let Some(c) = conversation.checkpoint.as_mut() {
+        c.eligible = false;
+    }
+    conversation.messages.push(json!({"role":"user","text":"用户撤回了本轮全部 AI 修改，照片恢复到本轮起点。"}));
+    conversation.notice = "已撤回本轮，保留对话。".into();
+    state.save(app, photo)?;
+    Ok(json!({"undone":true}))
+}
+fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId) -> Result<Value, String> {
+    if state.jobs.contains_key(&photo) || state.worker_busy(photo) {
+        return Err("处理期间不能删除对话，请先停止并等待结束。".into());
+    }
+    state.load(app, photo)?;
+    let names: BTreeSet<_> = state
+        .conversations
+        .get(&photo)
+        .into_iter()
+        .flat_map(|c| c.messages.iter())
+        .flat_map(|m| m.get("images").and_then(Value::as_array).into_iter().flatten())
+        .filter_map(|p| p.get("attachment").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    app.session.set_photo_companion(photo, None).map_err(|e| e.to_string())?;
+    app.session.persist().map_err(|e| e.to_string())?;
+    state.conversations.insert(photo, Conversation::default());
+    if let Some(library) = app.session.library.as_ref() {
+        for name in names {
+            library.remove_companion_attachment(&name).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(json!({"cleared":true}))
+}
+pub fn blocks_edit(app: &LightcraftApp, command: &str, params: &Value) -> bool {
+    if app.ai.jobs.is_empty() {
+        return false;
+    }
     if matches!(command, "edit.undo" | "edit.redo" | "history.undo" | "history.redo") {
-        return true;
+        let entry = if command.ends_with("redo") { app.session.redo.last() } else { app.session.undo.last() };
+        let mut blocked = false;
+        if let Some(entry) = entry {
+            entry.op.photo_ids(&mut |id| blocked |= app.ai.jobs.contains_key(&id));
+        }
+        return blocked;
     }
     let safe = command.starts_with("view.")
         || matches!(
@@ -177,467 +827,95 @@ pub fn blocks_edit(app: &LightcraftApp, command: &str, params: &Value) -> bool {
                 | "library.clearFilter"
                 | "library.filter"
                 | "library.info"
+                | "library.open"
+                | "library.new"
+                | "library.close"
                 | "photo.info"
                 | "photo.inspect"
                 | "develop.get"
                 | "develop.controls"
                 | "app.quit"
         );
-    !safe && (app.session.active() == Some(target) || app.session.targets(params).contains(&target))
+    !safe && app.session.targets(params).iter().any(|id| app.ai.jobs.contains_key(id))
 }
-
-fn start(app: &mut LightcraftApp) -> Result<Value, String> {
-    if cfg!(target_arch = "wasm32") {
-        return Err("本次验证仅支持桌面版。".into());
-    }
-    if !app.ai.consent {
-        return Err("请先同意发送压缩预览。".into());
-    }
-    if app.ai.job.is_some() {
-        return Err("已有照片正在处理，请先停止或等待完成。".into());
-    }
-    if app.ai.worker_busy() {
-        return Err("上一轮正在结束，请稍候。".into());
-    }
-    let photo = app.session.active().ok_or("请先选择一张照片。")?;
-    // Finish a short slider gesture, never hold an interaction across network waits.
-    app.session.end_interaction().map_err(|e| e.to_string())?;
-    let original = app.session.develop_of(photo).ok_or("照片不存在。")?;
-    let job = app.session.export_job(photo, 640, 640, lightcraft_pipeline::OutputSpace::Srgb, lightcraft_pipeline::OutputDepth::U8)?;
-    let generation = app.session.library_generation();
-    let content = app.session.catalog.photo(photo).map(|p| lightcraft_engine::media::content_key(p)).ok_or("照片不存在。")?;
-    let prompt = if app.ai.prompt.trim().is_empty() { "请点评这张照片，并自然优化曝光。".to_string() } else { app.ai.prompt.clone() };
-    if prompt.len() > 4096 {
-        return Err("请求过长。".into());
-    }
-    app.ai.serial = app.ai.serial.saturating_add(1);
-    let round = format!("{}-{}-{}", std::process::id(), photo.0, app.ai.serial);
-    let address = std::env::var("PHOTO_COMPANION_ADDR").unwrap_or_else(|_| "127.0.0.1:18080".into());
-    let cancel = Arc::new(AtomicBool::new(false));
-    let worker_cancel = cancel.clone();
-    let (tx, rx) = mpsc::channel();
-    let alive = Arc::new(AtomicBool::new(true));
-    let worker_alive = WorkerAlive(alive.clone());
-    #[cfg(not(target_arch = "wasm32"))]
-    std::thread::Builder::new()
-        .name("photo-companion".into())
-        .spawn(move || {
-            let _alive = worker_alive;
-            let result = roundtrip(job, &address, &round, &prompt, &worker_cancel, &tx);
-            if result.is_err() {
-                worker_cancel.store(true, Ordering::Relaxed);
+fn display_text(conversation: &Conversation) -> String {
+    let mut text = String::new();
+    for message in &conversation.messages {
+        if matches!(message.get("role").and_then(Value::as_str), Some("user" | "assistant")) {
+            let value = message.get("text").and_then(Value::as_str).unwrap_or_default();
+            if !value.starts_with("Actual execution feedback:") {
+                let visible = value.split("\nActual photo state:").next().unwrap_or(value);
+                if !visible.is_empty() {
+                    text.push_str(visible);
+                    text.push_str("\n\n");
+                }
             }
-            let _ = tx.send(Message::Finished(result));
-        })
-        .map_err(|e| format!("无法启动 AI：{e}"))?;
-    #[cfg(target_arch = "wasm32")]
-    let _ = (job, address, round, prompt, worker_cancel, tx, worker_alive);
-    app.ai.job = Some(Job {
-        checkpoint: Checkpoint { photo, generation, original: original.clone(), expected: original, content },
-        cancel,
-        rx,
-        started: Instant::now(),
+        }
+    }
+    for value in conversation.pending.values() {
+        text.push_str(value);
+    }
+    text.push_str(&conversation.notice);
+    text
+}
+pub fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
+    if !app.ai.open && !matches!(app.ui.right, crate::state::RightPanel::Edit) {
+        return;
+    }
+    egui::Frame::NONE.inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+        let open = ui.button("AI 点评并优化");
+        crate::widgets::register(ui.ctx(), "button:aiOpen", open.rect);
+        if open.clicked() {
+            let _ = app.run("ai.open", json!({}));
+        }
+        if !app.ai.open {
+            return;
+        }
+        ui.label("理解照片并自然优化。原始照片留在本机。");
+        let busy = app.ai.jobs.contains_key(&photo);
+        let worker = app.ai.worker_busy(photo);
+        let input = ui.add_enabled(!busy, egui::TextEdit::multiline(&mut app.ai.prompt).desired_rows(2).hint_text("例如：先评价照片，再自然优化"));
+        crate::widgets::register(ui.ctx(), "field:aiPrompt", input.rect);
+        if !busy {
+            let consent = ui.checkbox(&mut app.ai.consent, "同意将压缩预览发送给云端模型");
+            crate::widgets::register(ui.ctx(), "checkbox:aiConsent", consent.rect);
+            let start = ui.add_enabled(app.ai.consent && !worker && !cfg!(target_arch = "wasm32"), egui::Button::new("点评并优化"));
+            crate::widgets::register(ui.ctx(), "button:aiStart", start.rect);
+            if start.clicked()
+                && let Err(e) = app.run("ai.start", json!({}))
+            {
+                app.ai.text = e.clone();
+                app.ai.conversations.entry(photo).or_default().notice = e;
+            }
+            if worker {
+                ui.label("正在结束此照片的处理…");
+            }
+            for (label, widget, command) in [("撤回本轮", "button:aiUndo", "ai.undo"), ("删除对话", "button:aiClear", "ai.clear")] {
+                let button = ui.add_enabled(!worker, egui::Button::new(label));
+                crate::widgets::register(ui.ctx(), widget, button.rect);
+                if button.clicked()
+                    && let Err(e) = app.run(command, json!({}))
+                {
+                    app.ai.conversations.entry(photo).or_default().notice = e;
+                }
+            }
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("正在处理此照片…");
+                let stop = ui.button("停止生成");
+                crate::widgets::register(ui.ctx(), "button:aiStop", stop.rect);
+                if stop.clicked() {
+                    let _ = app.run("ai.stop", json!({}));
+                }
+            });
+        }
+        if let Some(conversation) = app.ai.conversations.get(&photo) {
+            egui::ScrollArea::vertical().id_salt(("ai-messages", photo.0)).max_height(240.0).stick_to_bottom(true).show(ui, |ui| {
+                ui.label(display_text(conversation));
+            });
+        } else if !app.ai.text.is_empty() {
+            ui.label(&app.ai.text);
+        }
     });
-    app.ai.worker_alive = Some(alive);
-    app.ai.last = None;
-    app.ai.text = "正在准备预览…".into();
-    Ok(json!({"started":true,"photo":photo.0}))
-}
-
-fn current(app: &LightcraftApp, c: &Checkpoint) -> bool {
-    app.session.library_generation() == c.generation
-        && app.session.catalog.photo(c.photo).is_some_and(|p| !p.deleted && lightcraft_engine::media::content_key(p) == c.content)
-        && app.session.develop_of(c.photo).is_some_and(|d| *d == *c.expected)
-}
-
-fn commit_one(app: &mut LightcraftApp, photo: PhotoId, settings: &DevelopSettings, label: &str) -> Result<(), String> {
-    // A targeted op deliberately bypasses Auto Sync and the current selection.
-    let op = app.session.develop_op(photo, settings.clone(), label).ok_or("照片不存在。")?;
-    app.session.commit(label, op).map_err(|e| e.to_string())
-}
-
-fn undo(app: &mut LightcraftApp) -> Result<Value, String> {
-    if app.ai.job.is_some() {
-        return Err("请先停止生成。".into());
-    }
-    let c = app.ai.last.as_ref().ok_or("没有可撤回的修图轮次。")?;
-    if !current(app, c) {
-        return Err("照片在本轮之后已改变，请使用编辑历史恢复。".into());
-    }
-    let (photo, original) = (c.photo, c.original.clone());
-    commit_one(app, photo, &original, "Restore AI round")?;
-    app.ai.last = None;
-    app.ai.text.push_str("\n本轮修改已撤回。");
-    Ok(Value::Null)
-}
-
-pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
-    let Some(mut job) = app.ai.job.take() else {
-        return;
-    };
-    if job.started.elapsed() > Duration::from_secs(300) {
-        app.ai.text.push_str("\n本轮超时，保留最近完整结果。");
-        app.ai.last = Some(clone_checkpoint(&job.checkpoint));
-        return;
-    }
-    loop {
-        let message = match job.rx.try_recv() {
-            Ok(message) => message,
-            Err(mpsc::TryRecvError::Empty) => break,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                app.ai.text.push_str("\nAI 处理已结束，保留最近完整结果。");
-                app.ai.last = Some(clone_checkpoint(&job.checkpoint));
-                return;
-            }
-        };
-        match message {
-            Message::Applied { settings, text, ack } => {
-                if !current(app, &job.checkpoint) || job.cancel.load(Ordering::Relaxed) {
-                    let _ = ack.send(false);
-                    app.ai.text.push_str("\n照片或图库已改变，迟到结果未执行。");
-                    app.ai.last = Some(clone_checkpoint(&job.checkpoint));
-                    return;
-                }
-                if let Err(e) = commit_one(app, job.checkpoint.photo, &settings, "AI exposure") {
-                    let _ = ack.send(false);
-                    app.ai.text.push_str(&format!("\n{e}"));
-                    return;
-                }
-                if ack.send(true).is_err() {
-                    let _ = commit_one(app, job.checkpoint.photo, &job.checkpoint.expected, "Restore expired AI plan");
-                    app.ai.text.push_str("\n本轮已结束，方案未保留。");
-                    app.ai.last = Some(clone_checkpoint(&job.checkpoint));
-                    return;
-                }
-                job.checkpoint.expected = settings;
-                app.ai.text = if app.ai.text == "正在准备预览…" { text } else { format!("{}\n{}", app.ai.text, text) };
-            }
-            Message::Finished(result) => {
-                match result {
-                    Ok(text) => app.ai.text.push_str(&format!("\n{text}")),
-                    Err(e) => app.ai.text.push_str(&format!("\n处理未完成：{e}")),
-                }
-                app.ai.last = Some(clone_checkpoint(&job.checkpoint));
-                return;
-            }
-        }
-    }
-    app.ai.job = Some(job);
-    ctx.request_repaint_after(Duration::from_millis(50));
-}
-
-fn render_preview(mut job: RenderJob, settings: Arc<DevelopSettings>) -> Result<Vec<u8>, String> {
-    job.settings = settings;
-    job.cache = None;
-    job.view_cache = None;
-    job.stages = None;
-    let output = job.run().rendered?;
-    let options = lightcraft_engine::export::ExportOptions {
-        format: lightcraft_engine::export::ExportFormat::Jpeg,
-        quality: 75,
-        metadata: lightcraft_engine::export::MetadataPolicy::None,
-        ..Default::default()
-    };
-    let bytes = lightcraft_engine::export::encode_image(&output.image, &options)?;
-    if bytes.len() > 128 * 1024 {
-        return Err("预览超过本次验证的大小限制。".into());
-    }
-    Ok(bytes)
-}
-
-fn check_cancel(cancel: &AtomicBool, start: Instant) -> Result<(), String> {
-    if cancel.load(Ordering::Relaxed) {
-        return Err("已停止生成。".into());
-    }
-    if start.elapsed() > Duration::from_secs(300) {
-        return Err("本轮超时。".into());
-    }
-    Ok(())
-}
-
-fn exposure_plan(response: &Value, round: &str, photo: PhotoId, stage: &str) -> Result<Option<f64>, String> {
-    if response.get("round_id").and_then(Value::as_str) != Some(round)
-        || response.get("photo_id").and_then(Value::as_str) != Some(&photo.0.to_string())
-    {
-        return Err("后端结果属于其他照片或轮次。".into());
-    }
-    let plan = response.get("plan").ok_or("后端缺少方案字段。")?;
-    if plan.is_null() {
-        if stage == "initial" {
-            return Err("没有收到初次编辑方案。".into());
-        }
-        return Ok(None);
-    }
-    if plan.get("id").and_then(Value::as_str) != Some(&format!("{round}/{stage}")) {
-        return Err("后端方案身份不匹配。".into());
-    }
-    let values = plan.get("values").and_then(Value::as_object).ok_or("方案参数无效。")?;
-    let exposure =
-        values.get("light.exposure").and_then(Value::as_f64).filter(|n| n.is_finite() && (-5.0..=5.0).contains(n)).ok_or("曝光参数无效。")?;
-    if values.len() != 1 {
-        return Err("方案包含未允许的编辑参数。".into());
-    }
-    Ok(Some(exposure))
-}
-
-fn roundtrip(job: RenderJob, address: &str, round: &str, prompt: &str, cancel: &AtomicBool, tx: &mpsc::Sender<Message>) -> Result<String, String> {
-    let start = Instant::now();
-    check_cancel(cancel, start)?;
-    let photo = job.photo;
-    let mut settings = job.settings.clone();
-    let mut preview = render_preview(job.clone(), settings.clone())?;
-    let mut history = vec![json!({"stage":"start","text":prompt,"exposure":settings.light.exposure,"preview":preview})];
-    let mut execution = Value::Null;
-    for stage in ["initial", "review"] {
-        check_cancel(cancel, start)?;
-        let request = json!({"round_id":round,"photo_id":photo.0.to_string(),"stage":stage,"prompt":prompt,"preview":preview,"settings":{"light.exposure":settings.light.exposure},"history":history,"execution":execution});
-        let response = post(address, &request, cancel, start)?;
-        check_cancel(cancel, start)?;
-        let text = response.get("text").and_then(Value::as_str).ok_or("后端缺少点评说明。")?.to_string();
-        let Some(exposure) = exposure_plan(&response, round, photo, stage)? else {
-            return Ok(text);
-        };
-        let mut proposed = (*settings).clone();
-        proposed.light.exposure = exposure;
-        let proposed = Arc::new(proposed);
-        // Render before committing: any render error keeps the last successful photo settings.
-        let rendered = render_preview(job.clone(), proposed.clone())?;
-        check_cancel(cancel, start)?;
-        let (ack_tx, ack_rx) = mpsc::channel();
-        tx.send(Message::Applied { settings: proposed.clone(), text: text.clone(), ack: ack_tx }).map_err(|_| "客户端已关闭。")?;
-        loop {
-            check_cancel(cancel, start)?;
-            match ack_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(true) => break,
-                Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => return Err("编辑结果未被客户端接受。".into()),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
-        }
-        settings = proposed;
-        preview = rendered;
-        history.push(json!({"stage":stage,"text":text,"exposure":settings.light.exposure,"preview":preview}));
-        execution = json!({"plan_id":format!("{round}/{stage}"),"success":true});
-    }
-    let request = json!({"round_id":round,"photo_id":photo.0.to_string(),"stage":"complete","prompt":prompt,"preview":preview,"settings":{"light.exposure":settings.light.exposure},"history":history,"execution":execution});
-    let response = post(address, &request, cancel, start)?;
-    if exposure_plan(&response, round, photo, "complete")?.is_some() {
-        return Err("本轮不允许再次修正。".into());
-    }
-    Ok(response.get("text").and_then(Value::as_str).unwrap_or("本轮完成。").to_string())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn post(address: &str, input: &Value, cancel: &AtomicBool, start: Instant) -> Result<Value, String> {
-    use std::io::{Read, Write};
-    let address: std::net::SocketAddr = address.parse().map_err(|_| "本地 AI 服务地址无效。")?;
-    if !address.ip().is_loopback() {
-        return Err("此原型仅连接本机 AI 服务。".into());
-    }
-    let data = serde_json::to_vec(input).map_err(|e| e.to_string())?;
-    if data.len() > 4 * 1024 * 1024 {
-        return Err("本轮输入超过大小限制。".into());
-    }
-    let mut socket =
-        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(3)).map_err(|_| "无法连接本地 AI 服务，请先启动 Go 后端。")?;
-    socket.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| e.to_string())?;
-    socket.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-    let header = format!(
-        "POST /prototype/turn HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        data.len()
-    );
-    socket.write_all(header.as_bytes()).and_then(|_| socket.write_all(&data)).map_err(|e| e.to_string())?;
-    let call_started = Instant::now();
-    let mut response = Vec::new();
-    let mut buffer = [0u8; 4096];
-    loop {
-        check_cancel(cancel, start)?;
-        if call_started.elapsed() > Duration::from_secs(125) {
-            return Err("模型调用超时。".into());
-        }
-        match socket.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                response.extend_from_slice(buffer.get(..n).ok_or("读取失败。")?);
-                if response.len() > 128 * 1024 {
-                    return Err("后端回复过大。".into());
-                }
-            }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
-            Err(e) => return Err(format!("AI 连接中断：{e}")),
-        }
-    }
-    let split = response.windows(4).position(|w| w == b"\r\n\r\n").ok_or("后端 HTTP 回复无效。")?;
-    let headers = std::str::from_utf8(response.get(..split).ok_or("HTTP 头无效。")?).map_err(|_| "HTTP 头无效。")?;
-    let body = response.get(split.saturating_add(4)..).ok_or("HTTP 正文无效。")?;
-    if !headers.lines().next().is_some_and(|line| line.starts_with("HTTP/1.1 200 ")) {
-        return Err(String::from_utf8_lossy(body).chars().take(400).collect());
-    }
-    if headers.to_ascii_lowercase().contains("transfer-encoding:") {
-        return Err("后端返回了不支持的传输格式。".into());
-    }
-    serde_json::from_slice(body).map_err(|_| "后端 JSON 回复无效。".into())
-}
-
-#[cfg(target_arch = "wasm32")]
-fn post(_: &str, _: &Value, _: &AtomicBool, _: Instant) -> Result<Value, String> {
-    Err("仅支持桌面版。".into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lightcraft_catalog::{Op, Source};
-
-    fn app() -> LightcraftApp {
-        LightcraftApp::new(lightcraft_engine::Session::with_demo(), crate::Services::default())
-    }
-
-    fn checkpoint(app: &LightcraftApp, photo: PhotoId) -> Checkpoint {
-        let settings = app.session.develop_of(photo).unwrap();
-        Checkpoint {
-            photo,
-            generation: app.session.library_generation(),
-            original: settings.clone(),
-            expected: settings,
-            content: lightcraft_engine::media::content_key(app.session.catalog.photo(photo).unwrap()),
-        }
-    }
-
-    fn pending(app: &mut LightcraftApp, photo: PhotoId, exposure: f64) -> (mpsc::Sender<Message>, mpsc::Receiver<bool>) {
-        let original = app.session.develop_of(photo).unwrap();
-        let mut settings = (*original).clone();
-        settings.light.exposure = exposure;
-        let (tx, rx) = mpsc::channel();
-        let (ack, ack_rx) = mpsc::channel();
-        app.ai.job = Some(Job { checkpoint: checkpoint(app, photo), cancel: Arc::new(AtomicBool::new(false)), rx, started: Instant::now() });
-        tx.send(Message::Applied { settings: Arc::new(settings), text: "点评".into(), ack }).unwrap();
-        (tx, ack_rx)
-    }
-
-    #[test]
-    fn plans_reject_wrong_targets_and_extra_controls() {
-        let base = json!({"round_id":"r","photo_id":"1","plan":{"id":"r/initial","values":{"light.exposure":0.7}}});
-        assert_eq!(exposure_plan(&base, "r", PhotoId(1), "initial").unwrap(), Some(0.7));
-        for value in [
-            json!({"round_id":"other","photo_id":"1","plan":null}),
-            json!({"round_id":"r","photo_id":"2","plan":null}),
-            json!({"round_id":"r","photo_id":"1","plan":{"id":"r/initial","values":{"light.exposure":0.7,"light.contrast":1}}}),
-            json!({"round_id":"r","photo_id":"1","plan":{"id":"r/review","values":{"light.exposure":6}}}),
-        ] {
-            assert!(exposure_plan(&value, "r", PhotoId(1), "initial").is_err());
-        }
-    }
-
-    #[test]
-    fn switching_photos_and_auto_sync_do_not_retarget_ai() {
-        let mut app = app();
-        let ids = app.session.visible_cloned();
-        let target = ids[0];
-        let other = ids[1];
-        let before = app.session.develop_of(target).unwrap();
-        let other_before = app.session.develop_of(other).unwrap();
-        app.session.execute("library.select", &json!({"ids":[target.0,other.0],"active":other.0})).unwrap();
-        app.session.auto_sync = true;
-        let (_tx, ack) = pending(&mut app, target, 0.7);
-        poll(&mut app, &egui::Context::default());
-        assert!(ack.recv().unwrap());
-        assert_eq!(app.session.develop_of(target).unwrap().light.exposure, 0.7);
-        assert_eq!(*app.session.develop_of(other).unwrap(), *other_before);
-        let job = app.ai.job.take().unwrap();
-        app.ai.last = Some(clone_checkpoint(&job.checkpoint));
-        drop(job);
-        undo(&mut app).unwrap();
-        assert_eq!(*app.session.develop_of(target).unwrap(), *before);
-    }
-
-    #[test]
-    fn stopped_and_expired_pending_plans_never_apply() {
-        for expired in [false, true] {
-            let mut app = app();
-            let photo = app.session.visible_cloned()[0];
-            let original = app.session.develop_of(photo).unwrap();
-            let (_tx, _ack) = pending(&mut app, photo, 0.7);
-            if expired {
-                app.ai.job.as_mut().unwrap().started = Instant::now() - Duration::from_secs(301)
-            } else {
-                command(&mut app, "ai.stop", &json!({})).unwrap().unwrap();
-            }
-            poll(&mut app, &egui::Context::default());
-            assert_eq!(*app.session.develop_of(photo).unwrap(), *original);
-            assert!(app.ai.job.is_none());
-        }
-    }
-
-    #[test]
-    fn changed_content_or_deleted_photo_rejects_old_result() {
-        for deleted in [false, true] {
-            let mut app = app();
-            let photo = app.session.visible_cloned()[0];
-            let original = app.session.develop_of(photo).unwrap();
-            let (_tx, ack) = pending(&mut app, photo, 0.7);
-            let op = if deleted {
-                Op::SetDeleted { id: photo, deleted: true }
-            } else {
-                Op::SetFile { id: photo, file_name: "replaced.jpg".into(), source: Source::File { path: "replaced.jpg".into() } }
-            };
-            app.session.catalog.apply(op).unwrap();
-            poll(&mut app, &egui::Context::default());
-            assert!(!ack.recv().unwrap());
-            assert_eq!(*app.session.develop_of(photo).unwrap(), *original);
-            assert!(app.ai.job.is_none());
-        }
-    }
-
-    #[test]
-    fn expired_worker_ack_preserves_previous_complete_result() {
-        let mut app = app();
-        let photo = app.session.visible_cloned()[0];
-        let mut first = (*app.session.develop_of(photo).unwrap()).clone();
-        first.light.exposure = 0.7;
-        commit_one(&mut app, photo, &first, "initial AI result").unwrap();
-        let (_tx, ack) = pending(&mut app, photo, 0.4);
-        drop(ack);
-        poll(&mut app, &egui::Context::default());
-        assert_eq!(app.session.develop_of(photo).unwrap().light.exposure, 0.7);
-    }
-
-    #[test]
-    fn rendering_failure_does_not_change_photo() {
-        let mut app = app();
-        let photo = app.session.visible_cloned()[0];
-        let original = app.session.develop_of(photo).unwrap();
-        let mut job = app.session.export_job(photo, 64, 64, lightcraft_pipeline::OutputSpace::Srgb, lightcraft_pipeline::OutputDepth::U8).unwrap();
-        job.source = app.session.media.origin_ref(&Source::File { path: "missing-photo-companion-fixture.jpg".into() }, 64);
-        let (tx, _rx) = mpsc::channel();
-        let cancel = AtomicBool::new(false);
-        assert!(roundtrip(job, "127.0.0.1:1", "r", "natural", &cancel, &tx).is_err());
-        assert_eq!(*app.session.develop_of(photo).unwrap(), *original);
-    }
-
-    #[test]
-    fn edits_pause_but_navigation_and_other_photos_remain_available() {
-        let mut app = app();
-        let ids = app.session.visible_cloned();
-        let photo = ids[0];
-        app.session.execute("library.select", &json!({"ids":[photo.0]})).unwrap();
-        let (_tx, _ack) = pending(&mut app, photo, 0.7);
-        for command in ["photo.rotateLeft", "curve.set", "geometry.set", "denoise.toggle", "preset.apply", "ui.tool"] {
-            assert!(blocks_edit(&app, command, &json!({})), "{command}")
-        }
-        for command in ["library.next", "library.previous", "view.detail", "photo.inspect"] {
-            assert!(!blocks_edit(&app, command, &json!({})), "{command}")
-        }
-        app.session.execute("library.select", &json!({"ids":[ids[1].0]})).unwrap();
-        assert!(!blocks_edit(&app, "develop.set", &json!({})));
-        assert!(blocks_edit(&app, "develop.set", &json!({"ids":[photo.0]})));
-    }
-
-    #[test]
-    fn stopped_worker_blocks_another_start_until_exit() {
-        let mut app = app();
-        app.ai.consent = true;
-        app.ai.worker_alive = Some(Arc::new(AtomicBool::new(true)));
-        assert!(start(&mut app).is_err());
-        assert!(app.ai.job.is_none());
-    }
 }

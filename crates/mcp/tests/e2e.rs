@@ -158,12 +158,54 @@ fn remote_unreachable_is_a_tool_error() {
 /// between complete photos, unrelated output preservation, and a usable session afterwards.
 #[test]
 fn export_progress_and_cancel() {
+    // A cached export may finish between two throttled progress notifications.
+    // Hold its first completed-photo boundary until the real transport consumes
+    // cancellation, instead of relying on the speed of rendering or the reader.
+    struct CancellationBoundary {
+        backend: Headless,
+        enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        reached: std::sync::mpsc::SyncSender<()>,
+    }
+    impl Backend for CancellationBoundary {
+        fn has_ui(&self) -> bool {
+            self.backend.has_ui()
+        }
+        fn describe(&self) -> String {
+            self.backend.describe()
+        }
+        fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+            self.backend.call(method, params)
+        }
+        fn set_progress(&mut self, hook: Option<lightcraft_mcp::ProgressHook>) {
+            let enabled = self.enabled.clone();
+            let reached = self.reached.clone();
+            self.backend.set_progress(hook.map(|mut hook| {
+                Box::new(move |done, total, name: &str| {
+                    if done == 1 && enabled.load(std::sync::atomic::Ordering::Acquire) {
+                        reached.send(()).unwrap();
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                        loop {
+                            if !hook(done, total, name) {
+                                return false;
+                            }
+                            assert!(std::time::Instant::now() < deadline, "transport did not consume cancellation");
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                    hook(done, total, name)
+                }) as lightcraft_mcp::ProgressHook
+            }));
+        }
+    }
     let dir = std::env::temp_dir().join(format!("lc-mcp-progress-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let (input, mut send) = std::io::pipe().unwrap();
     let (output, write) = std::io::pipe().unwrap();
-    let server = std::thread::spawn(move || Server::new(Box::new(Headless::demo())).serve(BufReader::new(input), write).unwrap());
+    let enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (reached, boundary) = std::sync::mpsc::sync_channel(1);
+    let backend = CancellationBoundary { backend: Headless::demo(), enabled: enabled.clone(), reached };
+    let server = std::thread::spawn(move || Server::new(Box::new(backend)).serve(BufReader::new(input), write).unwrap());
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         for line in BufReader::new(output).lines() {
@@ -212,20 +254,15 @@ fn export_progress_and_cancel() {
     std::fs::write(&decoy, b"unrelated existing output").unwrap();
     let mut request = call(4, "command_run", json!({"id":"app.export","params":{"ids":ids,"dir":out,"longEdge":1200,"format":"png"}}));
     request["params"]["_meta"] = json!({"progressToken":44});
+    enabled.store(true, std::sync::atomic::Ordering::Release);
     writeln!(send, "{request}").unwrap();
-    loop {
-        let value = next();
-        assert_ne!(value["id"], 4, "must be cancellable before completion: {value}");
-        assert_eq!(value["params"]["progressToken"], 44, "{value}");
-        if value["params"]["progress"].as_f64().unwrap() > 0.0 {
-            break;
-        }
-    }
+    boundary.recv_timeout(std::time::Duration::from_secs(30)).expect("first complete photo before cancellation");
     writeln!(send, "{}", json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4}})).unwrap();
     writeln!(send, "{}", call(5, "doc_inspect", json!({}))).unwrap();
     loop {
         let value = next();
         if value["method"] == "notifications/progress" {
+            assert_eq!(value["params"]["progressToken"], 44, "{value}");
             continue;
         }
         assert_eq!(value["id"], 5, "cancelled request must not reply: {value}");

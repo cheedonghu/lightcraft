@@ -114,6 +114,7 @@ impl Photo {
             && self.versions.is_empty()
             && *self.develop == self.import_defaults()
             && self.analysis.is_none()
+            && self.companion.is_none()
             && m.title.is_empty()
             && m.caption.is_empty()
             && m.alt_text.is_empty()
@@ -273,6 +274,7 @@ impl Op {
             | Op::SetFlag { id, .. }
             | Op::SetLabel { id, .. }
             | Op::SetDevelop { id, .. }
+            | Op::SetPhotoCompanion { id, .. }
             | Op::SetMeta { id, .. }
             | Op::SetDeleted { id, .. }
             | Op::SetLocal { id, .. }

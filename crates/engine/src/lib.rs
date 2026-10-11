@@ -19,6 +19,8 @@ pub mod availability;
 pub(crate) mod camera_preview;
 pub mod camera_profiles;
 pub mod cmd;
+pub mod color_sampling;
+pub mod companion;
 pub mod config;
 pub mod contact_sheet;
 pub mod crs;
@@ -152,6 +154,8 @@ static LIBRARY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 
 pub struct Session {
     library_generation: u64,
+    /// Process-local edit epochs; unlike equality they detect changes away and back.
+    photo_revisions: std::collections::BTreeMap<PhotoId, u64>,
     /// Auto Sync: edits to the active photo also change the other selected photos (the settings
     /// that changed, nothing else).
     pub auto_sync: bool,
@@ -289,9 +293,57 @@ impl Session {
         self.library_generation
     }
 
+    pub fn photo_revision(&self, photo: PhotoId) -> u64 {
+        self.photo_revisions.get(&photo).copied().unwrap_or(1)
+    }
+    pub fn set_photo_companion(&mut self, photo: PhotoId, conversation: Option<Value>) -> Result<()> {
+        let op = Op::SetPhotoCompanion { id: photo, conversation };
+        self.catalog.apply(op.clone())?;
+        self.pending_log.push(op);
+        Ok(())
+    }
+
+    fn note_photo_edits(&mut self, op: &Op) -> Result<()> {
+        let mut pending = vec![op];
+        let revision = self.catalog.revision.saturating_add(1);
+        let mut changed = std::collections::BTreeSet::new();
+        while let Some(op) = pending.pop() {
+            match op {
+                Op::SetDevelop { id, .. }
+                | Op::SetFile { id, .. }
+                | Op::SetDeleted { id, .. }
+                | Op::SetContent { id, .. }
+                | Op::SetEmbeddedLens { id, .. } => {
+                    self.photo_revisions.insert(*id, revision);
+                    changed.insert(*id);
+                }
+                Op::RemovePhoto { id } => {
+                    self.photo_revisions.remove(id);
+                }
+                Op::AddPhoto { photo } => {
+                    self.photo_revisions.insert(photo.id, revision);
+                }
+                Op::Batch { ops } => pending.extend(ops),
+                _ => {}
+            }
+        }
+        // Persist undo eligibility even when this conversation has not been opened in the UI.
+        // AI publication writes its new checkpoint after the edit has actually become visible.
+        for id in changed {
+            if let Some(mut archive) = self.catalog.photo(id).and_then(|p| p.companion.clone())
+                && archive.pointer("/checkpoint/eligible").and_then(serde_json::Value::as_bool) == Some(true)
+            {
+                archive["checkpoint"]["eligible"] = serde_json::json!(false);
+                self.set_photo_companion(id, Some(archive))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn new() -> Session {
         Session {
             library_generation: LIBRARY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            photo_revisions: Default::default(),
             auto_sync: false,
             catalog: Catalog::new(),
             source: LibrarySource::All,
@@ -439,7 +491,8 @@ impl Session {
     pub fn commit(&mut self, label: &str, op: Op) -> Result<()> {
         let fwd = op.clone();
         let inv = self.catalog.apply(op)?;
-        self.pending_log.push(fwd);
+        self.pending_log.push(fwd.clone());
+        self.note_photo_edits(&fwd)?;
         self.undo.push(UndoEntry { label: label.to_string(), op: inv, folder: None });
         self.commits = self.commits.wrapping_add(1);
         if self.undo.len() > 1000 {
@@ -527,7 +580,8 @@ impl Session {
 
     /// Apply without recording undo (interactive previews).
     fn apply_silent(&mut self, op: Op) -> Result<()> {
-        self.catalog.apply(op)?;
+        self.catalog.apply(op.clone())?;
+        self.note_photo_edits(&op)?;
         Ok(())
     }
 
@@ -602,6 +656,7 @@ impl Session {
         }
         match self.catalog.apply(op.clone()) {
             Ok(inv) => {
+                self.note_photo_edits(op)?;
                 if let Some(f) = folder {
                     cmd::browse::follow_folder(self, &f.from, &f.to);
                 }

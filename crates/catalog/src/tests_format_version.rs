@@ -176,6 +176,7 @@ fn bad_crc_is_still_a_torn_tail() {
 fn op_variants_are_versioned() {
     fn since(op: &Op) -> u32 {
         match op {
+            Op::SetPhotoCompanion { .. } => 7,
             Op::AddPhoto { .. }
             | Op::RemovePhoto { .. }
             | Op::SetRating { .. }
@@ -212,6 +213,6 @@ fn op_variants_are_versioned() {
             Op::SetFolderRecord { .. } => 6,
         }
     }
-    let newest = since(&Op::SetFolderRecord { folder: "/".into(), record: None });
+    let newest = since(&Op::SetPhotoCompanion { id: PhotoId(1), conversation: None });
     assert_eq!(newest, VERSION, "the newest op's version must be the current format version");
 }

@@ -74,6 +74,10 @@ pub const HISTORY_LIMIT: usize = 200;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Op {
+    SetPhotoCompanion {
+        id: PhotoId,
+        conversation: Option<serde_json::Value>,
+    },
     AddPhoto {
         photo: Box<Photo>,
     },
@@ -479,6 +483,10 @@ impl Catalog {
 
     fn apply_inner(&mut self, op: Op) -> Result<Op> {
         Ok(match op {
+            Op::SetPhotoCompanion { id, conversation } => {
+                let p = self.photo_mut(id)?;
+                Op::SetPhotoCompanion { id, conversation: std::mem::replace(&mut p.companion, conversation) }
+            }
             Op::AddPhoto { photo } => {
                 if self.photos.contains_key(&photo.id) {
                     return Err(CatalogError::Invalid(format!("photo {:?} exists", photo.id)));

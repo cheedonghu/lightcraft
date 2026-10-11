@@ -42,15 +42,15 @@ and prints the summary; `cargo xtask parity --write` refreshes the summary table
 | S. Export (EXP) | 15 | 2 | 1 | 0 | 7/7 (100%) | 7/7 (100%) |
 | T. Share (SHARE) | 0 | 0 | 0 | 4 | — | — |
 | U. Map & location (MAP) | 0 | 1 | 1 | 0 | — | 0/1 (0%) |
-| V. Preferences (PREF) | 7 | 1 | 2 | 2 | 1/1 (100%) | 5/5 (100%) |
+| V. Preferences (PREF) | 6 | 2 | 2 | 2 | 1/1 (100%) | 4/5 (80%) |
 | W. Cloud & AI infrastructure (CLOUD / AI) | 1 | 0 | 1 | 2 | — | — |
 | X. Cross-cutting behaviours (BEHAV) | 18 | 6 | 1 | 1 | 8/8 (100%) | 6/9 (67%) |
 | Y. Menus | 82 | 0 | 4 | 8 | 47/47 (100%) | 23/23 (100%) |
 | Z. Keyboard shortcuts (desktop) | 75 | 3 | 3 | 1 | 49/52 (94%) | 23/24 (96%) |
-| Lightroom Classic extras | 32 | 11 | 39 | 9 | — | 22/24 (92%) |
-| **Total** | 393 | 39 | 84 | 36 | 192/200 (96%) | 142/152 (93%) |
+| Lightroom Classic extras | 33 | 15 | 35 | 9 | — | 23/25 (92%) |
+| **Total** | 397 | 49 | 73 | 36 | 192/200 (96%) | 143/155 (92%) |
 
-Weighted completion (✅ = 1, 🟡 = ½, 🚫 left out): **79.9%** of 516 in-scope rows — P0 98.0% of 200 · P1 95.7% of 152 · P2 42.9% of 163.
+Weighted completion (✅ = 1, 🟡 = ½, 🚫 left out): **81.2%** of 519 in-scope rows — P0 98.0% of 200 · P1 95.2% of 155 · P2 47.2% of 163.
 <!-- /parity:summary -->
 
 ## Top gaps
@@ -508,13 +508,13 @@ under the UI command that wraps it (a no-op error); the UI command now wins.
 | LR-AI-UPDATE-INDICATOR | AI-settings update indicator | P2 | ⬜ | | |
 | LR-AI-CREDITS | Generative credits | OOS | 🚫 | | |
 
-### Photo Companion prototype (fork extension)
+### Photo Companion (fork extension)
 
 This extension is tracked separately from Lightroom parity and does not close the AI model gaps above.
 
 | Id | Feature | Status | Evidence | Remaining scope |
 |---|---|---|---|---|
-| PC-01 | AI critique and exposure round trip | 🟡 | `cmd:ai.open`, `cmd:ai.start`, `cmd:ai.stop`, `cmd:ai.undo`, `cmd:ai.status`, `crates/ui-egui/src/ai_companion.rs`, `docs/control-protocol.md` | Native desktop prototype with a separately configured local backend: consented JPEG preview, exposure-only edits, one review/correction, stop and round undo. Verified with a controlled provider and a real model. Broader edit tools, persistent backend rounds, accounts/budgets and browser support remain open. |
+| PC-01 | AI critique and complete edit plans | 🟡 | `cmd:ai.open`, `cmd:ai.start`, `cmd:ai.stop`, `cmd:ai.undo`, `cmd:ai.clear`, `cmd:ai.status`, `crates/ui-egui/src/ai_companion.rs`, `docs/control-protocol.md` | Native desktop and local Eino backend: one SSE per client, photo-local histories, six read tools, complete controls/WB/curve/Point Color/crop/manual-mask candidates, one review/correction, stop and protected round undo. Normal catalog saves conversations and preview attachments (journal v7). Accounts/budgets, automatic segmentation and browser support remain open. |
 
 ## X. Cross-cutting behaviours (BEHAV)
 

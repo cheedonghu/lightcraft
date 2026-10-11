@@ -3343,6 +3343,7 @@ dependencies = [
 name = "lightcraft-ui-egui"
 version = "0.5.0"
 dependencies = [
+ "base64ct",
  "egui",
  "lightcraft-catalog",
  "lightcraft-codecs",
