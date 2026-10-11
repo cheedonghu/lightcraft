@@ -5,6 +5,8 @@ LightCraft is a clean-room, open-source, pure-Rust photo library + non-destructi
 ## Start every session here
 本 fork 的两人协作规则见 [`docs/collaboration.md`](docs/collaboration.md)：默认直接在 `dev` 开发，开始前同步一次；大任务或明确要求时使用 worktree。`main` 发布和上游同步由项目负责人手动处理。提交检查按影响范围执行，允许有记录的既有失败例外。
 
+项目中要求“提交”时，默认执行 commit 并 push 到对应远端分支；只有明确要求不 push 或仅本地提交时才不推送。
+
 1. Read `plan/STATUS.md` (current milestone, next unchecked task, blockers).
 2. Read the task in `plan/execution-plan.md` §3, the relevant section of `plan/architecture.md`, and the README/docs of the crate you touch. Behaviour/visual reference: `plan/lightroom/` (incl. `10-observed-ui.md` + screenshots).
 3. **Know where we stand:** read [`ROADMAP.md`](ROADMAP.md) → *Where we stand* (honest assessment by dimension and
