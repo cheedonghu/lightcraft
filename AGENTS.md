@@ -3,6 +3,10 @@
 LightCraft is a clean-room, open-source, pure-Rust photo library + non-destructive raw developer targeting Adobe Lightroom parity (and beyond). Native on macOS, Windows, Linux; web via WASM. Sibling of `../pdfcraft` (Acrobat), `../photocraft` (Photoshop), `../vectorcraft` (Illustrator) and `../filmcraft` (Premiere), with the same conventions.
 
 ## Start every session here
+本 fork 的两人协作规则见 [`docs/collaboration.md`](docs/collaboration.md)：默认直接在 `dev` 开发，开始前同步一次；大任务或明确要求时使用 worktree。`main` 发布和上游同步由项目负责人手动处理。提交检查按影响范围执行，允许有记录的既有失败例外。
+
+项目中要求“提交”时，默认执行 commit 并 push 到对应远端分支；只有明确要求不 push 或仅本地提交时才不推送。
+
 1. Read `plan/STATUS.md` (current milestone, next unchecked task, blockers).
 2. Read the task in `plan/execution-plan.md` §3, the relevant section of `plan/architecture.md`, and the README/docs of the crate you touch. Behaviour/visual reference: `plan/lightroom/` (incl. `10-observed-ui.md` + screenshots).
 3. **Know where we stand:** read [`ROADMAP.md`](ROADMAP.md) → *Where we stand* (honest assessment by dimension and
@@ -15,11 +19,11 @@ LightCraft is a clean-room, open-source, pure-Rust photo library + non-destructi
 
 `plan/` is gitignored (local-only).
 
-**Merging agent branches:** merge one branch, run `cargo xtask ci`, fix, commit — then the next. Two individually green
+**Merging agent branches:** merge one branch, run the relevant checks under `docs/collaboration.md`, fix new failures, commit — then the next. Two individually green
 branches can still break each other (e.g. a new struct field vs. a new constructor).
 
-**Resuming after a crash / another session:** check `git status` on main, `git worktree list`, and each worktree's
-`git log main..HEAD` + `git status` for unmerged commits or uncommitted work before starting anything new. Commit small
+**Resuming after a crash / another session:** check `git status` on dev, `git worktree list`, and each worktree's
+`git log dev..HEAD` + `git status` for unmerged commits or uncommitted work before starting anything new. Commit small
 and often so a crash loses minutes, not hours.
 
 ## Never crash (outranks feature work)
@@ -56,8 +60,8 @@ of it. Full standard: `../craftrules/standards/never-crash.md`
 - **Layering** (`plan/architecture.md` §3, enforced by `cargo xtask layers`): nothing below L5 depends on egui/eframe/winit/rfd.
 - **Everything is a command** (`crates/engine`): id, label, menu path, shortcut, params, enabled(), run(). UI, CLI, control channel and MCP all dispatch by id. Every slider is a `develop` control spec.
 - **Resolution independence:** settings use normalized image coordinates and relative radii; previews and exports must match.
-- **Quality gates** before every commit: `cargo xtask ci` (fmt, clippy -D warnings, tests, layers, assets, wasm).
-- **Commits:** one task id per commit (`M2.3: local Laplacian highlights/shadows`). Only green states. End messages with the attribution line required by the environment.
+- **Quality gates:** follow `docs/collaboration.md`; check formatting, affected builds and relevant tests before code commits. `cargo xtask ci` remains the full-check command (fmt, clippy -D warnings, tests, layers, assets, wasm), not a mandatory step for every commit. Document confirmed pre-existing failures and verify no new failures.
+- **Commits:** one task id per commit (`M2.3: local Laplacian highlights/shadows`). Checks must pass apart from documented pre-existing failures under `docs/collaboration.md`. End messages with the attribution line required by the environment.
 
 ## Assets: icons, images, fonts (ABSOLUTE RULE — never violate)
 - **Never use any iconography, image, artwork, font, sound or other asset from Adobe products** (no Lightroom/Creative Cloud icons, no screenshots, no presets/profiles/LUTs, no UI bitmaps — not even as a temporary placeholder or "reference copy"). Observing Adobe's UI to imitate *layout and behaviour* is allowed; copying or tracing its assets is not.
