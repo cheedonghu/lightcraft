@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod ai_companion;
 pub mod album_picker;
 pub mod control;
 pub mod credits;
@@ -210,6 +211,7 @@ impl QuitPrompt {
 }
 
 pub struct LightcraftApp {
+    pub ai: ai_companion::State,
     pub(crate) model_setup: model_setup::Pending,
     /// Per-catalog-revision caches of library-wide results the panels show every frame
     /// (expensive on big libraries).
@@ -331,6 +333,7 @@ impl LightcraftApp {
         // AI mask requests run on the model's worker; frames apply their results (never wait)
         session.segmenter.background = true;
         Self {
+            ai: Default::default(),
             session,
             ui: UiState::default(),
             services,
@@ -411,6 +414,12 @@ impl LightcraftApp {
 
     /// Run a UI or engine command by id. The single entry point for every frontend path.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if let Some(result) = ai_companion::command(self, id, &params) {
+            return result;
+        }
+        if ai_companion::blocks_edit(self, id, &params) {
+            return Err("AI 正在处理此照片，请先停止生成。".into());
+        }
         if let Some(result) = model_setup::intercept(self, id, &params) {
             return result;
         }
@@ -823,6 +832,7 @@ impl LightcraftApp {
         import::tick(self, ctx);
         lightroom_import::tick(self, ctx);
         tasks::poll(self, ctx);
+        ai_companion::poll(self, ctx);
         self.preview_build_status(ctx);
         self.save_status(ctx);
         self.slideshow_tick(ctx);

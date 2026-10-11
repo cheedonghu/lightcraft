@@ -508,6 +508,14 @@ under the UI command that wraps it (a no-op error); the UI command now wins.
 | LR-AI-UPDATE-INDICATOR | AI-settings update indicator | P2 | ⬜ | | |
 | LR-AI-CREDITS | Generative credits | OOS | 🚫 | | |
 
+### Photo Companion prototype (fork extension)
+
+This extension is tracked separately from Lightroom parity and does not close the AI model gaps above.
+
+| Id | Feature | Status | Evidence | Remaining scope |
+|---|---|---|---|---|
+| PC-01 | AI critique and exposure round trip | 🟡 | `cmd:ai.open`, `cmd:ai.start`, `cmd:ai.stop`, `cmd:ai.undo`, `cmd:ai.status`, `crates/ui-egui/src/ai_companion.rs`, `docs/control-protocol.md` | Native desktop prototype with a separately configured local backend: consented JPEG preview, exposure-only edits, one review/correction, stop and round undo. Verified with a controlled provider and a real model. Broader edit tools, persistent backend rounds, accounts/budgets and browser support remain open. |
+
 ## X. Cross-cutting behaviours (BEHAV)
 
 | Id | Feature | Tier | Status | Evidence | Missing / notes |

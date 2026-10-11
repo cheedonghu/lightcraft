@@ -51,6 +51,11 @@ pub fn language_from_command(id: &str) -> Option<crate::i18n::Locale> {
 }
 
 pub const UI_COMMANDS: &[UiCommand] = &[
+    ("ai.open", "AI Photo Companion", None, ""),
+    ("ai.start", "Analyze and Optimize", None, ""),
+    ("ai.stop", "Stop AI", None, ""),
+    ("ai.undo", "Undo AI Round", None, ""),
+    ("ai.status", "AI Status", None, ""),
     ("modelSetup.cancel", "Cancel Pending Photo Action", None, ""),
     ("view.photoGrid", "Photo Grid", None, "View"),
     ("view.squareGrid", "Square Grid", None, "View"),

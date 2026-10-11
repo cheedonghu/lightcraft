@@ -24,6 +24,15 @@ mode ([mcp.md](mcp.md)) is a thin layer over this channel. Implementation:
 
 ## Methods
 
+The native Photo Companion prototype registers `ai.open`, `ai.start`, `ai.stop`, `ai.undo`, and
+`ai.status` as UI commands. `ai.start {prompt?, consent?: true}` explicitly authorizes sending a
+compressed preview; opening the panel sends nothing. `ai.status` reports `busy`, `workerBusy`,
+the in-flight `photo`, and `text`. The desktop talks only to the local backend at
+`PHOTO_COMPANION_ADDR` (default `127.0.0.1:18080`); model credentials belong to that backend.
+This exposure-only prototype is documented in the adjacent backend repository's
+`.scratch/photo-companion-v1/validation.md`. Its widgets are `button:aiOpen`, `field:aiPrompt`,
+`checkbox:aiConsent`, `button:aiStart`, `button:aiStop`, and `button:aiUndo`.
+
 | Method | Params | Result |
 |---|---|---|
 | `engine.execute` (alias `ui.menu.invoke`) | `{command, params?}` | Run any engine or UI command (see `engine.commands`) |

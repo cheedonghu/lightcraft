@@ -28,7 +28,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=locales");
     let out = PathBuf::from(env::var("OUT_DIR")?);
     fs::write(out.join("tr-formats.rs"), generate()?)?;
-    let (json, people) = credits::load();
+    // Read Cargo's current directory at execution time: a cached build script
+    // may have been compiled before the checkout was moved.
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let (json, people) = credits::load(&manifest_dir);
     fs::write(out.join("credits.rs"), credits::generate(&json, &people))?;
     Ok(())
 }
@@ -116,8 +119,8 @@ mod credits {
     /// `contributors/contributors.json` and `contributors/people.toml`; `Null`/empty (with a build
     /// warning) when missing or malformed. Names come only from people.toml entries the JSON marks
     /// verified (`people_entry`).
-    pub fn load() -> (Value, toml::Table) {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contributors");
+    pub fn load(manifest_dir: &std::path::Path) -> (Value, toml::Table) {
+        let dir = manifest_dir.join("../../contributors");
         let json = read(&dir.join("contributors.json"), "the About window shows no contributors", |t| {
             serde_json::from_str::<Value>(t).map_err(|e| e.to_string())
         })
