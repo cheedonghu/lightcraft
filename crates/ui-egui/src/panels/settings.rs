@@ -642,6 +642,7 @@ pub fn open_library(app: &mut LightcraftApp, p: &Value) -> Result<Value, String>
             }
         }
     };
+    crate::ai_companion::before_library_change(app)?;
     app.session.close_library().map_err(|e| e.to_string())?;
     app.session.open_library(&path, false).map_err(|e| e.to_string())?;
     app.lightroom_last = None;

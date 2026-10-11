@@ -969,8 +969,21 @@ impl crate::Session {
         apply_crop: bool,
         thumb_bucket: Option<usize>,
     ) -> Option<RenderJob> {
+        self.build_job_with_settings(id, max_w, max_h, before, apply_crop, thumb_bucket, None)
+    }
+
+    fn build_job_with_settings(
+        &mut self,
+        id: PhotoId,
+        max_w: usize,
+        max_h: usize,
+        before: bool,
+        apply_crop: bool,
+        thumb_bucket: Option<usize>,
+        candidate: Option<Arc<DevelopSettings>>,
+    ) -> Option<RenderJob> {
         let p = self.catalog.photo(id)?.clone();
-        let settings = if before { Arc::new(self.before_settings(&p)) } else { p.develop.clone() };
+        let settings = candidate.unwrap_or_else(|| if before { Arc::new(self.before_settings(&p)) } else { p.develop.clone() });
         let level = SourceLevel::for_size(if thumb_bucket.is_some() {
             max_w.max(max_h) // (grid thumbnails of tight crops stay cheap)
         } else {
@@ -985,7 +998,8 @@ impl crate::Session {
         let source_key = Hasher128::new().str(&content_key).finish();
         let content = source_key.0 as u64;
         // Temporary "before" settings must not replace the photo's cached develop hash.
-        let settings_hash = if before { settings.hash64() } else { self.media.settings_hashes.get(id, &settings) };
+        let settings_hash =
+            if before || !Arc::ptr_eq(&settings, &p.develop) { settings.hash64() } else { self.media.settings_hashes.get(id, &settings) };
         let salt = self.media.denoise_salt(id, &settings);
         let key = settings_hash
             ^ ((max_w as u64) << 40)
@@ -1021,6 +1035,21 @@ impl crate::Session {
             view_cache: None,
             display: None,
         })
+    }
+
+    /// Detached candidate with its own source level and render key. No photo mutation.
+    pub fn candidate_job(&mut self, id: PhotoId, settings: Arc<DevelopSettings>, edge: usize) -> Result<RenderJob, String> {
+        let mut job = self.build_job_with_settings(id, edge, edge, false, true, None, Some(settings.clone())).ok_or("no such photo")?;
+        if let Some(wanted) = self.denoise_for_export(id, &settings)? {
+            let p = self.catalog.photo(id).ok_or("no such photo")?.clone();
+            job.source = self.media.source_ref_uncached(&p, job.level);
+            if let SourceRef::File { denoise, .. } = &mut job.source {
+                *denoise = Some(wanted);
+            }
+        }
+        job.request.space = lightcraft_pipeline::OutputSpace::Srgb;
+        job.request.depth = lightcraft_pipeline::OutputDepth::U8;
+        Ok(job)
     }
 
     /// A render of `id` with `settings` in place of its own, fitting `max_w × max_h` (the loupe's
@@ -1575,6 +1604,21 @@ mod tests {
         let plain: Vec<_> = s.catalog.photos().filter(|p| !p.is_edited()).map(|p| p.id).take(2).collect();
         let (a, b) = (s.render_job(plain[0], 1600, 1600, false, true).unwrap(), s.render_job(plain[1], 1600, 1600, false, true).unwrap());
         assert_ne!(a.key, b.key);
+    }
+
+    #[test]
+    fn companion_candidate_chooses_source_from_new_crop_without_mutating_photo() {
+        let mut session = crate::Session::with_demo();
+        let photo = session.catalog.photos().next().unwrap().id;
+        let original = session.develop_of(photo).unwrap();
+        let mut candidate = (*original).clone();
+        candidate.crop.geometry.rect = lightcraft_geom::Rect::new(0.45, 0.45, 0.55, 0.55);
+        let ordinary = session.candidate_job(photo, original.clone(), 640).unwrap();
+        let tight = session.candidate_job(photo, Arc::new(candidate), 640).unwrap();
+        assert_eq!(ordinary.level, SourceLevel::Preview);
+        assert_eq!(tight.level, SourceLevel::Full);
+        assert_ne!(tight.key, ordinary.key);
+        assert_eq!(*session.develop_of(photo).unwrap(), *original);
     }
 
     // Issue #323: a window of a 1:1 view is its own job: the window's pixels, at the zoom scale,

@@ -2,6 +2,25 @@ use serde_json::{Value, json};
 
 use crate::{Selection, Session, command_specs};
 
+#[test]
+fn photo_revision_detects_change_away_and_back_without_locking_other_photos() {
+    let mut s = Session::with_demo();
+    let ids = s.visible_cloned();
+    let photo = ids[0];
+    let other = ids[1];
+    s.execute("library.select", &json!({"ids":[photo.0]})).unwrap();
+    let start = s.photo_revision(photo);
+    let other_start = s.photo_revision(other);
+    s.execute("develop.set", &json!({"control":"light.exposure","value":0.5})).unwrap();
+    let changed = s.photo_revision(photo);
+    s.execute("develop.set", &json!({"control":"light.exposure","value":0.0})).unwrap();
+    assert!(changed > start && s.photo_revision(photo) > changed);
+    assert_eq!(s.photo_revision(other), other_start);
+    let before_undo = s.photo_revision(photo);
+    s.undo_step().unwrap();
+    assert!(s.photo_revision(photo) > before_undo);
+}
+
 fn demo() -> Session {
     Session::with_demo()
 }

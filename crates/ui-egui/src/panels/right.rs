@@ -38,7 +38,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().id_salt("right-scroll").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             crate::ai_companion::panel(app, ui, id);
-            if app.ai.busy_photo() == Some(id) {
+            if app.ai.is_busy(id) {
                 ui.disable();
             }
             match app.ui.right {

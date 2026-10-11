@@ -363,6 +363,48 @@ impl Renderer {
         self.stages.remove(&slot);
     }
 
+    /// Publish the real AI candidate before acknowledging execution. Superseded
+    /// workers cannot replace it with pixels from an older edit.
+    pub fn publish_companion(&mut self, ctx: &egui::Context, photo: PhotoId, key: u64, rendered: &lightcraft_pipeline::Rendered, active: bool) {
+        let slot = if active { Slot::Main } else { Slot::Thumb(photo) };
+        self.pending.remove(&slot);
+        self.request_ids.remove(&slot);
+        self.queue.retain(|q| q.slot != slot);
+        self.stages.remove(&slot);
+        self.shown_ids.insert(slot, lightcraft_preview::next_tick());
+        let mut shown = RenderResult {
+            request_id: 0,
+            source_key: None,
+            photo,
+            level: lightcraft_engine::media::SourceLevel::Thumb,
+            key,
+            rendered: Ok(lightcraft_pipeline::Rendered { image: rendered.image.clone(), histogram: rendered.histogram.clone(), deep: None }),
+            loaded: None,
+            quick: None,
+            display: None,
+        };
+        if let Some(display) = &self.display {
+            lightcraft_engine::display::present(&mut shown, display);
+        }
+        let presented = shown.rendered.as_ref().unwrap_or(rendered);
+        let color = Arc::new(color_image(&presented.image));
+        let tex = ctx.load_texture(format!("companion:{photo:?}"), color.clone(), egui::TextureOptions::LINEAR);
+        self.textures.insert(
+            slot,
+            Tex {
+                key,
+                photo,
+                tex,
+                size: [rendered.image.width, rendered.image.height],
+                histogram: Some(rendered.histogram.clone()),
+                ms: 0.0,
+                quick: None,
+                pixels: self.keep_pixels.then_some(color),
+            },
+        );
+        ctx.request_repaint();
+    }
+
     /// Run jobs through `offload` from now on (instead of the job pool / inline).
     pub fn set_offload(&mut self, offload: Box<dyn RenderOffload>) {
         self.offload = Some(offload);

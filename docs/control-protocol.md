@@ -24,14 +24,19 @@ mode ([mcp.md](mcp.md)) is a thin layer over this channel. Implementation:
 
 ## Methods
 
-The native Photo Companion prototype registers `ai.open`, `ai.start`, `ai.stop`, `ai.undo`, and
-`ai.status` as UI commands. `ai.start {prompt?, consent?: true}` explicitly authorizes sending a
-compressed preview; opening the panel sends nothing. `ai.status` reports `busy`, `workerBusy`,
-the in-flight `photo`, and `text`. The desktop talks only to the local backend at
-`PHOTO_COMPANION_ADDR` (default `127.0.0.1:18080`); model credentials belong to that backend.
-This exposure-only prototype is documented in the adjacent backend repository's
-`.scratch/photo-companion-v1/validation.md`. Its widgets are `button:aiOpen`, `field:aiPrompt`,
-`checkbox:aiConsent`, `button:aiStart`, `button:aiStop`, and `button:aiUndo`.
+The native Photo Companion extension registers `ai.open`, `ai.start`, `ai.stop`, `ai.undo`,
+`ai.clear`, and `ai.status` as UI commands. `ai.start {prompt?, consent?: true}` sends only a
+compressed preview and the current photo's context. Opening the panel sends nothing. `ai.status
+{photo?}` reports `busy`, `workerBusy`, `photo`, `round`, `activePhotos`, and streamed `text`;
+`ai.stop`, `ai.undo`, and `ai.clear` also accept `photo?` (otherwise the active photo).
+The desktop uses one SSE connection to the loopback backend at `PHOTO_COMPANION_ADDR`
+(default `127.0.0.1:18080`); model credentials belong to that backend. Full native edit plans are
+validated and rendered before a photo-specific commit. Normal libraries preserve conversations
+and preview attachments; `ai.clear` removes that context without changing edits. Undo refuses
+to overwrite subsequent manual edits. Accounts, budgets, and browser support remain later work.
+See the adjacent backend's `.scratch/photo-companion-v1/validation.md`. Widgets are
+`button:aiOpen`, `field:aiPrompt`, `checkbox:aiConsent`, `button:aiStart`, `button:aiStop`, and
+`button:aiUndo`.
 
 | Method | Params | Result |
 |---|---|---|

@@ -56,6 +56,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("ai.stop", "Stop AI", None, ""),
     ("ai.undo", "Undo AI Round", None, ""),
     ("ai.status", "AI Status", None, ""),
+    ("ai.clear", "Delete AI Conversation", None, ""),
     ("modelSetup.cancel", "Cancel Pending Photo Action", None, ""),
     ("view.photoGrid", "Photo Grid", None, "View"),
     ("view.squareGrid", "Square Grid", None, "View"),
@@ -493,6 +494,12 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
         "app.openLibrary" => crate::panels::settings::open_library(app, p),
         "app.displayProfile" => crate::panels::settings::display_profile(app, p),
         "file.backupLibrary" | "file.restoreLibrary" => {
+            if id == "file.restoreLibrary"
+                && app.services.restore_library.is_some()
+                && let Err(error) = crate::ai_companion::before_library_change(app)
+            {
+                return Some(Err(error));
+            }
             let action = if id == "file.backupLibrary" { app.services.backup_library.as_mut() } else { app.services.restore_library.as_mut() };
             match action {
                 Some(f) => f(&mut app.session),

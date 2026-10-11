@@ -414,6 +414,9 @@ impl LightcraftApp {
 
     /// Run a UI or engine command by id. The single entry point for every frontend path.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if matches!(id, "library.open" | "library.new" | "library.close") {
+            ai_companion::before_library_change(self)?;
+        }
         if let Some(result) = ai_companion::command(self, id, &params) {
             return result;
         }
@@ -1624,5 +1627,7 @@ mod cache_tests {
     }
 }
 
+#[cfg(test)]
+mod tests_companion;
 #[cfg(test)]
 mod tests_model_setup;

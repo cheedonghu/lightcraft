@@ -111,6 +111,42 @@ struct ViewFile {
 }
 
 impl Library {
+    pub fn companion_attachment(&mut self, photo: lightcraft_catalog::PhotoId, data: &[u8]) -> Result<String> {
+        if data.is_empty() || data.len() > 128 * 1024 {
+            return Err(EngineError::Other("AI preview exceeds limits".into()));
+        }
+        let name = format!("companion-{}-{:032x}.bin", photo.0, lightcraft_preview::hash_bytes(data).0);
+        self.files.write_atomic(&name, data).map_err(|e| EngineError::Other(format!("cannot save AI preview: {e}")))?;
+        Ok(name)
+    }
+    pub fn read_companion_attachment(&mut self, name: &str) -> Result<Vec<u8>> {
+        validate_companion_attachment(name)?;
+        if self.on_disk
+            && std::fs::metadata(self.dir.join(name)).map_err(|_| EngineError::Other("AI preview attachment is missing".into()))?.len() > 128 * 1024
+        {
+            return Err(EngineError::Other("AI preview attachment exceeds limits".into()));
+        }
+        let bytes = self
+            .files
+            .read(name)
+            .map_err(|_| EngineError::Other("cannot read AI preview attachment".into()))?
+            .ok_or_else(|| EngineError::Other("AI preview attachment is missing".into()))?;
+        if bytes.is_empty() || bytes.len() > 128 * 1024 {
+            return Err(EngineError::Other("AI preview attachment exceeds limits".into()));
+        }
+        Ok(bytes)
+    }
+    pub fn remove_companion_attachment(&self, name: &str) -> Result<()> {
+        validate_companion_attachment(name)?;
+        if self.on_disk {
+            match std::fs::remove_file(self.dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(EngineError::Other("cannot remove AI preview attachment".into())),
+            }
+        }
+        Ok(())
+    }
     pub fn journal(&self) -> &Journal {
         &self.journal
     }
@@ -124,6 +160,18 @@ impl Library {
     pub fn originals_dir(&self) -> PathBuf {
         self.dir.join("Originals")
     }
+}
+fn validate_companion_attachment(name: &str) -> Result<()> {
+    let valid = name.len() <= 80
+        && name.strip_prefix("companion-").and_then(|s| s.strip_suffix(".bin")).is_some_and(|s| {
+            s.split_once('-').is_some_and(|(photo, hash)| {
+                !photo.is_empty() && photo.bytes().all(|b| b.is_ascii_digit()) && hash.len() == 32 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+        });
+    if !valid {
+        return Err(EngineError::Other("invalid AI attachment reference".into()));
+    }
+    Ok(())
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -312,6 +360,7 @@ impl Session {
         catalog.revision = LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1) << 32;
         self.catalog = catalog;
         self.library_generation = crate::LIBRARY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.photo_revisions.clear();
         self.undo.clear();
         self.redo.clear();
         self.interaction = None;

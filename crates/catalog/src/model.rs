@@ -292,6 +292,9 @@ pub struct Photo {
     /// whether the user changed anything since (see [`crate::local`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_baseline: Option<u64>,
+    /// Photo Companion conversation/round archive; image bytes live in library attachments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion: Option<serde_json::Value>,
 }
 
 /// What assisted culling measured on a photo.
@@ -348,6 +351,7 @@ impl Photo {
             analysis: None,
             preview_only: None,
             local_baseline: None,
+            companion: None,
         }
     }
     /// A raw file developed from its sensor data: not a rendered image, and not a raw shown from

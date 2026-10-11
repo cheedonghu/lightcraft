@@ -32,6 +32,11 @@ pub fn may_close(app: &mut LightcraftApp) -> bool {
         }));
         return false;
     }
+    if let Err(error) = crate::ai_companion::before_library_change(app) {
+        log::error!("quit: AI conversation not saved: {error}");
+        app.quit_prompt = Some(QuitPrompt::Unsaved(error));
+        return false;
+    }
     if app.session.unsaved().is_none() {
         return true;
     }
