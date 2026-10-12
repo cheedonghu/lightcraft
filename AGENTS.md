@@ -7,6 +7,8 @@ LightCraft is a clean-room, open-source, pure-Rust photo library + non-destructi
 
 项目中要求“提交”时，默认执行 commit 并 push 到对应远端分支；只有明确要求不 push 或仅本地提交时才不推送。
 
+**纯上游 bug 的处理（维护者决定，2026-10-12）：** 修复前先检查上游最新代码、未合并 PR 和相关 issue，确认是否已有同一问题的修复；已有修复时先不重复处理，记录链接与覆盖范围，等待上游合并后同步。没有现成修复时，修复应与 fork 的 AI 功能和同步改动分开，并附最小复现与回归测试；可尝试从上游基线创建独立 bugfix PR。不得把整个 fork 的 `dev` 或 AI 扩展提交到上游。对已在本 fork 修复的问题，回馈上游前同样先检查重复修复。
+
 1. Read `plan/STATUS.md` (current milestone, next unchecked task, blockers).
 2. Read the task in `plan/execution-plan.md` §3, the relevant section of `plan/architecture.md`, and the README/docs of the crate you touch. Behaviour/visual reference: `plan/lightroom/` (incl. `10-observed-ui.md` + screenshots).
 3. **Know where we stand:** read [`ROADMAP.md`](ROADMAP.md) (stage, headline numbers, every dimension) and, for

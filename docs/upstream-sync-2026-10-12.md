@@ -61,3 +61,23 @@
 
 验证日志及桌面截图保存在本次工作区的 `target/upstream-*.log` 和
 `target/upstream-native/`，属于忽略的验证产物，不进入提交。
+
+## 上游修复排重（2026-10-12）
+
+按维护者要求，回馈纯上游 bug 前先查最新上游代码、未合并 PR 及相关 issue。
+本次读取上游 main（仍为 `25ef65c8`）和全部 274 个打开的 PR，核对相关 PR 的文件补丁：
+
+- [#1052](https://github.com/storytold/lightcraft/pull/1052) 已修复 Windows
+  `same_file` 的对称性、大小写敏感卷上的不同文件保护、假文件系统及预期路径的分隔符、
+  Unix 测试专用锁方法和 `chunks_exact_to_as_chunks`；此外还保留重命名与保存时的 XMP 拼写。
+  与本 fork 本次兼容修复重合，不另提重复 PR。
+- [#1007](https://github.com/storytold/lightcraft/pull/1007) 覆盖侧车故障注入及大小写不敏感卷测试；
+  [#997](https://github.com/storytold/lightcraft/pull/997) 单独修复固定大小分块的 Clippy 报错。
+- [#1159](https://github.com/storytold/lightcraft/pull/1159) 已整合上述修复与三种桌面平台的 CI，
+  相关跟踪问题为 [#989](https://github.com/storytold/lightcraft/issues/989)。以上 PR 仍未合并，
+  先不继续处理，后续上游落地再同步并归一化已有本地兼容修改。
+- 对先前 `missing_const_for_thread_local` 诊断未找到对应打开的 PR；原代码已经使用 `const` 初始化。
+  独立最小例子及当前 dev 的 `cargo clippy --locked -p lightcraft-catalog --all-targets -- -D warnings`
+  均通过，因此该诊断目前不能稳定复现，不能据此提交产品 bugfix PR。
+
+本次只记录处理规则和排重证据，保留已验证的 dev 修复；不引入未合并的上游分支。
