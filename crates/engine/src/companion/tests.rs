@@ -3,6 +3,26 @@ use lightcraft_develop::DevelopSettings;
 use serde_json::json;
 
 #[test]
+fn companion_white_balance_uses_the_upstream_kelvin_scale() {
+    use lightcraft_develop::{WbMode, WbScale};
+    let mut settings = DevelopSettings::default();
+    settings.wb.mode = WbMode::Custom;
+    settings.wb.temp = 5800.0;
+    settings.wb.tint = 3.0;
+    let info = lightcraft_pipeline::SourceInfo { raw: true, relative_wb: false, as_shot_temp: 4986.0, as_shot_tint: -2.0, ..Default::default() };
+    let context = CandidateContext::new(Arc::new(Rgb32f::filled(60, 40, [0.2; 3])), info, &settings, "current");
+    let (_, expected_tint) = lightcraft_pipeline::auto::current_wb(&context.info, &settings);
+    let changed = candidate(&settings, &json!({"operations":[{"type":"set_controls","values":{"wb.temp":6100}}]}), &context).unwrap();
+    assert_eq!(changed.wb.scale, WbScale::Kelvin);
+    assert_eq!(changed.wb.temp, 6100.0);
+    assert_eq!(changed.wb.tint, expected_tint);
+    let changed = candidate(&settings, &json!({"operations":[{"type":"set_white_balance","mode":"custom","temp":6100,"tint":4}]}), &context).unwrap();
+    assert_eq!(changed.wb.scale, WbScale::Kelvin);
+    assert_eq!((changed.wb.temp, changed.wb.tint), (6100.0, 4.0));
+    assert_eq!(settings.wb.scale, WbScale::Legacy, "the original is unchanged");
+}
+
+#[test]
 fn separate_white_balance_controls_preserve_each_other() {
     let settings = DevelopSettings::default();
     let context = CandidateContext::new(Arc::new(Rgb32f::filled(60, 40, [0.2, 0.1, 0.05])), Default::default(), &settings, "current");

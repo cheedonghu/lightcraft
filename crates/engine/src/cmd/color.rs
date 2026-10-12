@@ -6,7 +6,10 @@
 //! picked colour is the one the adjustment will see (e.g. Point Color samples after the colour
 //! mixer, before vibrance, grading, vignette and curves).
 
+use lightcraft_color::perceptual::{lab_to_lch, oklab_from_2020};
 use lightcraft_color::spline::MonotoneCurve;
+use lightcraft_color::transfer::srgb_to_linear;
+use lightcraft_color::{REC2020, SRGB};
 use lightcraft_develop::{DevelopSettings, MAX_POINT_COLORS, MIXER_BANDS, PointColor, ToneCurve, Treatment, controls};
 use lightcraft_geom::Point;
 use serde_json::{Value, json};
@@ -15,7 +18,8 @@ use super::{CommandSpec, bad, cmd, f64_req, has_active};
 use crate::media::SourceLevel;
 use crate::{Result, Session};
 
-use crate::color_sampling::{after_mixer_neutral, encoded_to_oklch};
+/// Long edge of the proxy rendered for sampling.
+const PROBE_EDGE: usize = 384;
 
 /// The sRGB-encoded colour (0..1) at normalized image point `(x, y)` of the active photo rendered
 /// with its settings changed by `neutral`, averaged over 3 × 3 proxy pixels.
@@ -24,7 +28,58 @@ pub(crate) fn probe(s: &mut Session, c: &str, x: f64, y: f64, neutral: impl FnOn
     let src = s.source_now(id, SourceLevel::Thumb).map_err(|e| bad(c, e))?;
     let info = s.source_info(id);
     let d = s.develop_of(id).unwrap_or_default();
-    Ok(crate::color_sampling::probe(&src, &info, &d, Point::new(x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)), neutral))
+    Ok(probe_source(&src, &info, &d, Point::new(x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)), neutral))
+}
+
+/// The upstream probe on an explicit source, also usable by detached edit candidates.
+pub(crate) fn probe_source(
+    src: &lightcraft_raster::Rgb32f,
+    info: &lightcraft_pipeline::SourceInfo,
+    settings: &DevelopSettings,
+    point: Point,
+    neutral: impl FnOnce(&mut DevelopSettings),
+) -> [f32; 3] {
+    let mut d = settings.clone();
+    neutral(&mut d);
+    let req = lightcraft_pipeline::RenderRequest::fit(PROBE_EDGE, PROBE_EDGE);
+    let plan = lightcraft_pipeline::plan(src, info, &d, &req);
+    let q = plan.frame.norm_to_out(plan.w, plan.h).apply(point);
+    let img = lightcraft_pipeline::render(src, info, &d, &req).image;
+    let (cx, cy) = (q.x.floor() as isize, q.y.floor() as isize);
+    let mut acc = [0.0f32; 3];
+    let mut n = 0.0;
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let (px, py) = (
+                (cx + dx).clamp(0, img.width.saturating_sub(1) as isize) as usize,
+                (cy + dy).clamp(0, img.height.saturating_sub(1) as isize) as usize,
+            );
+            let p = img.get(px, py);
+            for (channel, value) in acc.iter_mut().enumerate() {
+                *value += f32::from(p.get(channel).copied().unwrap_or(0)) / 255.0;
+            }
+            n += 1.0;
+        }
+    }
+    acc.map(|v| v / n)
+}
+
+/// sRGB-encoded → OkLCh (lightness, chroma, hue in radians) via linear Rec.2020.
+pub(crate) fn encoded_to_oklch(e: [f32; 3]) -> [f32; 3] {
+    let lin = SRGB.to_space(&REC2020).apply_f32(e.map(srgb_to_linear));
+    lab_to_lch(oklab_from_2020(lin))
+}
+
+/// Everything after the colour mixer, neutralized (the colour Point Color sees).
+pub(crate) fn after_mixer_neutral(d: &mut DevelopSettings) {
+    d.color.vibrance = 0.0;
+    d.color.saturation = 0.0;
+    d.point_colors.clear();
+    d.treatment = Treatment::Color;
+    d.grading = Default::default();
+    d.vignette.amount = 0.0;
+    d.grain.amount = 0.0;
+    d.curve = Default::default();
 }
 
 /// The targeted adjustment tool: the controls (and their new values) a vertical drag of `delta`

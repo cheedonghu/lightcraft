@@ -49,7 +49,7 @@
 //! | 4 | Reload reads lens data | `Op::SetEmbeddedLens` |
 //! | 5 | the keyword list | `Op::SetKeyword`, `Catalog.keyword_list` |
 //! | 6 | folder labels | `Op::SetFolderRecord`, `Catalog.folder_records` |
-//! | 7 | Photo Companion | `Op::SetPhotoCompanion`, `Photo.companion` and local preview references |
+//! | 7 | Kelvin white balance for raws whose camera has matrices (#730) | `Op::SetAsShotWb`, `WhiteBalance.scale` |
 //!
 //! Rules:
 //! - **Bump [`VERSION`]** (and add a row above) in the change that adds an [`Op`] variant or a

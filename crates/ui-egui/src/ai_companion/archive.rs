@@ -6,7 +6,7 @@ impl State {
             return Ok(());
         }
         let mut conversation = Conversation::default();
-        if let Some(archive) = app.session.catalog.photo(photo).and_then(|p| p.companion.as_ref()) {
+        if let Some(archive) = app.session.photo_companion(photo).map_err(|e| e.to_string())? {
             if archive.get("schema_version").and_then(Value::as_u64) != Some(1) {
                 return Err("AI 对话格式不支持，未删减历史。".into());
             }

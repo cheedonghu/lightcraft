@@ -114,7 +114,6 @@ impl Photo {
             && self.versions.is_empty()
             && *self.develop == self.import_defaults()
             && self.analysis.is_none()
-            && self.companion.is_none()
             && m.title.is_empty()
             && m.caption.is_empty()
             && m.alt_text.is_empty()
@@ -274,7 +273,6 @@ impl Op {
             | Op::SetFlag { id, .. }
             | Op::SetLabel { id, .. }
             | Op::SetDevelop { id, .. }
-            | Op::SetPhotoCompanion { id, .. }
             | Op::SetMeta { id, .. }
             | Op::SetDeleted { id, .. }
             | Op::SetLocal { id, .. }
@@ -286,7 +284,8 @@ impl Op {
             | Op::SetFile { id, .. }
             | Op::Relink { id, .. }
             | Op::SetContent { id, .. }
-            | Op::SetEmbeddedLens { id, .. } => out(*id),
+            | Op::SetEmbeddedLens { id, .. }
+            | Op::SetAsShotWb { id, .. } => out(*id),
             Op::AddAlbum { album } => {
                 album.photos.iter().for_each(|p| out(*p));
                 album.cover.into_iter().for_each(&mut *out);

@@ -3,6 +3,9 @@ mod archive;
 #[cfg(test)]
 #[path = "ai_companion/disconnect_tests.rs"]
 mod disconnect_tests;
+#[cfg(test)]
+#[path = "ai_companion/library_tests.rs"]
+mod library_tests;
 mod network;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -684,6 +687,12 @@ fn close_pending_tools(messages: &mut Vec<Value>) {
 pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
     let mut state = std::mem::take(&mut app.ai);
     state.poll_inner(app, ctx);
+    if state.open
+        && let Some(photo) = app.session.active()
+        && let Err(e) = state.load(app, photo)
+    {
+        state.text = e;
+    }
     app.ai = state;
 }
 pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
@@ -814,6 +823,7 @@ pub fn blocks_edit(app: &LightcraftApp, command: &str, params: &Value) -> bool {
         return blocked;
     }
     let safe = command.starts_with("view.")
+        || command.starts_with("ui.")
         || matches!(
             command,
             "library.select"
@@ -830,6 +840,8 @@ pub fn blocks_edit(app: &LightcraftApp, command: &str, params: &Value) -> bool {
                 | "library.open"
                 | "library.new"
                 | "library.close"
+                | "app.openLibrary"
+                | "app.newLibrary"
                 | "photo.info"
                 | "photo.inspect"
                 | "develop.get"
@@ -858,18 +870,24 @@ fn display_text(conversation: &Conversation) -> String {
     text.push_str(&conversation.notice);
     text
 }
-pub fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
-    if !app.ai.open && !matches!(app.ui.right, crate::state::RightPanel::Edit) {
+pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
+    if !app.ai.open {
         return;
     }
-    egui::Frame::NONE.inner_margin(egui::Margin::same(16)).show(ui, |ui| {
-        let open = ui.button("AI 点评并优化");
-        crate::widgets::register(ui.ctx(), "button:aiOpen", open.rect);
-        if open.clicked() {
-            let _ = app.run("ai.open", json!({}));
+    let mut open = true;
+    egui::Window::new("AI Photo Companion").id(egui::Id::new("photo-companion-window")).open(&mut open).default_width(420.0).show(ctx, |ui| {
+        if let Some(photo) = app.session.active() {
+            panel(app, ui, photo);
+        } else {
+            ui.label("请选择一张照片。");
         }
-        if !app.ai.open {
-            return;
+    });
+    app.ai.open = open;
+}
+fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
+    egui::Frame::NONE.inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+        if let Some(p) = app.session.catalog.photo(photo) {
+            ui.label(p.file_name.as_str());
         }
         ui.label("理解照片并自然优化。原始照片留在本机。");
         let busy = app.ai.jobs.contains_key(&photo);

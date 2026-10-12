@@ -10,8 +10,8 @@ pub fn sample(context: &CandidateContext, settings: &DevelopSettings, args: &Val
     )?;
     match args.get("purpose").and_then(Value::as_str) {
         Some("point_color") => {
-            let rgb = crate::color_sampling::probe(&context.source, &context.info, settings, p, crate::color_sampling::after_mixer_neutral);
-            let [lum, chroma, hue] = crate::color_sampling::encoded_to_oklch(rgb);
+            let rgb = crate::cmd::color::probe_source(&context.source, &context.info, settings, p, crate::cmd::color::after_mixer_neutral);
+            let [lum, chroma, hue] = crate::cmd::color::encoded_to_oklch(rgb);
             Ok(json!({"space":"OkLCh","frame_id":context.frame_id,"sample":{"lum":lum,"chroma":chroma,"hue":hue.to_degrees().rem_euclid(360.0)}}))
         }
         Some("color_range") => {

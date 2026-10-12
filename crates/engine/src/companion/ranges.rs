@@ -1,5 +1,4 @@
-//! Shared local adjustment ranges for UI commands and strict companion candidates.
-use crate::LocalAdjustments;
+//! Strict companion parameter limits; ordinary mask commands retain upstream clamping.
 
 pub const LOCAL_RANGES: &[(&str, f64, f64)] = &[
     ("exposure", -4.0, 4.0),
@@ -23,12 +22,3 @@ pub const LOCAL_RANGES: &[(&str, f64, f64)] = &[
     ("color_sat", 0.0, 100.0),
     ("amount", 0.0, 200.0),
 ];
-
-pub fn clamp(a: LocalAdjustments) -> LocalAdjustments {
-    let mut value = serde_json::to_value(a).unwrap_or_default();
-    for &(name, lo, hi) in LOCAL_RANGES {
-        let n = value.get(name).and_then(serde_json::Value::as_f64).filter(|n| n.is_finite()).unwrap_or(0.0).clamp(lo, hi);
-        value[name] = serde_json::json!(n);
-    }
-    serde_json::from_value(value).unwrap_or_default()
-}

@@ -176,7 +176,6 @@ fn bad_crc_is_still_a_torn_tail() {
 fn op_variants_are_versioned() {
     fn since(op: &Op) -> u32 {
         match op {
-            Op::SetPhotoCompanion { .. } => 7,
             Op::AddPhoto { .. }
             | Op::RemovePhoto { .. }
             | Op::SetRating { .. }
@@ -211,8 +210,9 @@ fn op_variants_are_versioned() {
             Op::SetEmbeddedLens { .. } => 4,
             Op::SetKeyword { .. } => 5,
             Op::SetFolderRecord { .. } => 6,
+            Op::SetAsShotWb { .. } => 7,
         }
     }
-    let newest = since(&Op::SetPhotoCompanion { id: PhotoId(1), conversation: None });
+    let newest = since(&Op::SetAsShotWb { id: PhotoId(1), wb: None });
     assert_eq!(newest, VERSION, "the newest op's version must be the current format version");
 }

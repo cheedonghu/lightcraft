@@ -18,7 +18,7 @@ fn public_round_undo_restores_complete_settings_and_retains_conversation() {
     let (mut app, photo, original) = archived();
     app.run("ai.undo", json!({})).unwrap();
     assert_eq!(*app.session.develop_of(photo).unwrap(), original);
-    let archive = app.session.catalog.photo(photo).unwrap().companion.as_ref().unwrap();
+    let archive = app.session.photo_companion(photo).unwrap().unwrap();
     assert_eq!(archive["messages"].as_array().unwrap().len(), 2);
     assert_eq!(archive["checkpoint"]["eligible"], false);
     assert!(app.run("ai.undo", json!({})).is_err());
@@ -32,7 +32,7 @@ fn unopened_conversation_cannot_undo_after_manual_change_away_and_back() {
     assert_eq!(*app.session.develop_of(photo).unwrap(), *before);
     assert!(app.run("ai.undo", json!({})).unwrap_err().contains("历史恢复"));
     app.run("ai.clear", json!({})).unwrap();
-    assert!(app.session.catalog.photo(photo).unwrap().companion.is_none());
+    assert!(app.session.photo_companion(photo).unwrap().is_none());
     assert_eq!(*app.session.develop_of(photo).unwrap(), *before);
 }
 

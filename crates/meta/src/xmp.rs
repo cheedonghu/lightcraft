@@ -418,7 +418,7 @@ fn parse_one_region(item: &XmpValue, px_dims: Option<(f64, f64)>) -> Option<Regi
     // frame and writes the orientation as the region's `mwg-rs:Rotation` (π for 3, −π/2 for 6, +π/2 for
     // 8; 0 for 1) while `AppliedToDimensions` names the upright size. Turn it into the upright frame.
     // MWG has no way to say "mirrored", so orientations 2/4/5/7 can't be told apart from their unmirrored
-    // twins here; boxes on mirrored photos are taken as written (see LR-LIB-PEOPLE in docs/parity.md).
+    // twins here; boxes on mirrored photos are taken as written (see LR-LIB-PEOPLE in docs/parity-checklist.md).
     let rotation = item.field("mwg-rs:Rotation").and_then(XmpValue::text).and_then(parse_number).filter(|r| r.is_finite());
     let (quarter, half) = (std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
     let (cx, cy, w, h) = match rotation {

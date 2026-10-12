@@ -1,7 +1,10 @@
 //! Pure, photo-bound candidate transformations used by the companion bridge.
+pub(crate) mod archive;
+mod ranges;
+use ranges::LOCAL_RANGES;
 mod sampling;
 mod schemas;
-use lightcraft_develop::{DevelopSettings, Mask, MaskComponent, MaskOp, MaskShape, PointColor, Treatment, WbMode, controls, local::LOCAL_RANGES};
+use lightcraft_develop::{DevelopSettings, Mask, MaskComponent, MaskOp, MaskShape, PointColor, Treatment, WbMode, controls};
 use lightcraft_geom::{CropGeometry, Point, Rect};
 use lightcraft_pipeline::{RenderRequest, SourceInfo, geometry::Frame};
 use lightcraft_raster::Rgb32f;
@@ -130,6 +133,7 @@ pub fn candidate(original: &DevelopSettings, plan: &Value, context: &CandidateCo
                         return Err("白平衡模式与数值控件冲突。".into());
                     }
                     if seen.insert("white_balance_controls".into()) {
+                        lightcraft_pipeline::local::normalize_wb(&mut candidate, &context.info);
                         let (t, ti) = lightcraft_pipeline::auto::current_wb(&context.info, &candidate);
                         candidate.wb.temp = t;
                         candidate.wb.tint = ti;
@@ -170,7 +174,8 @@ pub fn candidate(original: &DevelopSettings, plan: &Value, context: &CandidateCo
                 };
                 range(t, 2000.0, 50000.0)?;
                 range(ti, -150.0, 150.0)?;
-                candidate.wb = lightcraft_develop::WhiteBalance { mode, temp: t, tint: ti };
+                lightcraft_pipeline::local::normalize_wb(&mut candidate, &context.info);
+                candidate.wb = lightcraft_develop::WhiteBalance { mode, temp: t, tint: ti, ..candidate.wb };
             }
             Operation::Treatment { treatment } => {
                 once(&mut seen, "treatment".into())?;

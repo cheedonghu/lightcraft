@@ -1,0 +1,275 @@
+//! Companion-owned persistence. It never adds catalog fields, ops or format versions.
+use crate::{EngineError, Result, Session};
+use lightcraft_catalog::{PhotoId, Store};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+pub const STATE_FILE: &str = "companion/state.json";
+const MAX_ARCHIVE: u64 = 64 << 20;
+
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    format: String,
+    version: u32,
+    photos: BTreeMap<PhotoId, Value>,
+}
+
+#[derive(Default)]
+pub(crate) struct Archive {
+    photos: BTreeMap<PhotoId, Value>,
+    dirty: bool,
+    blocked: Option<String>,
+    error: Option<String>,
+    retry_at: Option<web_time::Instant>,
+}
+fn error(e: impl std::fmt::Display) -> EngineError {
+    EngineError::Other(format!("AI archive: {e}"))
+}
+impl Archive {
+    pub(crate) fn load(store: &mut dyn Store, dir: &Path, on_disk: bool) -> Self {
+        let mut read = || -> Result<Self> {
+            if on_disk && std::fs::metadata(dir.join(STATE_FILE)).is_ok_and(|m| m.len() > MAX_ARCHIVE) {
+                return Err(error("file exceeds 64 MiB"));
+            }
+            let Some(bytes) = store.read(STATE_FILE).map_err(error)? else { return Ok(Self::default()) };
+            if bytes.len() as u64 > MAX_ARCHIVE {
+                return Err(error("file exceeds 64 MiB"));
+            }
+            let saved: Saved = serde_json::from_slice(&bytes).map_err(error)?;
+            if saved.format != "lightcraft-companion" || saved.version != 1 {
+                return Err(error("unsupported format; the file was left unchanged"));
+            }
+            Ok(Self { photos: saved.photos, ..Default::default() })
+        };
+        match read() {
+            Ok(a) => a,
+            Err(e) => {
+                log::error!("{e}");
+                Self { blocked: Some(e.to_string()), ..Default::default() }
+            }
+        }
+    }
+    pub(crate) fn invalidate(&mut self, ids: &BTreeSet<PhotoId>) {
+        for id in ids {
+            if let Some(a) = self.photos.get_mut(id)
+                && a.pointer("/checkpoint/eligible").and_then(Value::as_bool) == Some(true)
+            {
+                a["checkpoint"]["eligible"] = json!(false);
+                self.dirty = true;
+            }
+        }
+    }
+    pub(crate) fn needs_retry(&self) -> bool {
+        self.dirty && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t)
+    }
+    pub(crate) fn unsaved(&self) -> Option<&str> {
+        self.error.as_deref().filter(|_| self.dirty)
+    }
+    fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        if let Some(e) = &self.blocked {
+            return Err(error(e));
+        }
+        let result = (|| {
+            let saved = Saved { format: "lightcraft-companion".into(), version: 1, photos: self.photos.clone() };
+            let bytes = serde_json::to_vec(&saved).map_err(error)?;
+            if bytes.len() as u64 > MAX_ARCHIVE {
+                return Err(error("file exceeds 64 MiB"));
+            }
+            if library.on_disk {
+                std::fs::create_dir_all(library.dir.join("companion")).map_err(error)?;
+            }
+            library.files.write_atomic(STATE_FILE, &bytes).map_err(error)?;
+            sync_directory(library)
+        })();
+        match result {
+            Ok(()) => {
+                self.dirty = false;
+                self.error = None;
+                self.retry_at = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                self.retry_at = Some(web_time::Instant::now() + std::time::Duration::from_secs(2));
+                Err(EngineError::NotSaved(e.to_string()))
+            }
+        }
+    }
+}
+impl Session {
+    pub fn photo_companion(&self, photo: PhotoId) -> Result<Option<&Value>> {
+        if let Some(e) = &self.companion_archive.blocked {
+            return Err(error(e));
+        }
+        Ok(self.companion_archive.photos.get(&photo))
+    }
+    pub fn set_photo_companion(&mut self, photo: PhotoId, conversation: Option<Value>) -> Result<()> {
+        if self.catalog.photo(photo).is_none() {
+            return Err(error("no such photo"));
+        }
+        if let Some(e) = &self.companion_archive.blocked {
+            return Err(error(e));
+        }
+        match conversation {
+            Some(value) => {
+                self.companion_archive.photos.insert(photo, value);
+            }
+            None => {
+                self.companion_archive.photos.remove(&photo);
+            }
+        }
+        self.companion_archive.dirty = true;
+        self.flush_companion()
+    }
+    pub(crate) fn flush_companion(&mut self) -> Result<()> {
+        match self.library.as_mut() {
+            Some(lib) => self.companion_archive.persist(lib),
+            None => Ok(()),
+        }
+    }
+}
+
+impl crate::library::Library {
+    pub fn companion_attachment(&mut self, photo: PhotoId, data: &[u8]) -> Result<String> {
+        if data.is_empty() || data.len() > 128 * 1024 {
+            return Err(error("preview exceeds limits"));
+        }
+        let name = format!("companion/preview-{}-{:032x}.bin", photo.0, lightcraft_preview::hash_bytes(data).0);
+        if self.on_disk {
+            std::fs::create_dir_all(self.dir.join("companion")).map_err(error)?;
+        }
+        self.files.write_atomic(&name, data).map_err(error)?;
+        sync_directory(self)?;
+        Ok(name)
+    }
+    pub fn read_companion_attachment(&mut self, name: &str) -> Result<Vec<u8>> {
+        validate_attachment(name)?;
+        if self.on_disk && std::fs::metadata(self.dir.join(name)).map_err(error)?.len() > 128 * 1024 {
+            return Err(error("preview exceeds limits"));
+        }
+        let bytes = self.files.read(name).map_err(error)?.ok_or_else(|| error("preview is missing"))?;
+        if bytes.is_empty() || bytes.len() > 128 * 1024 {
+            return Err(error("preview exceeds limits"));
+        }
+        Ok(bytes)
+    }
+    pub fn remove_companion_attachment(&self, name: &str) -> Result<()> {
+        validate_attachment(name)?;
+        if self.on_disk {
+            match std::fs::remove_file(self.dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(error(e)),
+            }
+        }
+        sync_directory(self)
+    }
+}
+fn sync_directory(library: &crate::library::Library) -> Result<()> {
+    #[cfg(unix)]
+    if library.on_disk {
+        std::fs::File::open(library.dir.join("companion")).and_then(|f| f.sync_all()).map_err(error)?;
+    }
+    #[cfg(not(unix))]
+    let _ = library;
+    Ok(())
+}
+fn validate_attachment(name: &str) -> Result<()> {
+    let valid = name.len() <= 96
+        && name.strip_prefix("companion/preview-").and_then(|s| s.strip_suffix(".bin")).is_some_and(|s| {
+            s.split_once('-').is_some_and(|(id, hash)| {
+                !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) && hash.len() == 32 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+        });
+    if !valid {
+        return Err(error("invalid attachment reference"));
+    }
+    Ok(())
+}
+
+/// Predevelopment policy: discard only old AI ops, preserving record order and every photo op.
+/// A known empty batch stands in for the removed op, retaining the upstream journal sequence.
+pub(crate) fn discard_legacy_ops(store: &mut dyn Store) -> Result<()> {
+    use lightcraft_catalog::journal::{LOG, SNAPSHOT, VERSION};
+    let Some(log) = store.read(LOG).map_err(error)? else { return Ok(()) };
+    // Old typed serializers emit this ASCII tag verbatim. Ordinary upstream journals need
+    // no compatibility parsing or extra read of a potentially very large catalog snapshot.
+    if !log.windows(b"setPhotoCompanion".len()).any(|w| w == b"setPhotoCompanion") {
+        return Ok(());
+    }
+    if let Some(snap) = store.read(SNAPSHOT).map_err(error)? {
+        #[derive(Deserialize)]
+        struct Header {
+            format: String,
+            version: u32,
+        }
+        let value: Header = serde_json::from_slice(&snap).map_err(error)?;
+        if value.format != "lightcraft-catalog" || value.version > VERSION {
+            return Ok(());
+        }
+    }
+    let text = match std::str::from_utf8(&log) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let mut output = String::new();
+    let mut changed = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let parsed = (|| {
+            let (seq, rest) = trimmed.strip_prefix("{\"seq\":")?.split_once(",\"crc\":")?;
+            let (crc, rest) = rest.split_once(",\"op\":")?;
+            let body = rest.strip_suffix('}')?;
+            let seq = seq.parse::<u64>().ok()?;
+            if crc.parse::<u32>().ok()? != crc32fast::hash(body.as_bytes()) {
+                return None;
+            }
+            Some((seq, body, serde_json::from_str::<Value>(body).ok()?))
+        })();
+        if let Some((seq, body, mut op)) = parsed {
+            if remove_legacy(&mut op) {
+                let known: lightcraft_catalog::Op = serde_json::from_value(op).map_err(error)?;
+                output.push_str(&lightcraft_catalog::journal::encode_record(seq, &known));
+                if line.ends_with('\n') {
+                    output.push('\n');
+                }
+                changed = true;
+                continue;
+            }
+            // A future CRC-valid op must be refused untouched by the upstream loader.
+            if serde_json::from_str::<lightcraft_catalog::Op>(body).is_err() {
+                return Ok(());
+            }
+        }
+        output.push_str(line);
+    }
+    if changed {
+        store.write_atomic(LOG, output.as_bytes()).map_err(error)?;
+    }
+    Ok(())
+}
+fn remove_legacy(op: &mut Value) -> bool {
+    if op["op"] == "setPhotoCompanion" {
+        *op = json!({"op":"batch","ops":[]});
+        return true;
+    }
+    if op["op"] == "batch" {
+        return op.get_mut("ops").and_then(Value::as_array_mut).is_some_and(|ops| {
+            let mut changed = false;
+            for op in ops {
+                changed |= remove_legacy(op);
+            }
+            changed
+        });
+    }
+    false
+}
+
+#[cfg(test)]
+#[path = "archive_tests.rs"]
+mod tests;

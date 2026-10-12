@@ -1,4 +1,4 @@
-//! `cargo xtask parity`: the Lightroom parity tracker (`docs/parity.md`).
+//! `cargo xtask parity`: the Lightroom parity tracker (`docs/parity-checklist.md`).
 //!
 //! - **Reference check** (in `ci`): every `` `cmd:<id>` `` must be a registered command (engine command specs, as
 //!   listed by `lightcraft-cli commands --json`, or a UI command from `UI_COMMANDS`), every `` `ctl:<id>` `` a develop
@@ -10,7 +10,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
-pub const DOC: &str = "docs/parity.md";
+pub const DOC: &str = "docs/parity-checklist.md";
 const BEGIN: &str = "<!-- parity:summary -->";
 const END: &str = "<!-- /parity:summary -->";
 
