@@ -172,7 +172,8 @@ fn failed_stop_delivery_still_closes_its_connection_after_local_finish() {
         })
         .unwrap();
     state.poll_inner(&mut app, &egui::Context::default());
-    assert!(state.connection.is_none(), "failed stop must retain the existing disconnect fallback");
+    assert!(state.connection.as_ref().unwrap().is_closing(), "failed stop must close and retain its connection until workers finish");
+    assert!(state.start(&mut app).is_err(), "a closing connection cannot admit a replacement");
     assert_eq!(*app.session.develop_of(photo).unwrap(), *original);
 }
 

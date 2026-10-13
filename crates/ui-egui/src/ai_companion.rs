@@ -4,6 +4,9 @@
 mod admission_tests;
 mod archive;
 #[cfg(test)]
+#[path = "ai_companion/cancellation_tests.rs"]
+mod cancellation_tests;
+#[cfg(test)]
 #[path = "ai_companion/disconnect_tests.rs"]
 mod disconnect_tests;
 #[cfg(test)]
@@ -136,14 +139,26 @@ impl State {
             .find(|j| (submission != 0 && j.identity.submission_seq == submission) || (!round.is_empty() && j.round == round))
             .map(|j| j.identity.clone())
             .ok_or("AI 请求归属已结束。")?;
-        self.enqueue(path, body, submission, round, identity)
+        let cancel = self.jobs.get(&identity.scope.photo).ok_or("AI 轮次已结束。")?.cancel.clone();
+        self.enqueue(path, body, submission, round, identity, cancel)
     }
-    fn enqueue(&self, path: String, body: Value, submission: u64, round: String, identity: RoundIdentity) -> Result<(), String> {
-        self.connection
-            .as_ref()
-            .ok_or("AI 事件连接尚未建立。")?
-            .requests
-            .try_send(network::Request { path, body, submission, round, identity })
+    fn enqueue(
+        &self,
+        path: String,
+        body: Value,
+        submission: u64,
+        round: String,
+        identity: RoundIdentity,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<(), String> {
+        let control = path.ends_with("/stop");
+        if !control && (!self.consent || cancel.load(Ordering::Relaxed)) {
+            return Err("已取消未完成的 AI 请求。".into());
+        }
+        let connection = self.connection.as_ref().ok_or("AI 事件连接尚未建立。")?;
+        let queue = if control { &connection.controls } else { &connection.requests };
+        queue
+            .try_send(network::Request { path, body, submission, round, identity, cancel })
             .map_err(|_| "AI 请求交付积压，请稍候；未自动重试。".into())
     }
     fn connect(&mut self) -> Result<network::Connection, String> {
@@ -185,7 +200,11 @@ impl State {
         if !self.consent {
             return Err(tr("Please consent to sending compressed previews first.").into());
         }
-        if !self.jobs.is_empty() || self.workers.values().any(|a| a.load(Ordering::Relaxed)) || app.session.companion_task_photo().is_some() {
+        if self.connection.as_ref().is_some_and(|c| c.is_closing() && c.alive.load(Ordering::Relaxed))
+            || !self.jobs.is_empty()
+            || self.workers.values().any(|a| a.load(Ordering::Relaxed))
+            || app.session.companion_task_photo().is_some()
+        {
             return Err(tr("Another AI task is active; stop it or wait for completion.").into());
         }
         let photo = app.session.active().ok_or_else(|| tr("Select exactly one photo to start an AI task.").to_owned())?;
@@ -239,12 +258,14 @@ impl State {
         };
         let lease = app.session.acquire_companion_lease(photo, identity.local_round_id.clone()).map_err(|e| tr(&e.to_string()).to_owned())?;
         let history = self.history(app, photo)?;
+        let cancel = Arc::new(AtomicBool::new(false));
         self.enqueue(
             "/v1/rounds".into(),
             json!({"submission_seq":self.serial,"photo_ref":{"library_generation":generation,"photo_id":photo.0},"photo_revision":revision}),
             self.serial,
             String::new(),
             identity.clone(),
+            cancel.clone(),
         )?;
         self.jobs.insert(
             photo,
@@ -257,7 +278,7 @@ impl State {
                 user_message: self.conversations.get(&photo).map(|c| c.messages.len()).unwrap_or(0),
                 history,
                 checkpoint: Checkpoint { photo, generation, original: original.clone(), expected: original, revision, content, eligible: true },
-                cancel: Arc::new(AtomicBool::new(false)),
+                cancel,
                 snapshot: None,
                 plans: BTreeMap::new(),
                 stopped: false,
@@ -297,6 +318,21 @@ impl State {
         self.workers.insert(photo, alive);
         Ok(())
     }
+    fn set_consent(&mut self, consent: bool) -> Result<(), String> {
+        self.consent = consent;
+        if !consent {
+            let photos: Vec<_> = self.jobs.keys().copied().collect();
+            for photo in photos {
+                self.stop(photo)?;
+            }
+        }
+        Ok(())
+    }
+    fn close_connection(&self) {
+        if let Some(connection) = &self.connection {
+            connection.close();
+        }
+    }
     fn stop(&mut self, photo: PhotoId) -> Result<Value, String> {
         let round = if let Some(job) = self.jobs.get_mut(&photo) {
             job.stopped = true;
@@ -307,7 +343,7 @@ impl State {
         };
         if !round.is_empty() {
             if self.send(format!("/v1/rounds/{round}/stop"), json!({"reason":"user_stop"}), 0, round).is_err() {
-                self.connection = None;
+                self.close_connection();
             }
         } else {
             // Keep the submission identity until its admission event supplies
@@ -315,11 +351,11 @@ impl State {
             if let Some(conversation) = self.conversations.get_mut(&photo) {
                 conversation.pending.clear();
                 close_pending_tools(&mut conversation.messages);
-                conversation.notice = "已停止生成，正在确认取消提交。".into();
+                conversation.notice = tr("Stopped generating. Confirming cancellation of the submission…").into();
             }
             return Ok(Value::Null);
         }
-        self.finish(photo, "已停止生成，保留最近一次完整结果。");
+        self.finish(photo, tr("Stopped generating. Keeping the latest complete result."));
         Ok(Value::Null)
     }
     fn finish(&mut self, photo: PhotoId, notice: &str) {
@@ -357,9 +393,9 @@ impl State {
             job.round = round.into();
             if job.stopped {
                 if self.send(format!("/v1/rounds/{round}/stop"), json!({"reason":"user_stop"}), 0, round.into()).is_err() {
-                    self.connection = None;
+                    self.close_connection();
                 }
-                self.finish(photo, "已停止生成，保留最近一次完整结果。");
+                self.finish(photo, tr("Stopped generating. Keeping the latest complete result."));
                 self.save(app, photo)?;
                 return Ok(());
             }
@@ -655,15 +691,31 @@ impl State {
                         // failed delivery still needs the original disconnect
                         // fallback to cancel the task on this same connection.
                         if path.ends_with("/stop") && result.is_err() {
-                            self.connection = None;
+                            self.close_connection();
                         }
                         continue;
                     }
                     if let Err(error) = result {
+                        if submission != 0 && error.cancelled_before_send {
+                            self.finish(identity.scope.photo, tr("Stopped generating. Keeping the latest complete result."));
+                            let _ = self.save(app, identity.scope.photo);
+                            continue;
+                        }
                         if path.ends_with("/stop") || (submission != 0 && !error.rejected) {
                             // A failed creation POST may have been accepted. Disconnect
                             // rather than abandon an unidentifiable server task.
-                            self.connection = None;
+                            self.close_connection();
+                            if submission != 0 && !error.rejected {
+                                if let Some(job) = self.jobs.get_mut(&identity.scope.photo) {
+                                    job.stopped = true;
+                                    job.cancel.store(true, Ordering::Relaxed);
+                                }
+                                if let Some(c) = self.conversations.get_mut(&identity.scope.photo) {
+                                    c.pending.clear();
+                                    c.notice = tr("Cancelling… Waiting for the AI connection to close safely.").into();
+                                }
+                                continue;
+                            }
                         }
                         let photo = identity.scope.photo;
                         if !round.is_empty() {
@@ -1000,9 +1052,15 @@ fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
             egui::TextEdit::multiline(&mut app.ai.prompt).desired_rows(2).hint_text(tr("For example: review this photo, then naturally optimize it")),
         );
         crate::widgets::register(ui.ctx(), "field:aiPrompt", input.rect);
+        let mut consent_value = app.ai.consent;
+        let consent = ui.checkbox(&mut consent_value, tr("Allow compressed previews to be sent to the cloud model"));
+        crate::widgets::register(ui.ctx(), "checkbox:aiConsent", consent.rect);
+        if consent.changed()
+            && let Err(e) = app.ai.set_consent(consent_value)
+        {
+            app.ai.text = e;
+        }
         if !busy {
-            let consent = ui.checkbox(&mut app.ai.consent, tr("Allow compressed previews to be sent to the cloud model"));
-            crate::widgets::register(ui.ctx(), "checkbox:aiConsent", consent.rect);
             let admission = app.ai.admission(app, None);
             if let Err(message) = &admission {
                 ui.label(message);
@@ -1032,7 +1090,7 @@ fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
         } else {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(tr("Processing this photo…"));
+                ui.label(tr(if app.ai.jobs.get(&photo).is_some_and(|j| j.stopped) { "Cancelling…" } else { "Processing this photo…" }));
                 let stop = ui.button(tr("Stop Generating"));
                 crate::widgets::register(ui.ctx(), "button:aiStop", stop.rect);
                 if stop.clicked() {

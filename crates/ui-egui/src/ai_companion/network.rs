@@ -17,6 +17,8 @@ pub struct Request {
     pub submission: u64,
     pub round: String,
     pub identity: RoundIdentity,
+    /// Irreversible cancellation for this local round; controls ignore it.
+    pub cancel: Arc<AtomicBool>,
 }
 pub enum Event {
     Connected { client: String, connection: String },
@@ -26,11 +28,12 @@ pub enum Event {
 }
 pub struct RequestFailure {
     pub rejected: bool,
+    pub cancelled_before_send: bool,
     message: String,
 }
 impl From<String> for RequestFailure {
     fn from(message: String) -> Self {
-        Self { rejected: false, message }
+        Self { rejected: false, cancelled_before_send: false, message }
     }
 }
 impl From<&str> for RequestFailure {
@@ -45,6 +48,7 @@ impl std::fmt::Display for RequestFailure {
 }
 pub struct Connection {
     pub requests: mpsc::SyncSender<Request>,
+    pub controls: mpsc::SyncSender<Request>,
     pub events: mpsc::Receiver<Event>,
     pub alive: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
@@ -61,6 +65,16 @@ impl Drop for RequestWorker {
         }
     }
 }
+impl Connection {
+    /// Retain the connection until alive becomes false: its workers and sockets
+    /// must close before an uncertain creation can be replaced.
+    pub fn is_closing(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+    pub fn close(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
 impl Drop for Connection {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
@@ -72,6 +86,7 @@ pub fn connect(address: &str) -> Result<Connection, String> {
         return Err("开发模式仅连接本机 AI 服务。".into());
     }
     let (requests, rx) = mpsc::sync_channel::<Request>(8);
+    let (controls, control_rx) = mpsc::sync_channel::<Request>(8);
     let (tx, events) = mpsc::sync_channel::<Event>(32);
     let cancel = Arc::new(AtomicBool::new(false));
     let alive = Arc::new(AtomicBool::new(true));
@@ -80,13 +95,13 @@ pub fn connect(address: &str) -> Result<Connection, String> {
     std::thread::Builder::new()
         .name("photo-companion-events".into())
         .spawn(move || {
-            let result = receive(address, rx, &tx, &worker_cancel);
+            let result = receive(address, rx, control_rx, &tx, &worker_cancel);
             worker_cancel.store(true, Ordering::Relaxed);
             let _ = tx.try_send(Event::Closed(result.err().unwrap_or_else(|| "AI 连接已结束。".into())));
             worker_alive.store(false, Ordering::Relaxed);
         })
         .map_err(|e| format!("无法启动 AI 连接：{e}"))?;
-    Ok(Connection { requests, events, alive, cancel })
+    Ok(Connection { requests, controls, events, alive, cancel })
 }
 fn emit(tx: &mpsc::SyncSender<Event>, mut event: Event, cancel: &AtomicBool) -> Result<(), String> {
     let start = Instant::now();
@@ -104,8 +119,8 @@ fn emit(tx: &mpsc::SyncSender<Event>, mut event: Event, cancel: &AtomicBool) -> 
 }
 fn socket(address: SocketAddr) -> Result<TcpStream, String> {
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(3)).map_err(|_| "无法连接本地 AI 服务，请先启动 Go 后端。")?;
-    stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| e.to_string())?;
-    stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(Duration::from_millis(100))).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(Duration::from_millis(100))).map_err(|e| e.to_string())?;
     Ok(stream)
 }
 fn cancelled(cancel: &AtomicBool, start: Instant, timeout: Duration) -> Result<(), String> {
@@ -120,10 +135,17 @@ fn cancelled(cancel: &AtomicBool, start: Instant, timeout: Duration) -> Result<(
 fn timed_out(error: &std::io::Error) -> bool {
     matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
-fn line(reader: &mut BufReader<TcpStream>, cancel: &AtomicBool, timeout: Duration, limit: usize) -> Result<String, String> {
-    let start = Instant::now();
+fn line(
+    reader: &mut BufReader<TcpStream>,
+    cancel: &AtomicBool,
+    round: Option<&AtomicBool>,
+    start: Instant,
+    timeout: Duration,
+    limit: usize,
+) -> Result<String, String> {
     let mut bytes = Vec::new();
     loop {
+        check_round(round, 1).map_err(|e| e.to_string())?;
         cancelled(cancel, start, timeout)?;
         // take() bounds a hostile line even when no newline ever arrives.
         match (&mut *reader).take(limit.saturating_add(1).saturating_sub(bytes.len()) as u64).read_until(b'\n', &mut bytes) {
@@ -137,12 +159,20 @@ fn line(reader: &mut BufReader<TcpStream>, cancel: &AtomicBool, timeout: Duratio
     }
 }
 fn headers(reader: &mut BufReader<TcpStream>, cancel: &AtomicBool) -> Result<(u16, Option<usize>), String> {
-    let status = line(reader, cancel, Duration::from_secs(10), 8192)?;
+    headers_scoped(reader, cancel, None, Instant::now())
+}
+fn headers_scoped(
+    reader: &mut BufReader<TcpStream>,
+    cancel: &AtomicBool,
+    round: Option<&AtomicBool>,
+    start: Instant,
+) -> Result<(u16, Option<usize>), String> {
+    let status = line(reader, cancel, round, start, Duration::from_secs(15), 8192)?;
     let code = status.split_whitespace().nth(1).and_then(|v| v.parse().ok()).ok_or("后端 HTTP 状态无效。")?;
     let mut size = None;
     let mut bytes = status.len();
     loop {
-        let value = line(reader, cancel, Duration::from_secs(10), 8192)?;
+        let value = line(reader, cancel, round, start, Duration::from_secs(15), 8192)?;
         bytes += value.len();
         if bytes > 8192 {
             return Err("后端 HTTP 头过大。".into());
@@ -165,7 +195,54 @@ fn post(address: SocketAddr, path: &str, token: &str, body: &Value, cancel: &Ato
     post_request(address, path, token, body, cancel).map_err(|e| e.to_string())
 }
 fn post_request(address: SocketAddr, path: &str, token: &str, body: &Value, cancel: &AtomicBool) -> Result<Value, RequestFailure> {
-    cancelled(cancel, Instant::now(), Duration::from_secs(15))?;
+    post_scoped(address, path, token, body, cancel, None)
+}
+fn check_round(round: Option<&AtomicBool>, sent: usize) -> Result<(), RequestFailure> {
+    if round.is_some_and(|r| r.load(Ordering::Relaxed)) {
+        return Err(RequestFailure { rejected: false, cancelled_before_send: sent == 0, message: "已取消未完成的 AI 请求。".into() });
+    }
+    Ok(())
+}
+fn write_request(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    cancel: &AtomicBool,
+    round: Option<&AtomicBool>,
+    sent: &mut usize,
+    start: Instant,
+) -> Result<(), RequestFailure> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        check_round(round, *sent)?;
+        cancelled(cancel, start, Duration::from_secs(15))?;
+        let end = offset.saturating_add(16 * 1024).min(bytes.len());
+        let chunk = bytes.get(offset..end).ok_or("AI 请求编码无效。")?;
+        match writer.write(chunk) {
+            Ok(0) => return Err("AI 请求发送失败；未自动重试。".into()),
+            Ok(n) => {
+                if n > chunk.len() {
+                    return Err("AI 请求写入无效。".into());
+                }
+                offset = offset.saturating_add(n);
+                *sent = sent.saturating_add(n);
+            }
+            Err(e) if timed_out(&e) => {}
+            Err(_) => return Err("AI 请求发送失败；未自动重试。".into()),
+        }
+    }
+    Ok(())
+}
+fn post_scoped(
+    address: SocketAddr,
+    path: &str,
+    token: &str,
+    body: &Value,
+    cancel: &AtomicBool,
+    round: Option<&AtomicBool>,
+) -> Result<Value, RequestFailure> {
+    let start = Instant::now();
+    check_round(round, 0)?;
+    cancelled(cancel, start, Duration::from_secs(15))?;
     if !path.starts_with("/v1/") || path.chars().any(char::is_whitespace) || (!token.is_empty() && !token.bytes().all(|b| b.is_ascii_hexdigit())) {
         return Err("AI 请求身份无效。".into());
     }
@@ -173,21 +250,24 @@ fn post_request(address: SocketAddr, path: &str, token: &str, body: &Value, canc
     if data.len() > 32 * 1024 * 1024 {
         return Err("AI 输入超过服务大小限制，未删减历史。".into());
     }
+    check_round(round, 0)?;
     let mut stream = socket(address)?;
     let header = format!(
         "POST {path} HTTP/1.0\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         data.len()
     );
-    stream.write_all(header.as_bytes()).and_then(|_| stream.write_all(&data)).map_err(|_| "AI 请求发送失败；未自动重试。")?;
+    let mut sent = 0;
+    write_request(&mut stream, header.as_bytes(), cancel, round, &mut sent, start)?;
+    write_request(&mut stream, &data, cancel, round, &mut sent, start)?;
     let mut reader = BufReader::new(stream);
-    let (status, length) = headers(&mut reader, cancel)?;
+    let (status, length) = headers_scoped(&mut reader, cancel, round, start)?;
     if length.is_some_and(|n| n > 96 * 1024) {
         return Err("后端回复过大。".into());
     }
     let mut bytes = Vec::new();
-    let start = Instant::now();
     let mut buffer = [0u8; 4096];
     loop {
+        check_round(round, sent)?;
         cancelled(cancel, start, Duration::from_secs(15))?;
         if length == Some(bytes.len()) {
             break;
@@ -211,6 +291,7 @@ fn post_request(address: SocketAddr, path: &str, token: &str, body: &Value, canc
     if !(200..300).contains(&status) {
         return Err(RequestFailure {
             rejected: status < 500 && result.get("code").and_then(Value::as_str).is_some(),
+            cancelled_before_send: false,
             message: format!(
                 "{}; traceId={}",
                 result.get("code").and_then(Value::as_str).unwrap_or("request_failed"),
@@ -220,7 +301,21 @@ fn post_request(address: SocketAddr, path: &str, token: &str, body: &Value, canc
     }
     Ok(result)
 }
-fn receive(address: SocketAddr, requests: mpsc::Receiver<Request>, tx: &mpsc::SyncSender<Event>, cancel: &Arc<AtomicBool>) -> Result<(), String> {
+fn next_request(requests: &mpsc::Receiver<Request>, controls: &mpsc::Receiver<Request>) -> Result<Request, mpsc::TryRecvError> {
+    controls.try_recv().or_else(|_| {
+        requests.recv_timeout(Duration::from_millis(50)).map_err(|e| match e {
+            mpsc::RecvTimeoutError::Timeout => mpsc::TryRecvError::Empty,
+            mpsc::RecvTimeoutError::Disconnected => mpsc::TryRecvError::Disconnected,
+        })
+    })
+}
+fn receive(
+    address: SocketAddr,
+    requests: mpsc::Receiver<Request>,
+    controls: mpsc::Receiver<Request>,
+    tx: &mpsc::SyncSender<Event>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
     let registration = post(address, "/v1/clients", "", &json!({"protocol_version":"v1"}), cancel)?;
     let client = registration.get("client_id").and_then(Value::as_str).ok_or("AI 客户端身份无效。")?.to_owned();
     let token = registration.get("client_token").and_then(Value::as_str).ok_or("AI 客户端令牌无效。")?.to_owned();
@@ -240,9 +335,10 @@ fn receive(address: SocketAddr, requests: mpsc::Receiver<Request>, tx: &mpsc::Sy
     let mut connection = String::new();
     let mut last_seq = 0u64;
     let mut requests = Some(requests);
+    let mut controls = Some(controls);
     let mut worker = RequestWorker { thread: None, cancel: cancel.clone() };
     loop {
-        let value = line(&mut reader, cancel, Duration::from_secs(35), 96 * 1024)?;
+        let value = line(&mut reader, cancel, None, Instant::now(), Duration::from_secs(35), 96 * 1024)?;
         if value.trim().is_empty() {
             if data.is_empty() {
                 continue;
@@ -271,22 +367,31 @@ fn receive(address: SocketAddr, requests: mpsc::Receiver<Request>, tx: &mpsc::Sy
                 let tx = tx.clone();
                 let cancel = cancel.clone();
                 let requests = requests.take().ok_or("重复 AI 请求线程。")?;
+                let controls = controls.take().ok_or("重复 AI 控制线程。")?;
                 // One ordered submission/request outlet; heartbeat uses the reader thread.
                 worker.thread = Some(
                     std::thread::Builder::new()
                         .name("photo-companion-requests".into())
                         .spawn(move || {
                             while !cancel.load(Ordering::Relaxed) {
-                                let mut request = match requests.recv_timeout(Duration::from_millis(100)) {
+                                let mut request = match next_request(&requests, &controls) {
                                     Ok(r) => r,
-                                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                                    Err(mpsc::TryRecvError::Empty) => continue,
                                     Err(_) => break,
                                 };
                                 if request.path == "/v1/rounds" {
                                     request.body["client_id"] = json!(client);
                                     request.body["connection_id"] = json!(connection);
                                 }
-                                let result = post_request(address, &request.path, &token, &request.body, &cancel);
+                                let control = request.path.ends_with("/stop");
+                                let result = post_scoped(
+                                    address,
+                                    &request.path,
+                                    &token,
+                                    &request.body,
+                                    &cancel,
+                                    (!control).then_some(request.cancel.as_ref()),
+                                );
                                 if emit(
                                     &tx,
                                     Event::Response {
@@ -332,5 +437,9 @@ fn receive(address: SocketAddr, requests: mpsc::Receiver<Request>, tx: &mpsc::Sy
 pub(super) fn test_connection() -> (Connection, mpsc::Receiver<Request>, mpsc::SyncSender<Event>) {
     let (requests, receiver) = mpsc::sync_channel(8);
     let (sender, events) = mpsc::sync_channel(32);
-    (Connection { requests, events, alive: Arc::new(AtomicBool::new(true)), cancel: Arc::new(AtomicBool::new(false)) }, receiver, sender)
+    (
+        Connection { controls: requests.clone(), requests, events, alive: Arc::new(AtomicBool::new(true)), cancel: Arc::new(AtomicBool::new(false)) },
+        receiver,
+        sender,
+    )
 }
