@@ -427,13 +427,6 @@ pub(crate) fn move_folder(s: &mut Session, from: &str, to: &str) -> std::result:
     if s.library.as_ref().is_some_and(|l| l.dir.starts_with(src) || src.starts_with(&l.dir)) {
         return Err("the library's own folders can't be moved here".into());
     }
-    if let Some(id) = s.companion_task_photo()
-        && let Some(photo) = s.catalog.photo(id)
-        && let lightcraft_catalog::Source::File { path } = &photo.source
-        && std::fs::canonicalize(path).ok().zip(std::fs::canonicalize(src).ok()).is_some_and(|(path, folder)| path.starts_with(folder))
-    {
-        s.preflight_mutation(&Op::RemovePhoto { id }).map_err(|e| e.to_string())?;
-    }
     // Repairs retain their exact old paths, including those on surviving history entries.
     // Complete them before the directory moves; an unavailable repair leaves it in place.
     let mut ops: Vec<Op> = s
@@ -451,7 +444,10 @@ pub(crate) fn move_folder(s: &mut Session, from: &str, to: &str) -> std::result:
         })
         .collect();
     let n = ops.len();
-    s.authorize_mutation(&Op::Batch { ops: ops.clone() }).map_err(|e| e.to_string())?;
+    let physical_folder = crate::FolderMove { from: from.into(), to: to.into() };
+    let repairs = s.retained_sidecar_repairs();
+    s.authorize_file_effects(&crate::rename::RealFs, &Op::Batch { ops: ops.clone() }, &[], Some(&physical_folder), &repairs)
+        .map_err(|e| e.to_string())?;
     s.repair_sidecars_with(&crate::rename::RealFs).map_err(|e| e.to_string())?;
     rename_folder_on_disk(from, to)?;
     // what the library knows about the folder (and those inside it) goes along, in the same step

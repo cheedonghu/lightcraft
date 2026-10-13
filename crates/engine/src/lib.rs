@@ -658,8 +658,8 @@ impl Session {
     }
 
     pub(crate) fn undo_step_with(&mut self, fs: &dyn rename::MoveFs) -> Result<String> {
-        if let Some(op) = self.undo.last().map(|entry| entry.op.clone()) {
-            self.authorize_mutation(&op)?;
+        if let Some(entry) = self.undo.last().cloned() {
+            self.authorize_history_entry(fs, &entry)?;
         }
         let mut e = self.undo.pop().ok_or_else(|| EngineError::Other("nothing to undo".into()))?;
         let redo = match self.apply_with_files(&mut e, fs) {
@@ -686,8 +686,8 @@ impl Session {
     }
 
     pub(crate) fn redo_step_with(&mut self, fs: &dyn rename::MoveFs) -> Result<String> {
-        if let Some(op) = self.redo.last().map(|entry| entry.op.clone()) {
-            self.authorize_mutation(&op)?;
+        if let Some(entry) = self.redo.last().cloned() {
+            self.authorize_history_entry(fs, &entry)?;
         }
         let mut e = self.redo.pop().ok_or_else(|| EngineError::Other("nothing to redo".into()))?;
         let undo = match self.apply_with_files(&mut e, fs) {
@@ -732,8 +732,7 @@ impl Session {
     /// library follows them (a logged change outside the undo history), so none goes missing; the
     /// folder is only moved back when no file was left behind at its new path.
     fn apply_with_files(&mut self, entry: &mut UndoEntry, fs: &dyn rename::MoveFs) -> Result<Op> {
-        self.authorize_mutation(&entry.op)?;
-        self.preflight_repair_packets(fs, entry.retry_sidecars.iter().cloned())?;
+        self.authorize_history_entry(fs, entry)?;
         // The entry is detached from self.undo/self.redo: include it before any global
         // repair can retire, then retry revalidates it before moving its own packets.
         rename::validate_sidecars(fs, &entry.retry_sidecars).map_err(|e| EngineError::Other(format!("can't move the files back: {e}")))?;
