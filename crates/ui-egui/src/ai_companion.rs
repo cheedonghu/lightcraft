@@ -1419,10 +1419,10 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
             let stop = ui.button(tr("Stop Generating"));
             composer_widget(ui, "button:aiStop", stop.rect);
             if !sizing && stop.clicked() {
-                app.ai.defer_local_saves_for_feedback(ui.ctx());
                 if let Err(error) = app.run("ai.stop", json!({})) {
                     app.ai.text = error;
                 }
+                app.ai.defer_local_saves_for_feedback(ui.ctx());
             }
         } else if worker {
             ui.label(tr("Finishing processing for this photo…"));
@@ -1454,11 +1454,11 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
     let checkbox = ui.checkbox(&mut consent, tr("Allow compressed previews to be sent to the cloud model"));
     composer_widget(ui, "checkbox:aiConsent", checkbox.rect);
     if !sizing && checkbox.changed() {
-        app.ai.defer_local_saves_for_feedback(ui.ctx());
         if let Err(error) = app.ai.set_consent(consent) {
             app.ai.text = error.clone();
             app.ai.conversations.entry(photo).or_default().notice = error;
         }
+        app.ai.defer_local_saves_for_feedback(ui.ctx());
     }
     if !busy {
         let admission = app.ai.admission(app, None);
