@@ -5,7 +5,8 @@ impl State {
         if self.conversations.contains_key(&photo) {
             return Ok(());
         }
-        let mut conversation = Conversation::default();
+        let mut conversation =
+            Conversation { scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }), ..Default::default() };
         if let Some(archive) = app.session.photo_companion(photo).map_err(|e| e.to_string())? {
             if archive.get("schema_version").and_then(Value::as_u64) != Some(1) {
                 return Err("AI 对话格式不支持，未删减历史。".into());
@@ -36,6 +37,9 @@ impl State {
         let Some(conversation) = self.conversations.get_mut(&photo) else {
             return Ok(());
         };
+        if conversation.scope.is_some_and(|scope| scope != PhotoScope { library_generation: app.session.library_generation(), photo }) {
+            return Err("AI 会话属于已关闭的图库，未写入当前图库。".into());
+        }
         if let Some(library) = app.session.library.as_mut() {
             for message in &mut conversation.messages {
                 if let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) {
@@ -73,6 +77,10 @@ impl State {
         let mut images = 0usize;
         let mut text = 0usize;
         for message in &mut messages {
+            // Additive local metadata must not change the v1 model-input shape.
+            if let Some(object) = message.as_object_mut() {
+                object.remove("local_round_id");
+            }
             text = text.saturating_add(message.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0));
             if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
                 text = text.saturating_add(serde_json::to_vec(calls).map_err(|_| "AI 工具历史无效。")?.len());
