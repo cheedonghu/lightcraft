@@ -10,9 +10,15 @@ use serde_json::{Value, json};
 const SMALL: u64 = 32 * 1024;
 const BLOCK: u64 = 4 * 1024 * 1024;
 const PAGE_ITEMS: usize = 128;
+const PACK_ITEMS: usize = 64;
+mod pagination;
+use pagination::load_index;
+pub use pagination::{HistoryCursor, HistoryReader, HistorySlice, RoundSearch, record_size};
+pub(crate) use pagination::{TailUpdate, persist_tail};
+
 const FORMAT: &str = "lightcraft-companion";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhotoHeader {
     pub photo_id: PhotoId,
     pub conversation_epoch: u64,
@@ -26,8 +32,12 @@ pub struct PhotoHeader {
     pub record_count: u64,
     pub metadata_digest: String,
     pub metadata_length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_chunk_payload: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_patch: Option<u64>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRoot {
     pub key: String,
     pub digest: String,
@@ -55,12 +65,23 @@ struct Entry {
     offset: u64,
     length: usize,
     digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunk_payload: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_range: Option<[u64; 2]>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Index {
     start: u64,
     entries: Vec<Entry>,
     previous: Option<IndexRoot>,
+    #[serde(default)]
+    jumps: Vec<Jump>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Jump {
+    root: IndexRoot,
+    upper: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingCommit {
@@ -71,6 +92,10 @@ pub struct PendingCommit {
     head: Head,
     /// Persisted before creating any file from this transaction's reserved range.
     pub reserved_files: u64,
+    #[serde(default)]
+    reuse: Option<PhotoHeader>,
+    #[serde(default)]
+    revert_override: Option<Value>,
 }
 fn base(photo: PhotoId) -> String {
     format!("companion/v2/photos/{}", photo.0)
@@ -128,8 +153,14 @@ fn page(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRoot>, count: 
     }
     let mut key = root.cloned();
     let mut found = Vec::new();
+    let mut retained_bytes = 0usize;
     let mut upper = count;
+    let mut visits = 0usize;
     while let Some(current) = key {
+        visits += 1;
+        if visits > 128 {
+            return Err(error("index seek exceeds bounded work; rebuild index required"));
+        }
         validate_key(photo, &current.key, "pages/")?;
         let bytes = store.read_limited(&current.key, SMALL).map_err(error)?.ok_or_else(|| error("index missing"))?;
         if digest(&bytes) != current.digest {
@@ -137,7 +168,7 @@ fn page(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRoot>, count: 
         }
         let index: Index = serde_json::from_slice(&bytes).map_err(error)?;
         let index_end = index.start.checked_add(index.entries.len() as u64).ok_or_else(|| error("index overflow"))?;
-        if index.entries.is_empty() || index.entries.len() > PAGE_ITEMS || index_end != upper {
+        if index.entries.is_empty() || index.entries.len() > PAGE_ITEMS || index.jumps.len() > 64 || index_end != upper {
             return Err(error("invalid index sequence"));
         }
         for (n, entry) in index.entries.iter().enumerate() {
@@ -152,7 +183,11 @@ fn page(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRoot>, count: 
             {
                 return Err(error("invalid record bounds"));
             }
-            let bytes = read_blob(store, photo, &entry.block, entry.offset, entry.length)?;
+            retained_bytes = retained_bytes.checked_add(entry.length).ok_or_else(|| error("page length exhausted"))?;
+            if retained_bytes > 32 * 1024 * 1024 {
+                return Err(error("page exceeds bounded materialization; use history fragments"));
+            }
+            let bytes = pagination::range(store, photo, entry, 0, entry.length)?;
             if bytes.len() != entry.length || digest(&bytes) != entry.digest {
                 return Err(error("record digest mismatch"));
             }
@@ -161,8 +196,14 @@ fn page(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRoot>, count: 
         if index.start <= cursor {
             break;
         }
-        upper = index.start;
-        key = index.previous;
+        let jump = index.jumps.iter().rev().find(|j| index.start >= end && j.upper >= end && j.upper < index.start);
+        if let Some(jump) = jump {
+            upper = jump.upper;
+            key = Some(jump.root.clone());
+        } else {
+            upper = index.start;
+            key = index.previous;
+        }
     }
     found.sort_by_key(|(seq, _)| *seq);
     if found.len() as u64 != end - cursor {
@@ -171,6 +212,9 @@ fn page(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRoot>, count: 
     Ok(RecordPage { records: found.into_iter().map(|(_, v)| v).collect(), next_cursor: (end < count).then_some(end) })
 }
 fn read_blob(store: &mut dyn Store, photo: PhotoId, first: &str, mut offset: u64, mut remaining: usize) -> Result<Vec<u8>> {
+    if remaining > 32 * 1024 * 1024 {
+        return Err(error("blob exceeds materialization budget; use streaming or fragments"));
+    }
     let mut bytes = Vec::new();
     let mut key = first.to_owned();
     while remaining > 0 {
@@ -222,30 +266,34 @@ impl Writer<'_> {
         first.ok_or_else(|| error("empty block"))
     }
     fn records(&mut self, records: &[Value]) -> Result<Option<IndexRoot>> {
-        let mut previous = None;
-        let mut sequence = 0u64;
+        self.records_after(records, None, 0)
+    }
+    fn records_after(&mut self, records: &[Value], mut previous: Option<IndexRoot>, mut sequence: u64) -> Result<Option<IndexRoot>> {
         let mut entries = Vec::new();
         let mut bytes = Vec::new();
         let mut offsets = Vec::new();
         for record in records {
-            let data = serde_json::to_vec(record).map_err(error)?;
-            if data.is_empty() {
+            let length = pagination::serialized_length(record)?;
+            if length == 0 {
                 return Err(error("empty record"));
             }
-            if data.len() as u64 > BLOCK {
+            if length as u64 > BLOCK {
                 self.block(&mut bytes, &mut offsets, &mut entries)?;
-                let first = self.blob(&data)?;
-                entries.push(Entry { block: first, offset: 0, length: data.len(), digest: digest(&data) });
+                let mut entry = pagination::stream_record(self, record, length)?;
+                entry.text_range = pagination::text_range(record, None)?;
+                entries.push(entry);
             } else {
+                let data = serde_json::to_vec(record).map_err(error)?;
                 if bytes.len().saturating_add(data.len()) as u64 > BLOCK {
                     self.block(&mut bytes, &mut offsets, &mut entries)?;
                 }
-                offsets.push((bytes.len() as u64, data.len(), digest(&data)));
+                offsets.push((bytes.len() as u64, data.len(), digest(&data), pagination::text_range(record, None)?));
                 bytes.extend_from_slice(&data);
             }
-            if offsets.len() + entries.len() >= PAGE_ITEMS {
+            if offsets.len() + entries.len() >= PACK_ITEMS {
                 self.block(&mut bytes, &mut offsets, &mut entries)?;
-                let index = Index { start: sequence, entries: std::mem::take(&mut entries), previous };
+                let jumps = self.jumps(previous.as_ref(), sequence)?;
+                let index = Index { start: sequence, entries: std::mem::take(&mut entries), previous, jumps };
                 sequence = sequence.checked_add(index.entries.len() as u64).ok_or_else(|| error("record count overflow"))?;
                 let bytes = serde_json::to_vec(&index).map_err(error)?;
                 previous = Some(IndexRoot { key: self.file("pages/", "json", &bytes)?, digest: digest(&bytes) });
@@ -253,19 +301,34 @@ impl Writer<'_> {
         }
         self.block(&mut bytes, &mut offsets, &mut entries)?;
         if !entries.is_empty() {
-            let index = Index { start: sequence, entries, previous };
+            let jumps = self.jumps(previous.as_ref(), sequence)?;
+            let index = Index { start: sequence, entries, previous, jumps };
             let bytes = serde_json::to_vec(&index).map_err(error)?;
             previous = Some(IndexRoot { key: self.file("pages/", "json", &bytes)?, digest: digest(&bytes) });
         }
         Ok(previous)
     }
-    fn block(&mut self, bytes: &mut Vec<u8>, offsets: &mut Vec<(u64, usize, String)>, entries: &mut Vec<Entry>) -> Result<()> {
+    fn jumps(&mut self, previous: Option<&IndexRoot>, upper: u64) -> Result<Vec<Jump>> {
+        let Some(previous) = previous else { return Ok(Vec::new()) };
+        let mut jumps = vec![Jump { root: previous.clone(), upper }];
+        for level in 0..63 {
+            let Some(last) = jumps.last() else { break };
+            let index = load_index(self.store, self.pending.photo, &last.root, last.upper)?;
+            let Some(next) = index.jumps.get(level) else { break };
+            if next.upper >= last.upper {
+                return Err(error("invalid index jump"));
+            }
+            jumps.push(next.clone());
+        }
+        Ok(jumps)
+    }
+    fn block(&mut self, bytes: &mut Vec<u8>, offsets: &mut Vec<(u64, usize, String, Option<[u64; 2]>)>, entries: &mut Vec<Entry>) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         let key = self.file("blocks/", "bin", bytes)?;
-        for (offset, length, digest) in offsets.drain(..) {
-            entries.push(Entry { block: key.clone(), offset, length, digest });
+        for (offset, length, digest, text_range) in offsets.drain(..) {
+            entries.push(Entry { block: key.clone(), offset, length, digest, chunk_payload: None, text_range });
         }
         bytes.clear();
         Ok(())
@@ -295,7 +358,7 @@ pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, expected_epoch: u64, 
         let tx = super::LocalRoundId::new().map_err(error)?.as_str().to_owned();
         let head = Head { manifest: format!("{}/manifest-{tx}.json", base(photo)), transaction_id: tx.clone(), manifest_digest: String::new() };
         let old_head = actual;
-        PendingCommit { photo, transaction_id: tx, expected_epoch, old_head, head, reserved_files: 0 }
+        PendingCommit { photo, transaction_id: tx, expected_epoch, old_head, head, reserved_files: 0, reuse: None, revert_override: None }
     };
     write(store, &pending_key, &pending)?;
     let mut writer = Writer { store, pending, sequence: 0 };
@@ -359,6 +422,8 @@ pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, expected_epoch: u64, 
         record_count: records.len() as u64,
         metadata_digest,
         metadata_length,
+        metadata_chunk_payload: None,
+        record_patch: None,
     };
     write(writer.store, &writer.pending.head.manifest, &manifest)?;
     writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
@@ -367,35 +432,40 @@ pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, expected_epoch: u64, 
     Ok(writer.pending)
 }
 fn verify_graph(store: &mut dyn Store, manifest: &PhotoHeader) -> Result<()> {
+    verify_suffix(store, manifest, None)
+}
+fn verify_suffix(store: &mut dyn Store, manifest: &PhotoHeader, reuse: Option<&PhotoHeader>) -> Result<()> {
+    verify_suffix_from(store, manifest, reuse, None)
+}
+fn verify_suffix_from(store: &mut dyn Store, manifest: &PhotoHeader, reuse: Option<&PhotoHeader>, from: Option<[u64; 3]>) -> Result<()> {
     validate_key(manifest.photo_id, &manifest.metadata, "blocks/")?;
-    let actual = read_blob(store, manifest.photo_id, &manifest.metadata, 0, usize::try_from(manifest.metadata_length).map_err(error)?)?;
-    if actual.len() as u64 != manifest.metadata_length || digest(&actual) != manifest.metadata_digest {
-        return Err(error("metadata write verification failed"));
-    }
-    serde_json::from_slice::<Value>(&actual).map_err(error)?;
-    for (root, count, messages) in [
-        (manifest.message_root.as_ref(), manifest.message_count, true),
-        (manifest.round_root.as_ref(), manifest.round_count, false),
-        (manifest.record_root.as_ref(), manifest.record_count, false),
-    ] {
-        let mut cursor = 0;
+    let entry = pagination::metadata_entry(manifest)?;
+    pagination::verify_record(store, manifest.photo_id, &entry)?;
+    for (ordinal, (root, count, messages, start)) in [
+        (manifest.message_root.as_ref(), manifest.message_count, true, reuse.map(|h| h.message_count).unwrap_or(0)),
+        (manifest.round_root.as_ref(), manifest.round_count, false, reuse.map(|h| h.round_count).unwrap_or(0)),
+        (manifest.record_root.as_ref(), manifest.record_count, false, reuse.map(|h| h.record_count).unwrap_or(0)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut cursor = from.map(|v| v.get(ordinal).copied().unwrap_or(start)).unwrap_or(start);
+        if cursor > count {
+            return Err(error("invalid suffix verification range"));
+        }
         while cursor < count {
-            let result = page(store, manifest.photo_id, root, count, cursor, PAGE_ITEMS)?;
-            if messages {
-                for message in &result.records {
-                    if let Some(images) = message.get("images").and_then(Value::as_array) {
-                        for image in images {
-                            validate_key(
-                                manifest.photo_id,
-                                image.get("attachment").and_then(Value::as_str).ok_or_else(|| error("preview reference missing"))?,
-                                "previews/",
-                            )?;
-                            read_preview_reference(store, image)?;
-                        }
+            let entry = pagination::entry(store, manifest.photo_id, root, count, cursor)?;
+            pagination::verify_record(store, manifest.photo_id, &entry)?;
+            if messages && entry.length as u64 <= BLOCK {
+                let bytes = pagination::range(store, manifest.photo_id, &entry, 0, entry.length)?;
+                let message: Value = serde_json::from_slice(&bytes).map_err(error)?;
+                if let Some(images) = message.get("images").and_then(Value::as_array) {
+                    for image in images {
+                        read_preview_reference(store, image)?;
                     }
                 }
             }
-            cursor = result.next_cursor.unwrap_or(count);
+            cursor = cursor.checked_add(1).ok_or_else(|| error("verification cursor exhausted"))?;
         }
     }
     Ok(())
@@ -419,7 +489,34 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
     if staged.photo_id != pending.photo || staged.transaction_id != pending.transaction_id || staged.conversation_epoch != pending.expected_epoch {
         return Err(error("staged identity mismatch"));
     }
-    verify_graph(store, &staged)?;
+    if let Some(reuse) = pending.reuse.as_ref() {
+        if reuse.photo_id != pending.photo
+            || reuse.conversation_epoch != pending.expected_epoch
+            || reuse.message_count > staged.message_count
+            || reuse.round_count > staged.round_count
+            || reuse.record_count > staged.record_count
+        {
+            return Err(error("invalid reused graph identity"));
+        }
+        let frozen: Option<PhotoHeader> = read(store, &format!("{}/manifest-{}.json", base(pending.photo), reuse.transaction_id), SMALL)?;
+        if frozen.as_ref() != Some(reuse) {
+            return Err(error("reused immutable manifest changed"));
+        }
+    }
+    let verify_from = if let Some(ordinal) = staged.record_patch {
+        let reuse = pending.reuse.as_ref().ok_or_else(|| error("patched graph has no immutable base"))?;
+        if ordinal >= staged.record_count
+            || ordinal < staged.record_count.saturating_sub(128)
+            || staged.message_root != reuse.message_root
+            || staged.round_root != reuse.round_root
+        {
+            return Err(error("invalid bounded record patch"));
+        }
+        Some([staged.message_count, staged.round_count, ordinal])
+    } else {
+        None
+    };
+    verify_suffix_from(store, &staged, pending.reuse.as_ref(), verify_from)?;
     let head_key = format!("{}/HEAD.json", base(pending.photo));
     // Retrying the same transaction after an ambiguous fsync is idempotent.
     let visible: Option<Head> = read(store, &head_key, SMALL)?;
@@ -430,13 +527,22 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
         write(store, &head_key, &pending.head)?;
     }
     let manifest = header(store, pending.photo)?.ok_or_else(|| error("committed manifest missing"))?;
-    let metadata: Value =
-        serde_json::from_slice(&read_blob(store, pending.photo, &manifest.metadata, 0, usize::try_from(manifest.metadata_length).map_err(error)?)?)
-            .map_err(error)?;
+    let metadata = pagination::metadata_raw(store, &manifest)?;
+    let live_revert: Option<Value> =
+        if pending.revert_override.is_some() { read(store, &format!("{}/revert.json", base(pending.photo)), SMALL)? } else { None };
+    let revert = pending.revert_override.as_ref();
+    let override_eligible = revert.map(|r| {
+        r["eligible"] == true
+            && live_revert.as_ref().is_some_and(|current| {
+                (current["transaction_id"] == pending.transaction_id
+                    || pending.old_head.as_ref().is_some_and(|head| current["transaction_id"] == head.transaction_id))
+                    && current["eligible"] == true
+            })
+    });
     write(
         store,
         &format!("{}/revert.json", base(pending.photo)),
-        &json!({"transaction_id":pending.transaction_id,"local_round_id":metadata.pointer("/checkpoint/local_round_id"),"eligible":metadata.pointer("/checkpoint/eligible").and_then(Value::as_bool).unwrap_or(false)}),
+        &json!({"transaction_id":pending.transaction_id,"local_round_id":revert.and_then(|r|r.get("local_round_id")).or_else(||metadata.pointer("/checkpoint/local_round_id")),"eligible":override_eligible.unwrap_or_else(||metadata.pointer("/checkpoint/eligible").and_then(Value::as_bool).unwrap_or(false))}),
     )?;
     // Cleanup cannot turn a visible valid commit into an archive-save error.
     if let Err(e) = store.remove(&format!("{}/pending.json", base(pending.photo))) {
@@ -478,13 +584,16 @@ impl Session {
         let store = self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut();
         let root = if h.record_count > 0 { h.record_root.as_ref() } else { h.round_root.as_ref() };
         let count = if h.record_count > 0 { h.record_count } else { h.round_count };
-        let mut cursor = 0;
+        let mut cursor = count.saturating_sub(PAGE_ITEMS as u64);
         while cursor < count {
             let p = page(store, photo, root, count, cursor, PAGE_ITEMS)?;
             if let Some(v) = p.records.into_iter().find(|v| v["local_round_id"] == local_round_id) {
                 return Ok(Some(v));
             }
             cursor = p.next_cursor.unwrap_or(count);
+        }
+        if count > PAGE_ITEMS as u64 {
+            return Err(error("older round requires bounded paged lookup"));
         }
         Ok(None)
     }
@@ -535,6 +644,9 @@ impl Session {
             .and_then(|p| self.companion_commit(&p).map(|_| ()));
         match result {
             Ok(()) => {
+                // Format 2 keeps graphs on disk; only failed writes own a retry
+                // payload. Successful full-value compatibility saves are not cached.
+                self.companion_archive.photos.remove(&photo);
                 self.companion_archive.dirty_photos.remove(&photo);
                 if self.companion_archive.dirty_photos.is_empty() && self.companion_archive.revert_dirty.is_empty() {
                     self.companion_archive.error = None;
@@ -561,12 +673,13 @@ impl Session {
         let Some(h) = self.companion_photo_header(photo)? else { return Ok(None) };
         validate_key(photo, &h.metadata, "blocks/")?;
         let store = self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut();
-        let bytes = read_blob(store, photo, &h.metadata, 0, usize::try_from(h.metadata_length).map_err(error)?)?;
+        let bytes = pagination::range(store, photo, &pagination::metadata_entry(&h)?, 0, usize::try_from(h.metadata_length).map_err(error)?)?;
         if bytes.len() as u64 != h.metadata_length || digest(&bytes) != h.metadata_digest {
             return Err(error("metadata digest mismatch"));
         }
         let mut value: Value = serde_json::from_slice(&bytes).map_err(error)?;
         let had_records = h.record_count > 0;
+        let mut materialized_bytes = usize::try_from(h.metadata_length).map_err(error)?;
         for (name, root, count) in [
             ("messages", h.message_root.as_ref(), h.message_count),
             ("rounds", h.round_root.as_ref(), h.round_count),
@@ -576,7 +689,15 @@ impl Session {
             let mut cursor = 0;
             while cursor < count {
                 let p = page(store, photo, root, count, cursor, PAGE_ITEMS)?;
-                records.extend(p.records);
+                for record in p.records {
+                    materialized_bytes = materialized_bytes
+                        .checked_add(pagination::serialized_length(&record)?)
+                        .ok_or_else(|| error("materialized history overflow"))?;
+                    if materialized_bytes > 32 * 1024 * 1024 {
+                        return Err(error("compatibility hydration exceeds bounded budget; use pages/fragments"));
+                    }
+                    records.push(record);
+                }
                 cursor = p.next_cursor.unwrap_or(count);
             }
             value[name] = Value::Array(records);
@@ -588,7 +709,6 @@ impl Session {
         if !had_records {
             value.as_object_mut().ok_or_else(|| error("invalid metadata"))?.remove("round_records");
         }
-        self.companion_archive.photos.insert(photo, value.clone());
         Ok(Some(value))
     }
 }

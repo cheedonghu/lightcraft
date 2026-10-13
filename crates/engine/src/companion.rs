@@ -2,6 +2,8 @@
 pub(crate) mod archive;
 mod identity;
 mod mutation_guard;
+#[cfg(test)]
+mod pagination_tests;
 pub mod storage;
 pub use identity::{LocalRoundId, PhotoScope, RoundIdentity};
 pub use mutation_guard::LeaseToken;

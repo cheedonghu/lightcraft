@@ -1,0 +1,27 @@
+# AI companion history storage
+
+The companion owns `companion/`; it does not change the core Catalog format or add catalog operations. Fresh conversations use `companion/state.json` version 2 (`photo-head-v2`). The root contains no photo array. A photo's `HEAD.json` points to one immutable manifest. Existing version 1 remains on its compatibility path until the migration implementation.
+
+## Pages and records
+
+The manifest contains counts and roots for messages, round summaries and round records. Index files are at most 32 KiB and 128 entries; current writers pack at most 64 entries to leave room for the bounded jump table. Each index links its predecessor and up to 64 verified binary ancestor references. A page seek has at most 128 index visits and stops with an actionable error if a damaged/unsupported chain cannot satisfy this bound. No history is removed by that error.
+
+Packed data files are at most 4 MiB. Large logical records stream over consecutive files; those files use a payload of `4 MiB - 32` bytes plus a 32-byte hexadecimal digest trailer. `Entry.chunk_payload` selects this layout; absent means the original packed layout. `PhotoHeader.metadata_chunk_payload` uses the same convention for large metadata. Readers validate chunk digests before displaying fragments and validate the complete record digest and JSON when committing. File reservations still name the contiguous transaction sequence; no additional hash files are created.
+
+These are I/O engineering bounds, not a local history quota. A logical record may be larger than a block. A UI page retains at most 32 records and 256 KiB; oversized records remain readable in consecutive UTF-8 serialized fragments. The full-value compatibility reader and materialized pages have a 32 MiB allocation budget and direct callers to fragments/streaming when it is exceeded. That refusal does not prevent storage or delete records. Large metadata is retained on disk and deferred by the small header reader, without fabricating a checkpoint.
+
+## Actual client path
+
+`companion_photo_header`, `companion_metadata` and `companion_history_slice_at` replace eager whole-conversation loading. `Conversation.view` owns a single bounded history page, while its mutable tail contains only the new round's generated records. Saved inactive read caches are limited to 16 photo entries and a 2 MiB target; the selected current round and dirty unsaved results are runtime data, separate from the read cache. Each subsequent submission seals the completed tail into an immutable prefix before appending its new request. Dirty unsaved results are preserved rather than evicted after a real disk failure.
+
+`save_companion_tail` reuses an immutable verified prefix, writes the changed tail and metadata, verifies the new suffix, then publishes the photo HEAD. It does not reread or rewrite every older record. Late receipts for a sealed round patch only the bounded recent round-index suffix, preserve the current durable eligibility flag, and survive subsequent tail saves. The immutable manifest marks the patch ordinal so commit verification cannot silently skip the changed record. A failed tail is retained per photo in the archive retry queue; another photo can commit independently. A retry reuses an uncommitted transaction's durable reservation. Ordinary mutation invalidates both the dirty tail's checkpoint and the independent stored revert marker.
+
+Native page reads use one independent Store reader and a bounded result channel. Model-input history uses a separate reader and a captured immutable header. Results carry the exact runtime photo/library and graph/round identity. Switching libraries or stopping a preflight prevents its result from creating a request or publishing a photo. Local-only preflight stop releases its task lease; the reader remains busy until it retires. The panel does not synchronously scan complete history.
+
+## Model input and follow-on callers
+
+The model service limits remain separate: 1,024 messages, 256 KiB of text/tool arguments, 256 images and a 32 MiB history body. Projection reads one message at a time on the native worker, checks cumulative budgets and predicted Base64 size before hydrating previews, and rejects overflow while keeping every local record. Complete tool-pair legality and exact final request validation belong to the projection implementation.
+
+Round readers should use `companion_rounds_page` or advance `companion_round_search` in bounded steps. `companion_round` is a small recent-record compatibility lookup; an older large-history lookup returns an explicit request to use the paged API. Captured readers must be treated as readers of immutable graph objects when adding retirement/GC. Recovery and migration must preserve optional jump/chunk/record-patch fields and pending revert overrides, reservation ownership and a photo's single HEAD commit point.
+
+Validation uses procedural photos, native temporary directories and fault stores. See the UX-08 execution report for actual commands, large-history volume, corruption, seek, cancellation and screenshot evidence. No all-platform durability certification is implied by native macOS tests.

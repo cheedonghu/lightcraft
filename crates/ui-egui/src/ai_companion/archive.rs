@@ -2,18 +2,35 @@
 use super::*;
 impl State {
     pub(super) fn load(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
-        if self.conversations.contains_key(&photo) {
+        if let Some(conversation) = self.conversations.get(&photo) {
+            if conversation.view.is_none()
+                && let Some(prefix) = conversation.prefix.as_ref()
+            {
+                let cursor = lightcraft_engine::companion::storage::HistoryCursor { record: prefix.message_count.saturating_sub(32), offset: 0 };
+                self.request_page(app, photo, cursor)?;
+            }
             return Ok(());
         }
         let mut conversation =
             Conversation { scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }), ..Default::default() };
-        if let Some(archive) = app.session.load_companion_conversation(photo).map_err(|e| e.to_string())? {
+        let header = if app.session.library.is_some() { app.session.companion_photo_header(photo).map_err(|e| e.to_string())? } else { None };
+        let archive = if let Some(header) = header {
+            conversation.prefix = Some(header);
+            app.session.companion_metadata(photo).map_err(|e| e.to_string())?
+        } else {
+            app.session.photo_companion(photo).map_err(|e| e.to_string())?.cloned()
+        };
+        if let Some(archive) = archive {
             if !matches!(archive.get("schema_version").and_then(Value::as_u64), Some(1 | 2)) {
                 return Err("AI 对话格式不支持，未删减历史。".into());
             }
             conversation.schema_version = archive["schema_version"].as_u64().unwrap_or(1);
             conversation.records = archive.get("round_records").and_then(Value::as_array).cloned().unwrap_or_default();
-            conversation.messages = archive.get("messages").and_then(Value::as_array).ok_or("AI 对话记录无效。")?.clone();
+            conversation.messages = if conversation.prefix.is_some() {
+                Vec::new()
+            } else {
+                archive.get("messages").and_then(Value::as_array).ok_or("AI 对话记录无效。")?.clone()
+            };
             conversation.rounds = archive.get("rounds").and_then(Value::as_array).cloned().unwrap_or_default();
             if let Some(saved) = archive.get("checkpoint").filter(|v| !v.is_null()) {
                 let original: DevelopSettings =
@@ -29,10 +46,17 @@ impl State {
                     revision: app.session.photo_revision(photo),
                     content: lightcraft_engine::media::content_key(p),
                     eligible: saved.get("eligible").and_then(Value::as_bool) == Some(true),
+                    local_round_id: saved.get("local_round_id").and_then(Value::as_str).map(str::to_owned),
                 });
             }
         }
+        app.session.pin_companion_prefix(photo, conversation.prefix.clone()).map_err(|e| e.to_string())?;
         self.conversations.insert(photo, conversation);
+        self.prune_cache(app, photo);
+        if let Some(prefix) = self.conversations.get(&photo).and_then(|c| c.prefix.as_ref()) {
+            let cursor = lightcraft_engine::companion::storage::HistoryCursor { record: prefix.message_count.saturating_sub(32), offset: 0 };
+            self.request_page(app, photo, cursor)?;
+        }
         Ok(())
     }
     pub(super) fn save(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
@@ -76,18 +100,42 @@ impl State {
                 }
             }
         }
-        let checkpoint = conversation.checkpoint.as_ref().map(|c| json!({"original":c.original,"expected":c.expected,"eligible":c.eligible,"local_round_id":conversation.records.iter().rev().find(|r|r.get("recent_complete_result").is_some()).and_then(|r|r.get("local_round_id"))}));
-        app.session
-            .save_companion_conversation(
+        let checkpoint = conversation
+            .checkpoint
+            .as_ref()
+            .map(|c| json!({"original":c.original,"expected":c.expected,"eligible":c.eligible,"local_round_id":c.local_round_id}));
+        if conversation.schema_version == 2 && app.session.library.is_some() {
+            conversation.dirty = true;
+            let result = app.session.save_companion_tail(
                 photo,
-                json!({"schema_version":conversation.schema_version,"messages":messages,"rounds":conversation.rounds,"round_records":conversation.records,"checkpoint":checkpoint}),
-            )
-            .map_err(|e| e.to_string())?;
-        if conversation.schema_version == 2
-            && app.session.library.is_some()
-            && let Some(saved) = app.session.load_companion_conversation(photo).map_err(|e| e.to_string())?
-        {
-            conversation.messages = saved.get("messages").and_then(Value::as_array).cloned().ok_or("AI 对话记录无效。")?;
+                conversation.prefix.as_ref(),
+                &messages,
+                &conversation.rounds,
+                &conversation.records,
+                &json!({"schema_version":2,"checkpoint":checkpoint}),
+            );
+            if let Err(error) = result {
+                conversation.dirty_queued = app.session.companion_tail_unsaved(photo);
+                return Err(error.to_string());
+            }
+            // Only the caller-owned current round is retained/re-normalized. Never
+            // reload the complete saved conversation after a successful write.
+            let header = app.session.companion_photo_header(photo).map_err(|e| e.to_string())?.ok_or("AI 会话缺失。")?;
+            let start = conversation.prefix.as_ref().map(|h| h.message_count).unwrap_or(0);
+            let mut normalized = Vec::new();
+            let mut cursor = start;
+            while cursor < header.message_count {
+                let result = app.session.companion_messages_bounded(&header, cursor, 128, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
+                normalized.extend(result.records);
+                cursor = result.next_cursor.unwrap_or(header.message_count);
+            }
+            conversation.messages = normalized;
+            conversation.dirty = false;
+            conversation.dirty_queued = false;
+        } else {
+            app.session.save_companion_conversation(photo,
+                json!({"schema_version":conversation.schema_version,"messages":messages,"rounds":conversation.rounds,"round_records":conversation.records,"checkpoint":checkpoint})
+            ).map_err(|e| e.to_string())?;
         }
         // Normal journal persistence, independent of the already visible execution result.
         app.session.persist_if_dirty();
@@ -95,10 +143,38 @@ impl State {
     }
     pub(super) fn history(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<Vec<Value>, String> {
         self.load(app, photo)?;
-        let mut messages = self.conversations.get(&photo).ok_or("AI 会话不存在。")?.messages.clone();
-        if messages.len() > 1024 {
+        let conversation = self.conversations.get(&photo).ok_or("AI 会话不存在。")?;
+        let tail = conversation.messages.clone();
+        let prefix = conversation.prefix.clone();
+        if prefix.as_ref().map(|h| h.message_count).unwrap_or(0).saturating_add(tail.len() as u64) > 1024 {
             return Err("AI 完整历史超过服务限制，未删减历史。".into());
         }
+        let mut messages = Vec::new();
+        let mut bytes = 0usize;
+        if let Some(prefix) = prefix {
+            let mut cursor = 0;
+            while cursor < prefix.message_count {
+                let page = app
+                    .session
+                    .companion_messages_bounded(&prefix, cursor, 32, (32 * 1024 * 1024usize).saturating_sub(bytes))
+                    .map_err(|e| e.to_string())?;
+                for message in page.records {
+                    bytes = bytes.saturating_add(serde_json::to_vec(&message).map_err(|_| "AI 历史无效。")?.len());
+                    if messages
+                        .iter()
+                        .map(|m: &Value| m.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0))
+                        .sum::<usize>()
+                        .saturating_add(message.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0))
+                        > 256 * 1024
+                    {
+                        return Err("AI 完整历史超过服务限制，未删减历史。".into());
+                    }
+                    messages.push(message);
+                }
+                cursor = page.next_cursor.unwrap_or(prefix.message_count);
+            }
+        }
+        messages.extend(tail);
         let mut images = 0usize;
         let mut text = 0usize;
         for message in &mut messages {
@@ -111,6 +187,9 @@ impl State {
             text = text.saturating_add(message.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0));
             if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
                 text = text.saturating_add(serde_json::to_vec(calls).map_err(|_| "AI 工具历史无效。")?.len());
+            }
+            if text > 256 * 1024 {
+                return Err("AI 完整历史超过服务限制，未删减历史。".into());
             }
             if let Some(pictures) = message.get_mut("images").and_then(Value::as_array_mut) {
                 images = images.saturating_add(pictures.len());
@@ -139,5 +218,45 @@ impl State {
             return Err("AI 完整历史超过服务限制，未删减历史。".into());
         }
         Ok(messages)
+    }
+    pub(super) fn read_page(
+        &mut self,
+        app: &mut LightcraftApp,
+        photo: PhotoId,
+        cursor: lightcraft_engine::companion::storage::HistoryCursor,
+    ) -> Result<(), String> {
+        let Some(prefix) = self.conversations.get(&photo).and_then(|c| c.prefix.clone()) else { return Ok(()) };
+        let page = app.session.companion_history_slice_at(&prefix, cursor, 256 * 1024).map_err(|e| e.to_string())?;
+        let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+        conversation.view = Some(HistoryView { cursor, next: page.next, messages: page.records, fragments: page.fragments, bytes: page.bytes });
+        self.prune_cache(app, photo);
+        Ok(())
+    }
+    pub(super) fn prune_cache(&mut self, app: &mut LightcraftApp, keep: PhotoId) {
+        // Dirty results remain owned until successfully saved; active work is
+        // separately service-budgeted. Evict only saved inactive read caches.
+        loop {
+            let bytes: usize = self
+                .conversations
+                .values()
+                .map(|c| {
+                    c.view.as_ref().map(|v| v.bytes).unwrap_or(0).saturating_add(
+                        c.messages
+                            .iter()
+                            .chain(c.records.iter())
+                            .chain(c.rounds.iter())
+                            .map(|v| lightcraft_engine::companion::storage::record_size(v).unwrap_or(usize::MAX))
+                            .fold(0usize, usize::saturating_add),
+                    )
+                })
+                .fold(0usize, usize::saturating_add);
+            if self.conversations.len() <= 16 && bytes <= 2 * 1024 * 1024 {
+                break;
+            }
+            let candidate = self.conversations.iter().find(|(p, c)| **p != keep && !c.dirty && !self.jobs.contains_key(p)).map(|(p, _)| *p);
+            let Some(candidate) = candidate else { break };
+            self.conversations.remove(&candidate);
+            let _ = app.session.pin_companion_prefix(candidate, None);
+        }
     }
 }
