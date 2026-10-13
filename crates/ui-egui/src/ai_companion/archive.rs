@@ -188,6 +188,9 @@ impl State {
         cursor: lightcraft_engine::companion::storage::HistoryCursor,
     ) -> Result<(), String> {
         let Some(prefix) = self.conversations.get(&photo).and_then(|c| c.prefix.clone()) else { return Ok(()) };
+        // Capture before the first fallback read, and keep it through all
+        // owner/round scans and inactive pauses until the actual view drops.
+        let retention = app.session.retain_companion_history(&prefix).map_err(|e| e.to_string())?;
         let page = app.session.companion_history_slice_at(&prefix, cursor, 256 * 1024).map_err(|e| e.to_string())?;
         let wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
         let owners: VecDeque<_> = page
@@ -201,6 +204,7 @@ impl State {
         let total = if prefix.record_count > 0 { prefix.record_count } else { prefix.round_count };
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
         conversation.view = Some(HistoryView {
+            _retention: retention,
             items: page.items,
             cursor,
             next: page.next,

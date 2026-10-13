@@ -564,6 +564,9 @@ fn fallback_giant_ignored_fields_keep_each_frame_bounded_and_eventually_show_the
         fn describe(&self) -> String {
             self.files.describe()
         }
+        fn retention_namespace(&self) -> Option<String> {
+            self.files.retention_namespace()
+        }
     }
     let bytes = Arc::new(AtomicUsize::new(0));
     let mut session = Session::new();
@@ -847,4 +850,205 @@ fn failed_proposal_retained_categorical_value_uses_the_selected_language() {
         }
         screenshot(&mut h, &format!("failed-category-{}", locale.code()));
     }
+}
+
+#[test]
+fn actual_fallback_view_retains_its_graph_across_inactive_scans_until_real_retirement() {
+    retained_view(false);
+}
+#[test]
+fn actual_native_completion_view_retains_its_graph_until_real_retirement() {
+    retained_view(true);
+}
+fn retained_view(background: bool) {
+    use lightcraft_catalog::Store;
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    struct Files {
+        memory: MemStore,
+        calls: Arc<AtomicUsize>,
+        largest: Arc<AtomicUsize>,
+        reader: bool,
+        native_ranges: Arc<AtomicUsize>,
+    }
+    impl Store for Files {
+        fn read(&mut self, n: &str) -> io::Result<Option<Vec<u8>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.largest.store(usize::MAX, Ordering::Relaxed);
+            self.memory.read(n)
+        }
+        fn read_limited(&mut self, n: &str, max: u64) -> io::Result<Option<Vec<u8>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.largest.fetch_max(max as usize, Ordering::Relaxed);
+            self.memory.read_limited(n, max)
+        }
+        fn read_range(&mut self, n: &str, o: u64, len: usize) -> io::Result<Vec<u8>> {
+            if self.reader {
+                self.native_ranges.fetch_add(1, Ordering::Relaxed);
+            }
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.largest.fetch_max(len, Ordering::Relaxed);
+            self.memory.read_range(n, o, len)
+        }
+        fn write_atomic(&mut self, n: &str, b: &[u8]) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.memory.write_atomic(n, b)
+        }
+        fn append(&mut self, n: &str, b: &[u8]) -> io::Result<()> {
+            self.memory.append(n, b)
+        }
+        fn remove(&mut self, n: &str) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.memory.remove(n)
+        }
+        fn truncate(&mut self, n: &str, len: u64) -> io::Result<()> {
+            self.memory.truncate(n, len)
+        }
+        fn describe(&self) -> String {
+            self.memory.describe()
+        }
+        fn retention_namespace(&self) -> Option<String> {
+            self.memory.retention_namespace()
+        }
+        fn background_writer(&self) -> Option<Box<dyn Store>> {
+            self.memory.background.then(|| {
+                Box::new(Self {
+                    memory: self.memory.clone(),
+                    calls: self.calls.clone(),
+                    largest: self.largest.clone(),
+                    reader: true,
+                    native_ranges: self.native_ranges.clone(),
+                }) as Box<dyn Store>
+            })
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let largest = Arc::new(AtomicUsize::new(0));
+    let native_ranges = Arc::new(AtomicUsize::new(0));
+    let mut backing = MemStore::new();
+    backing.background = background;
+    let mut session = Session::new();
+    session
+        .open_library_in(
+            LibraryStores {
+                catalog: Box::new(MemStore::new()),
+                files: Box::new(Files {
+                    memory: backing.clone(),
+                    calls: calls.clone(),
+                    largest: largest.clone(),
+                    reader: false,
+                    native_ranges: native_ranges.clone(),
+                }),
+                dir: "view-retention".into(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let photo = session.active().unwrap();
+    let other = session.catalog.photos().find(|p| p.id != photo).unwrap().id;
+    session
+        .set_companion_editor(other, lightcraft_engine::companion::EditorState { draft: "independent editor draft".into(), ..Default::default() })
+        .unwrap();
+    let rounds: Vec<_> = (0..5).map(|i| json!({"local_round_id":format!("retained-{i}"),"request":"ignored".repeat(100_000),"stages":if i==4 {vec![stage("initial",0.0,0.35)]} else {Vec::new()},"local_terminal":"completed"})).collect();
+    session.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"role":"assistant","text":"A".repeat(600_000),"local_round_id":"retained-4"}],"round_records":rounds,"rounds":[]})).unwrap();
+    let old = session.companion_photo_header(photo).unwrap().unwrap();
+    let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1400.0, 1000.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    h.app.run("ai.history", json!({"record":0})).unwrap();
+    if background {
+        let status = ready(&mut h);
+        assert_eq!(status["resultCards"][0]["localRoundId"], "retained-4");
+        assert!(native_ranges.load(Ordering::Relaxed) > 0, "actual background handle read the captured graph");
+    } else {
+        h.step();
+        assert_eq!(h.app.run("ai.status", json!({})).unwrap()["historyLoading"], true);
+    }
+    h.app.run("library.select", json!({"ids":[other.0],"active":other.0})).unwrap();
+    h.step(); // real inactive HistoryView owns its unfinished scanner
+    h.app
+        .session
+        .save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"role":"assistant","text":"current saved view"}],"rounds":[]}))
+        .unwrap();
+    let current = h.app.session.companion_photo_header(photo).unwrap().unwrap();
+    h.app.session.pin_companion_prefix(photo, None).unwrap();
+    let mut idle = false;
+    for _ in 0..1000 {
+        calls.store(0, Ordering::Relaxed);
+        largest.store(0, Ordering::Relaxed);
+        h.app.session.persist().unwrap();
+        assert!(calls.load(Ordering::Relaxed) <= 100);
+        assert!(largest.load(Ordering::Relaxed) <= 32 * 1024);
+        if calls.load(Ordering::Relaxed) == 0 {
+            idle = true;
+            break;
+        }
+    }
+    assert!(idle, "protected automatic cycle reached observed zero-I/O idle");
+    assert!(
+        h.app.session.companion_messages_bounded(&old, 0, 1, 1024 * 1024).is_ok(),
+        "actual paused fallback view must protect its captured graph after cache release"
+    );
+    h.app.run("library.select", json!({"ids":[photo.0],"active":photo.0})).unwrap();
+    let status = ready(&mut h);
+    assert_eq!(status["resultCards"][0]["localRoundId"], "retained-4");
+    assert_eq!(status["resultCards"][0]["stages"][0]["changes"][0]["actual"], "+0.35");
+    assert_eq!(h.app.session.companion_editor(other).unwrap().draft, "independent editor draft");
+    // A real library-generation change retires the actual view and scanner.
+    h.app
+        .session
+        .open_library_in(
+            LibraryStores { catalog: Box::new(MemStore::new()), files: Box::new(MemStore::new()), dir: "other-library".into(), on_disk: false },
+            true,
+        )
+        .unwrap();
+    h.step();
+    // Reopening A resumes its transferred work, without touching its HEAD.
+    h.app
+        .session
+        .open_library_in(
+            LibraryStores {
+                catalog: Box::new(MemStore::new()),
+                files: Box::new(Files {
+                    memory: backing,
+                    calls: calls.clone(),
+                    largest: largest.clone(),
+                    reader: false,
+                    native_ranges: native_ranges.clone(),
+                }),
+                dir: "view-retention".into(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let mut reclaimed = false;
+    for _ in 0..1000 {
+        calls.store(0, Ordering::Relaxed);
+        largest.store(0, Ordering::Relaxed);
+        h.app.session.persist().unwrap();
+        assert!(calls.load(Ordering::Relaxed) <= 100);
+        assert!(largest.load(Ordering::Relaxed) <= 32 * 1024);
+        assert_eq!(h.app.session.companion_messages_bounded(&current, 0, 1, 1024).unwrap().records[0]["text"], "current saved view");
+        if h.app.session.companion_messages_bounded(&old, 0, 1, 1024 * 1024).is_err() {
+            reclaimed = true;
+            break;
+        }
+    }
+    assert!(reclaimed, "actual view retirement must permit eventual automatic reclamation");
+    for _ in 0..1000 {
+        calls.store(0, Ordering::Relaxed);
+        h.app.session.persist().unwrap();
+        if calls.load(Ordering::Relaxed) == 0 {
+            break;
+        }
+    }
+    assert!(!h.app.session.companion_cleanup_pending());
+    assert!(h.app.session.unsaved().is_none());
+    assert_eq!(h.app.session.companion_editor(other).unwrap().draft, "independent editor draft");
 }

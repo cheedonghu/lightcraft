@@ -114,6 +114,7 @@ impl Default for State {
     }
 }
 struct HistoryView {
+    _retention: lightcraft_engine::companion::storage::HistoryRetention,
     items: Vec<lightcraft_engine::companion::storage::HistoryItem>,
     cursor: lightcraft_engine::companion::storage::HistoryCursor,
     next: Option<lightcraft_engine::companion::storage::HistoryCursor>,

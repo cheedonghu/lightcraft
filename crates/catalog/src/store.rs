@@ -342,7 +342,7 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
 /// In-memory files. Clones share the same files (so a test can "reopen" or corrupt them).
 #[derive(Clone)]
 pub struct MemStore {
-    namespace: u64,
+    namespace: Option<u64>,
     pub files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     /// Offer a [`Store::background_writer`] (off by default: snapshots stay synchronous).
     pub background: bool,
@@ -353,8 +353,9 @@ impl Default for MemStore {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         // Never wrap/reuse identity while a retired debt registry may outlive
-        // the backing allocation. Clones carry the same namespace and files.
-        let namespace = NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).expect("memory Store identity exhausted");
+        // the backing allocation. Exhaustion returns unknown/protected identity;
+        // clones carry the same namespace and files.
+        let namespace = NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).ok();
         Self { namespace, files: Arc::default(), background: false }
     }
 }
@@ -424,7 +425,7 @@ impl Store for MemStore {
         "memory".into()
     }
     fn retention_namespace(&self) -> Option<String> {
-        Some(format!("memory-store:{}", self.namespace))
+        self.namespace.map(|id| format!("memory-store:{id}"))
     }
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         self.background.then(|| Box::new(self.clone()) as Box<dyn Store>)

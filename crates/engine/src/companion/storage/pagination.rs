@@ -541,6 +541,11 @@ pub struct HistoryReader {
     header: PhotoHeader,
 }
 impl HistoryReader {
+    /// Transfer verified graph/OS-lock retention into the completed page/view.
+    /// The Store reader retires here; the graph retires when this guard drops.
+    pub fn into_retention(self) -> reader_pins::HistoryRetention {
+        self._pin
+    }
     pub fn header(&self) -> &PhotoHeader {
         &self.header
     }
