@@ -14,6 +14,7 @@ fn ready_candidate_cannot_publish_after_connection_invalidation() {
         revision: app.session.photo_revision(photo),
         content: lightcraft_engine::media::content_key(app.session.catalog.photo(photo).unwrap()),
         eligible: true,
+        local_round_id: None,
     };
     let mut target = (*original).clone();
     target.light.exposure = 0.5;
@@ -38,6 +39,7 @@ fn ready_candidate_cannot_publish_after_connection_invalidation() {
             prompt: "brighten".into(),
             user_message: 0,
             history: vec![],
+            history_preflight: false,
             checkpoint,
             cancel,
             snapshot: None,
@@ -54,7 +56,7 @@ fn ready_candidate_cannot_publish_after_connection_invalidation() {
                 identity: state.jobs.get(&photo).unwrap().identity.clone(),
                 plan: Some(json!({"plan_id":"plan"})),
                 settings: target,
-                result: Ok(result),
+                result: Ok(Box::new(result)),
             },
         )
         .unwrap_err();
@@ -87,6 +89,7 @@ fn explanation_keeps_stable_local_identity_after_selection_and_backend_admission
             prompt: "explain".into(),
             user_message: 0,
             history: vec![],
+            history_preflight: false,
             checkpoint: Checkpoint {
                 photo,
                 generation,
@@ -95,6 +98,7 @@ fn explanation_keeps_stable_local_identity_after_selection_and_backend_admission
                 revision: app.session.photo_revision(photo),
                 content: lightcraft_engine::media::content_key(app.session.catalog.photo(photo).unwrap()),
                 eligible: true,
+                local_round_id: None,
             },
             cancel: Arc::new(AtomicBool::new(false)),
             snapshot: None,

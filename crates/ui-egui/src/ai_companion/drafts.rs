@@ -5,6 +5,7 @@ use lightcraft_engine::companion::EditorState;
 pub(super) struct Editor {
     scope: PhotoScope,
     pub(super) data: EditorState,
+    known_draft: bool,
     revision: u64,
     pub(super) restore_scroll: bool,
 }
@@ -23,7 +24,12 @@ impl State {
                 }
             }
         } else if let Some(photo) = active {
+            let missing = !self.editors.contains_key(&photo);
             self.ensure_editor(app, photo)?;
+            if missing && let Some(editor) = self.editors.get_mut(&photo) {
+                self.prompt = editor.data.draft.clone();
+                editor.restore_scroll = true;
+            }
         }
         // Saved inactive editor buffers can be reloaded independently; never evict unsaved drafts.
         let dirty: BTreeSet<_> = app.session.companion_dirty_editors().into_iter().collect();
@@ -51,6 +57,18 @@ impl State {
         }
         Ok(())
     }
+    pub(super) fn sync_editor_deferred(&mut self, app: &mut LightcraftApp) -> Result<(), String> {
+        let captured = self.capture_draft(app);
+        let active = app.session.active().filter(|_| app.session.selection.ids.len() == 1);
+        if self.editor_photo != active {
+            self.editor_photo = active;
+            self.prompt = active.and_then(|photo| self.editors.get(&photo)).map(|editor| editor.data.draft.clone()).unwrap_or_default();
+            if let Some(editor) = active.and_then(|photo| self.editors.get_mut(&photo)) {
+                editor.restore_scroll = true;
+            }
+        }
+        captured
+    }
     fn ensure_editor(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
         if self.editors.contains_key(&photo) {
             return Ok(());
@@ -61,7 +79,13 @@ impl State {
         // cannot overwrite the unreadable source; normal saves report it unsaved.
         self.editors.insert(
             photo,
-            Editor { scope: PhotoScope { library_generation: app.session.library_generation(), photo }, data, revision: 0, restore_scroll: true },
+            Editor {
+                scope: PhotoScope { library_generation: app.session.library_generation(), photo },
+                data,
+                known_draft: loaded.is_ok(),
+                revision: 0,
+                restore_scroll: true,
+            },
         );
         loaded.map(|_| ())
     }
@@ -74,6 +98,7 @@ impl State {
         if editor.data.draft != self.prompt {
             editor.revision = editor.revision.saturating_add(1);
             editor.data.draft.clone_from(&self.prompt);
+            editor.known_draft = true;
             app.session.set_companion_editor(photo, editor.data.clone()).map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -82,9 +107,12 @@ impl State {
         self.ensure_editor(app, photo)?;
         let editor = self.editors.get_mut(&photo).ok_or_else(|| tr("The AI draft is unavailable.").to_owned())?;
         editor.revision = editor.revision.saturating_add(1);
+        let changed = !editor.data.draft.is_empty();
         editor.data.draft.clear();
         let revision = editor.revision;
-        app.session.set_companion_editor(photo, editor.data.clone()).map_err(|e| e.to_string())?;
+        if changed {
+            app.session.set_companion_editor(photo, editor.data.clone()).map_err(|e| e.to_string())?;
+        }
         if self.editor_photo == Some(photo) {
             self.prompt.clear();
         }
@@ -101,6 +129,7 @@ impl State {
         }
         editor.revision = editor.revision.saturating_add(1);
         editor.data.draft = prompt.into();
+        editor.known_draft = true;
         if self.editor_photo == Some(photo) {
             self.prompt = prompt.into();
         }
@@ -137,9 +166,75 @@ pub(super) fn scroll_position(app: &mut LightcraftApp, photo: PhotoId, offset: f
     if (editor.data.scroll_offset - offset).abs() > 0.5 || editor.data.follow_tail != tail {
         editor.data.scroll_offset = offset;
         editor.data.follow_tail = tail;
-        let data = editor.data.clone();
-        if let Err(error) = app.session.set_companion_editor(photo, data) {
-            app.ai.text = error.to_string();
+        // A failed load's empty overlay is not a replacement authored by the user.
+        if editor.known_draft {
+            let data = editor.data.clone();
+            if let Err(error) = app.session.set_companion_editor(photo, data) {
+                app.ai.text = error.to_string();
+            }
+        }
+    }
+}
+
+impl State {
+    pub(super) fn initial_page(
+        &mut self,
+        app: &mut LightcraftApp,
+        photo: PhotoId,
+        header: &lightcraft_engine::companion::storage::PhotoHeader,
+    ) -> lightcraft_engine::companion::storage::HistoryCursor {
+        if let Err(error) = self.ensure_editor(app, photo) {
+            self.text = error;
+        }
+        self.editors
+            .get(&photo)
+            .filter(|e| {
+                e.data.reading_epoch == Some(header.conversation_epoch)
+                    && !(e.data.follow_tail && e.data.reading_count.is_some_and(|count| count != header.message_count))
+            })
+            .and_then(|e| e.data.reading_cursor)
+            .filter(|cursor| cursor.record < header.message_count)
+            .unwrap_or(lightcraft_engine::companion::storage::HistoryCursor { record: header.message_count.saturating_sub(32), offset: 0 })
+    }
+    pub(super) fn navigate_page(
+        &mut self,
+        app: &mut LightcraftApp,
+        photo: PhotoId,
+        cursor: lightcraft_engine::companion::storage::HistoryCursor,
+    ) -> Result<(), String> {
+        self.ensure_editor(app, photo)?;
+        let prefix = self.conversations.get(&photo).and_then(|c| c.prefix.as_ref());
+        let epoch = prefix.map(|h| h.conversation_epoch);
+        let count = prefix.map(|h| h.message_count);
+        if let Some(editor) = self.editors.get_mut(&photo) {
+            editor.data.reading_cursor = Some(cursor);
+            editor.data.reading_epoch = epoch;
+            editor.data.reading_count = count;
+            editor.data.follow_tail = false;
+            editor.restore_scroll = true;
+            if editor.known_draft {
+                app.session.set_companion_editor(photo, editor.data.clone()).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn accept_page(&mut self, app: &mut LightcraftApp, photo: PhotoId, cursor: lightcraft_engine::companion::storage::HistoryCursor) {
+        if let Err(error) = self.ensure_editor(app, photo) {
+            self.text = error;
+        }
+        let prefix = self.conversations.get(&photo).and_then(|c| c.prefix.as_ref());
+        let epoch = prefix.map(|h| h.conversation_epoch);
+        let count = prefix.map(|h| h.message_count);
+        if let Some(editor) = self.editors.get_mut(&photo) {
+            editor.data.reading_cursor = Some(cursor);
+            editor.data.reading_epoch = epoch;
+            editor.data.reading_count = count;
+            editor.restore_scroll = true;
+            if editor.known_draft
+                && let Err(error) = app.session.set_companion_editor(photo, editor.data.clone())
+            {
+                self.text = error.to_string();
+            }
         }
     }
 }

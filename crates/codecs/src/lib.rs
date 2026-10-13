@@ -35,6 +35,7 @@ pub mod proof;
 mod psd;
 mod sniff;
 pub mod space;
+mod strict;
 mod tiff_codec;
 mod webp;
 
@@ -164,6 +165,17 @@ pub(crate) fn mat_apply(m: &[[f32; 3]; 3], p: [f32; 3]) -> [f32; 3] {
 pub fn decode(bytes: &[u8], opts: DecodeOptions) -> Result<Decoded> {
     let format = sniff(bytes).ok_or(Error::UnknownFormat)?;
     std::panic::catch_unwind(|| decode_unguarded(bytes, format, &opts)).unwrap_or_else(|_| Err(Error::Malformed(format, "decoder panicked".into())))
+}
+
+/// Validate a complete JPEG/PNG pixel stream without repairing truncated scan
+/// data or ignoring errors after PNG image data. Normal photo decoding stays
+/// tolerant. The caller's pixel budget is checked before pixel allocation.
+/// Resizing/colour conversion are unnecessary for validation; stored dimensions
+/// and orientation are returned. Unsupported formats return an error.
+pub fn validate_complete_image(bytes: &[u8], max_pixels: u64) -> Result<Header> {
+    let format = sniff(bytes).ok_or(Error::UnknownFormat)?;
+    std::panic::catch_unwind(|| strict::validate(bytes, format, max_pixels))
+        .unwrap_or_else(|_| Err(Error::Malformed(format, "decoder panicked".into())))
 }
 
 /// What a file's headers say about its image: enough to catalogue it without decoding pixels.

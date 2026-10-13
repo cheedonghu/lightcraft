@@ -40,6 +40,7 @@ fn invalid_library_keeps_the_round_and_new_library_archives_it() {
             prompt: "brighten".into(),
             user_message: 0,
             history: vec![],
+            history_preflight: false,
             checkpoint: Checkpoint {
                 photo,
                 generation,
@@ -48,6 +49,7 @@ fn invalid_library_keeps_the_round_and_new_library_archives_it() {
                 revision: app.session.photo_revision(photo),
                 content: lightcraft_engine::media::content_key(app.session.catalog.photo(photo).unwrap()),
                 eligible: true,
+                local_round_id: None,
             },
             cancel: cancel.clone(),
             snapshot: None,

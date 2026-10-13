@@ -4,6 +4,8 @@ mod editor;
 pub use editor::EditorState;
 mod identity;
 mod mutation_guard;
+#[cfg(test)]
+mod pagination_tests;
 pub mod storage;
 pub use identity::{LocalRoundId, PhotoScope, RoundIdentity};
 pub use mutation_guard::LeaseToken;
@@ -371,3 +373,21 @@ fn closed(value: &Value, names: &[&str]) -> Result<(), String> {
 }
 #[cfg(test)]
 mod tests;
+
+/// Validate historical model images using the same actual MIME/dimension/decode
+/// bounds as the v1 service. This does not read or publish the original photo.
+pub fn validate_history_image(mime: &str, data: &[u8]) -> Result<(), String> {
+    let expected = match mime {
+        "image/jpeg" => lightcraft_codecs::Format::Jpeg,
+        "image/png" => lightcraft_codecs::Format::Png,
+        _ => return Err("unsupported historical image MIME".into()),
+    };
+    if data.is_empty() || data.len() > 128 * 1024 || lightcraft_codecs::sniff(data) != Some(expected) {
+        return Err("invalid historical image".into());
+    }
+    let decoded = lightcraft_codecs::validate_complete_image(data, 640 * 640).map_err(|e| e.to_string())?;
+    if decoded.width == 0 || decoded.height == 0 || decoded.width > 640 || decoded.height > 640 {
+        return Err("historical image dimensions exceed service limits".into());
+    }
+    Ok(())
+}

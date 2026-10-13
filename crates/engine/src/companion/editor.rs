@@ -10,10 +10,16 @@ pub struct EditorState {
     pub draft: String,
     pub scroll_offset: f32,
     pub follow_tail: bool,
+    #[serde(default)]
+    pub reading_cursor: Option<super::storage::HistoryCursor>,
+    #[serde(default)]
+    pub reading_epoch: Option<u64>,
+    #[serde(default)]
+    pub reading_count: Option<u64>,
 }
 impl Default for EditorState {
     fn default() -> Self {
-        Self { draft: String::new(), scroll_offset: 0.0, follow_tail: true }
+        Self { draft: String::new(), scroll_offset: 0.0, follow_tail: true, reading_cursor: None, reading_epoch: None, reading_count: None }
     }
 }
 #[derive(Default)]
@@ -31,6 +37,12 @@ struct Header {
     draft_length: u64,
     scroll_offset: f32,
     follow_tail: bool,
+    #[serde(default)]
+    reading_cursor: Option<super::storage::HistoryCursor>,
+    #[serde(default)]
+    reading_epoch: Option<u64>,
+    #[serde(default)]
+    reading_count: Option<u64>,
 }
 fn name(photo: PhotoId) -> String {
     format!("companion/v2/photos/{}/editor.json", photo.0)
@@ -70,7 +82,14 @@ fn read(store: &mut dyn Store, photo: PhotoId) -> Result<EditorState> {
     if hash.finish().to_string() != h.draft_digest {
         return Err(error("draft digest mismatch"));
     }
-    Ok(EditorState { draft: String::from_utf8(bytes).map_err(error)?, scroll_offset: h.scroll_offset, follow_tail: h.follow_tail })
+    Ok(EditorState {
+        draft: String::from_utf8(bytes).map_err(error)?,
+        scroll_offset: h.scroll_offset,
+        follow_tail: h.follow_tail,
+        reading_cursor: h.reading_cursor,
+        reading_epoch: h.reading_epoch,
+        reading_count: h.reading_count,
+    })
 }
 impl Editors {
     pub(crate) fn dirty(&self) -> bool {
@@ -109,6 +128,9 @@ impl Editors {
                         draft_length: editor.draft.len() as u64,
                         scroll_offset: editor.scroll_offset,
                         follow_tail: editor.follow_tail,
+                        reading_cursor: editor.reading_cursor,
+                        reading_epoch: editor.reading_epoch,
+                        reading_count: editor.reading_count,
                     };
                     store.write_atomic(&name(photo), &serde_json::to_vec(&h).map_err(error)?).map_err(error)?;
                     if let Some(old) = old.filter(|old| old.draft_digest != digest) {
@@ -198,7 +220,7 @@ mod tests {
         let catalog = MemStore::new();
         let mut s = open(files.clone(), catalog.clone());
         let ids: Vec<_> = s.catalog.photos().take(2).map(|p| p.id).collect();
-        let a = EditorState { draft: "A unsent 草稿\n".repeat(100), scroll_offset: 321.0, follow_tail: false };
+        let a = EditorState { draft: "A unsent 草稿\n".repeat(100), scroll_offset: 321.0, follow_tail: false, ..Default::default() };
         let b = EditorState { draft: "B unsent draft".into(), ..Default::default() };
         s.set_companion_editor(ids[0], a.clone()).unwrap();
         s.set_companion_editor(ids[1], b.clone()).unwrap();
