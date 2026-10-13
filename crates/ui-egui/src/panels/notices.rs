@@ -33,12 +33,21 @@ pub fn may_close(app: &mut LightcraftApp) -> bool {
         }));
         return false;
     }
-    if let Err(error) = crate::ai_companion::before_library_change(app) {
-        log::error!("quit: AI conversation not saved: {error}");
-        app.quit_prompt = Some(QuitPrompt::Unsaved(error));
-        return false;
-    }
-    if app.session.unsaved().is_none() {
+    let preparation_failed = match crate::ai_companion::before_library_change(app) {
+        Ok(()) => false,
+        Err(error) => {
+            log::error!("quit: records not saved: {error}");
+            // Normal persistence can fail on the catalog journal before flushing
+            // companions. Keep the existing closing-snapshot fallback and counted
+            // unsaved warning instead of misclassifying that as an AI-only fault.
+            if app.session.library.as_ref().is_none_or(|lib| lib.unsaved_error.is_none()) {
+                app.quit_prompt = Some(QuitPrompt::Unsaved(error));
+                return false;
+            }
+            true
+        }
+    };
+    if !preparation_failed && app.session.unsaved().is_none() {
         crate::ai_companion::before_exit(app);
         return true;
     }
@@ -50,6 +59,12 @@ pub fn may_close(app: &mut LightcraftApp) -> bool {
     }
     match app.session.unsaved() {
         None => {
+            // A successful core snapshot is not proof that a failed companion
+            // staging/receipt operation succeeded. Explicitly finish it too.
+            if preparation_failed && let Err(error) = crate::ai_companion::before_library_change(app) {
+                app.quit_prompt = Some(QuitPrompt::Unsaved(error));
+                return false;
+            }
             crate::ai_companion::before_exit(app);
             true
         }
