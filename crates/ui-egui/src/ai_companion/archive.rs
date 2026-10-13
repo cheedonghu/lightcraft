@@ -149,78 +149,35 @@ impl State {
         let conversation = self.conversations.get(&photo).ok_or("AI 会话不存在。")?;
         let tail = conversation.messages.clone();
         let prefix = conversation.prefix.clone();
-        if prefix.as_ref().map(|h| h.message_count).unwrap_or(0).saturating_add(tail.len() as u64) > 1024 {
-            return Err("AI 完整历史超过服务限制，未删减历史。".into());
-        }
-        let mut messages = Vec::new();
-        let mut bytes = 0usize;
+        let mut projection = projection::HistoryProjection::new(photo);
         if let Some(prefix) = prefix {
             let mut cursor = 0;
             while cursor < prefix.message_count {
-                let page = app
-                    .session
-                    .companion_messages_bounded(&prefix, cursor, 32, (32 * 1024 * 1024usize).saturating_sub(bytes))
-                    .map_err(|e| e.to_string())?;
-                for message in page.records {
-                    bytes = bytes.saturating_add(serde_json::to_vec(&message).map_err(|_| "AI 历史无效。")?.len());
-                    if messages
-                        .iter()
-                        .map(|m: &Value| m.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0))
-                        .sum::<usize>()
-                        .saturating_add(message.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0))
-                        > 256 * 1024
-                    {
-                        return Err("AI 完整历史超过服务限制，未删减历史。".into());
-                    }
-                    messages.push(message);
-                }
-                cursor = page.next_cursor.unwrap_or(prefix.message_count);
-            }
-        }
-        messages.extend(tail);
-        let mut images = 0usize;
-        let mut text = 0usize;
-        for message in &mut messages {
-            // Additive local metadata must not change the v1 model-input shape.
-            if let Some(object) = message.as_object_mut() {
-                for key in ["local_round_id", "local_message_id", "stage", "model_call_id", "tool_request_id", "complete_state", "display_kind"] {
-                    object.remove(key);
-                }
-            }
-            text = text.saturating_add(message.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0));
-            if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
-                text = text.saturating_add(serde_json::to_vec(calls).map_err(|_| "AI 工具历史无效。")?.len());
-            }
-            if text > 256 * 1024 {
-                return Err("AI 完整历史超过服务限制，未删减历史。".into());
-            }
-            if let Some(pictures) = message.get_mut("images").and_then(Value::as_array_mut) {
-                images = images.saturating_add(pictures.len());
-                if images > 256 {
-                    return Err("AI 完整历史超过服务限制，未删减历史。".into());
-                }
-                for picture in pictures {
-                    if let Some(name) = picture.get("attachment").and_then(Value::as_str) {
+                let page = app.session.companion_messages_bounded(&prefix, cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
+                for message in &page.records {
+                    projection.push(message, |picture| {
+                        let name = picture.get("attachment").and_then(Value::as_str).ok_or("AI 预览附件无效。")?;
                         let library = app.session.library.as_mut().ok_or("AI 预览附件的图库已关闭。")?;
-                        let data = if name.starts_with("companion/v2/") {
+                        if name.starts_with("companion/v2/") {
                             library.read_companion_preview(picture)
                         } else {
                             library.read_companion_attachment(name)
                         }
-                        .map_err(|e| e.to_string())?;
-                        let object = picture.as_object_mut().ok_or("AI 图片记录无效。")?;
-                        for key in ["attachment", "digest", "length", "width", "height"] {
-                            object.remove(key);
-                        }
-                        picture["data"] = json!(Base64::encode_string(&data));
-                    }
+                        .map_err(|e| e.to_string())
+                    })?;
                 }
+                cursor = page.next_cursor.unwrap_or(prefix.message_count);
             }
         }
-        if images > 256 || text > 256 * 1024 || serde_json::to_vec(&messages).map_err(|_| "AI 历史无效。")?.len() > 32 * 1024 * 1024 {
-            return Err("AI 完整历史超过服务限制，未删减历史。".into());
+        for message in &tail {
+            projection.push(message, |picture| {
+                let name = picture.get("attachment").and_then(Value::as_str).ok_or("AI 预览附件无效。")?;
+                let library = app.session.library.as_mut().ok_or("AI 预览附件的图库已关闭。")?;
+                if name.starts_with("companion/v2/") { library.read_companion_preview(picture) } else { library.read_companion_attachment(name) }
+                    .map_err(|e| e.to_string())
+            })?;
         }
-        Ok(messages)
+        projection.finish()
     }
     pub(super) fn read_page(
         &mut self,
