@@ -1,5 +1,7 @@
 //! Pure, photo-bound candidate transformations used by the companion bridge.
 pub(crate) mod archive;
+mod editor;
+pub use editor::EditorState;
 mod identity;
 mod mutation_guard;
 pub mod storage;

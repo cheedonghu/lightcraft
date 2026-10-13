@@ -36,6 +36,7 @@ impl State {
         Ok(())
     }
     pub(super) fn save(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
+        self.stage_editors(app)?;
         let Some(conversation) = self.conversations.get_mut(&photo) else {
             self.pending_local_saves.remove(&photo);
             return Ok(());

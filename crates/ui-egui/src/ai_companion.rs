@@ -9,6 +9,7 @@ mod cancellation_tests;
 #[cfg(test)]
 #[path = "ai_companion/disconnect_tests.rs"]
 mod disconnect_tests;
+mod drafts;
 #[cfg(test)]
 #[path = "ai_companion/identity_tests.rs"]
 mod identity_tests;
@@ -41,6 +42,9 @@ pub struct State {
     open: bool,
     consent: bool,
     prompt: String,
+    editor_photo: Option<PhotoId>,
+    editors: BTreeMap<PhotoId, drafts::Editor>,
+    dirty_editors: BTreeSet<PhotoId>,
     pub text: String,
     generation: u64,
     serial: u64,
@@ -65,6 +69,9 @@ impl Default for State {
             open: false,
             consent: false,
             prompt: String::new(),
+            editor_photo: None,
+            editors: BTreeMap::new(),
+            dirty_editors: BTreeSet::new(),
             text: String::new(),
             generation: 0,
             serial: 0,
@@ -124,6 +131,7 @@ struct Job {
     round: String,
     state: String,
     prompt: String,
+    draft_revision: u64,
     user_message: usize,
     history: Vec<Value>,
     checkpoint: Checkpoint,
@@ -259,11 +267,19 @@ impl State {
     fn start(&mut self, app: &mut LightcraftApp) -> Result<Value, String> {
         self.start_for(app, None)
     }
+    #[cfg(test)]
     fn start_for(&mut self, app: &mut LightcraftApp, explicit: Option<PhotoId>) -> Result<Value, String> {
+        self.start_with_prompt(app, explicit, None)
+    }
+    fn start_with_prompt(&mut self, app: &mut LightcraftApp, explicit: Option<PhotoId>, supplied_prompt: Option<&str>) -> Result<Value, String> {
         if self.connection.as_ref().is_none_or(|c| !c.alive.load(Ordering::Relaxed)) {
             self.retire_disconnected_jobs(app)?;
         }
         let photo = self.admission(app, explicit)?;
+        self.sync_editor(app)?;
+        if let Some(prompt) = supplied_prompt {
+            self.prompt = prompt.into();
+        }
         app.session.end_interaction().map_err(|e| e.to_string())?;
         let original = app.session.develop_of(photo).ok_or("照片不存在。")?;
         let content = app.session.catalog.photo(photo).map(|p| lightcraft_engine::media::content_key(p)).ok_or("照片不存在。")?;
@@ -304,6 +320,7 @@ impl State {
                 round: String::new(),
                 state: "submitting".into(),
                 prompt: prompt.clone(),
+                draft_revision: 0,
                 user_message: self.conversations.get(&photo).map(|c| c.messages.len()).unwrap_or(0),
                 history,
                 checkpoint: Checkpoint { photo, generation, original: original.clone(), expected: original, revision, content, eligible: true },
@@ -314,6 +331,10 @@ impl State {
                 inflight_plan: None,
             },
         );
+        let draft_revision = self.clear_submitted_draft(app, photo)?;
+        if let Some(job) = self.jobs.get_mut(&photo) {
+            job.draft_revision = draft_revision;
+        }
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
         conversation.records.push(json!({"local_round_id":identity.local_round_id,"photo_id":photo.0,"request_text":prompt,"submission_seq":identity.submission_seq,"connection_generation":identity.connection_generation,"runtime_library_generation":identity.scope.library_generation,"original":self.jobs.get(&photo).map(|j| &j.checkpoint.original),"stages":[],"phase":"submitting"}));
         conversation.messages.push(json!({"role":"user","text":prompt,"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request"}));
@@ -393,6 +414,7 @@ impl State {
         if self.jobs.contains_key(&photo) {
             self.request_feedback();
         }
+        let recovery = self.jobs.get(&photo).map(|job| (job.identity.scope, job.draft_revision, job.prompt.clone()));
         let round = if let Some(job) = self.jobs.get_mut(&photo) {
             job.stopped = true;
             job.cancel.store(true, Ordering::Relaxed);
@@ -400,6 +422,9 @@ impl State {
         } else {
             return Ok(Value::Null);
         };
+        if let Some((scope, revision, prompt)) = recovery {
+            self.restore_text(photo, scope, revision, &prompt);
+        }
         if !round.is_empty() {
             if self.send(format!("/v1/rounds/{round}/stop"), json!({"reason":"user_stop"}), 0, round).is_err() {
                 self.close_connection();
@@ -418,9 +443,11 @@ impl State {
         Ok(Value::Null)
     }
     fn finish(&mut self, photo: PhotoId, notice: &str) {
-        if let Some(job) = self.jobs.remove(&photo)
-            && let Some(conversation) = self.conversations.get_mut(&photo)
-        {
+        let Some(job) = self.jobs.remove(&photo) else { return };
+        let completed = self.conversations.get(&photo).is_some_and(|c| {
+            c.records.iter().any(|r| r["local_round_id"] == job.identity.local_round_id.as_str() && r["local_terminal"] == "completed")
+        });
+        if let Some(conversation) = self.conversations.get_mut(&photo) {
             if !job.plans.is_empty() {
                 conversation.checkpoint = Some(job.checkpoint.clone());
             }
@@ -454,6 +481,9 @@ impl State {
             conversation.pending.clear();
             close_pending_tools(&mut conversation.messages);
             conversation.notice = notice.into();
+        }
+        if !completed {
+            self.restore_request(photo, &job);
         }
     }
     fn server(&mut self, app: &mut LightcraftApp, ctx: &egui::Context, kind: &str, data: &Value) -> Result<(), String> {
@@ -883,6 +913,10 @@ impl State {
             }
             self.connection = None;
             self.conversations.clear();
+            self.editors.clear();
+            self.dirty_editors.clear();
+            self.editor_photo = None;
+            self.prompt.clear();
             self.pending_local_saves.clear();
             self.local_save_retry_at = None;
             self.local_save_after_frame = None;
@@ -897,6 +931,9 @@ impl State {
         if self.feedback_needs_paint(ctx) {
             ctx.request_repaint();
             return;
+        }
+        if let Err(error) = self.sync_editor(app).and_then(|()| self.stage_editors(app)) {
+            self.text = error;
         }
         self.workers.retain(|_, alive| alive.load(Ordering::Relaxed));
         if self.open
@@ -1210,6 +1247,7 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
 pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
     let mut state = std::mem::take(&mut app.ai);
     let result = (|| {
+        state.stage_editors(app)?;
         state.flush_local_saves(app)?;
         let photos: Vec<_> = state.jobs.keys().copied().collect();
         for photo in photos {
@@ -1218,7 +1256,9 @@ pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
             state.finish(photo, "图库已关闭，保留最近一次完整结果。");
             state.save(app, photo)?;
         }
+        state.stage_editors(app)?;
         state.flush_local_saves(app)?;
+        app.session.persist().map_err(|e| e.to_string())?;
         state.connection = None;
         Ok(())
     })();
@@ -1239,6 +1279,10 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         }
         state.connection = None;
         state.conversations.clear();
+        state.editors.clear();
+        state.dirty_editors.clear();
+        state.editor_photo = None;
+        state.prompt.clear();
         state.pending_local_saves.clear();
         state.local_save_retry_at = None;
         state.local_save_after_frame = None;
@@ -1257,14 +1301,15 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             })
         }
         "ai.start" => {
-            if let Some(prompt) = params.get("prompt").and_then(Value::as_str) {
-                state.prompt = prompt.into();
+            if let Err(error) = state.sync_editor(app) {
+                app.ai = state;
+                return Some(Err(error));
             }
             let explicit = params
                 .get("photo")
                 .map(|v| v.as_u64().map(PhotoId).ok_or_else(|| tr("The requested photo must match the single selected photo.").to_owned()))
                 .transpose();
-            explicit.and_then(|p| state.start_for(app, p))
+            explicit.and_then(|p| state.start_with_prompt(app, p, params.get("prompt").and_then(Value::as_str)))
         }
         "ai.stop" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
             state.pending_local_saves.insert(p);
@@ -1383,6 +1428,11 @@ fn display_text(conversation: &Conversation) -> String {
 /// Shared Tools body; the host supplies its viewport, so only messages scroll.
 pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     app.ai.open = true;
+    let mut state = std::mem::take(&mut app.ai);
+    if let Err(error) = state.sync_editor(app) {
+        state.text = error;
+    }
+    app.ai = state;
     egui::Frame::NONE.inner_margin(egui::Margin::same(12)).show(ui, |ui| {
         ui.horizontal(|ui| {
             let heading = ui.heading(tr("AI Assistant"));
@@ -1426,7 +1476,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             // Supported short/floating/stacked Tools panes scroll their compact body.
             // Stop and consent precede the draft; full-size panes retain a fixed footer.
             egui::ScrollArea::vertical()
-                .id_salt(("ai-compact-composer", photo.0, app.ai.jobs.contains_key(&photo)))
+                .id_salt(("ai-compact-composer", app.session.library_generation(), photo.0, app.ai.jobs.contains_key(&photo)))
                 .auto_shrink([false, false])
                 .min_scrolled_height(0.0)
                 .max_height(height)
@@ -1447,21 +1497,29 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         ui.advance_cursor_after_rect(body);
     });
 }
-fn message_area(app: &LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
-    let scroll = egui::ScrollArea::vertical()
-        .id_salt(("ai-messages", photo.0))
+fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
+    let editor = app.ai.editors.get_mut(&photo);
+    let tail = editor.as_ref().is_none_or(|e| e.data.follow_tail);
+    let restore = editor.and_then(|e| std::mem::replace(&mut e.restore_scroll, false).then_some(e.data.scroll_offset));
+    let mut area = egui::ScrollArea::vertical()
+        .id_salt(("ai-messages", app.session.library_generation(), photo.0))
         .auto_shrink([false, false])
-        .stick_to_bottom(true)
+        .stick_to_bottom(tail)
         .max_height(height)
-        .min_scrolled_height(0.0)
-        .show(ui, |ui| {
-            if let Some(conversation) = app.ai.conversations.get(&photo) {
-                ui.label(display_text(conversation));
-            } else if !app.ai.text.is_empty() {
-                ui.label(&app.ai.text);
-            }
-        });
+        .min_scrolled_height(0.0);
+    if let Some(offset) = restore {
+        area = area.vertical_scroll_offset(offset);
+    }
+    let scroll = area.show(ui, |ui| {
+        if let Some(conversation) = app.ai.conversations.get(&photo) {
+            ui.label(display_text(conversation));
+        } else if !app.ai.text.is_empty() {
+            ui.label(&app.ai.text);
+        }
+    });
     composer_widget(ui, "ai:messages", scroll.inner_rect);
+    let at_bottom = scroll.state.offset.y + scroll.inner_rect.height() >= scroll.content_size.y - 2.0;
+    drafts::scroll_position(app, photo, scroll.state.offset.y, at_bottom);
 }
 
 fn phase_text(phase: &str) -> &'static str {
@@ -1523,19 +1581,25 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
     // The draft viewport is fixed, so measuring needs no copy of user text.
     let mut measured_prompt = String::new();
     let prompt = if sizing { &mut measured_prompt } else { &mut app.ai.prompt };
-    let input = egui::ScrollArea::vertical().id_salt("ai-prompt-scroll").min_scrolled_height(48.0).max_height(48.0).auto_shrink([false, false]).show(
-        ui,
-        |ui| {
+    let input = egui::ScrollArea::vertical()
+        .id_salt(("ai-prompt-scroll", app.session.library_generation(), photo.0))
+        .min_scrolled_height(48.0)
+        .max_height(48.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
             ui.add_enabled(
                 !busy,
                 egui::TextEdit::multiline(prompt)
+                    .id_salt(("ai-draft", app.session.library_generation(), photo.0))
                     .desired_width(f32::INFINITY)
                     .desired_rows(2)
                     .hint_text(tr("For example: review this photo, then naturally optimize it")),
             )
-        },
-    );
+        });
     composer_widget(ui, "field:aiPrompt", input.inner_rect);
+    if !sizing && input.inner.changed() {
+        drafts::capture(app);
+    }
     if !compact {
         consent_control(app, ui, photo);
     }

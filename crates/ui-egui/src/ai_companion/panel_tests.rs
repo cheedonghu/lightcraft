@@ -419,3 +419,264 @@ fn short_snapshot(h: &mut Headless, name: &str) {
         assert_eq!(h.request("ui.screenshot", json!({"path":format!("{dir}/{name}.png"),"headless":true}), Duration::from_secs(20))["ok"], true);
     }
 }
+
+#[test]
+fn drafts_follow_the_actual_selected_photo_and_survive_tool_switches() {
+    let mut h = headless([1000.0, 680.0]);
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(&mut h);
+    let a = h.app.session.active().unwrap().0;
+    let b = h.app.session.catalog.photos().find(|p| p.id.0 != a).unwrap().id.0;
+    let ids = [a, b];
+    let timeout = Duration::from_secs(10);
+    h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+    h.request("ui.text", json!({"text":"A unsent draft"}), timeout);
+    assert!(h.painted_text().iter().any(|text| text == "A unsent draft"));
+    h.app.run("library.select", json!({"ids":[ids[1]],"active":ids[1]})).unwrap();
+    frames(&mut h);
+    assert!(!h.painted_text().iter().any(|text| text == "A unsent draft"), "B must not display A's unsent draft");
+    h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+    h.request("ui.text", json!({"text":"B draft 草稿"}), timeout);
+    h.app.run("library.select", json!({"ids":[ids[0]],"active":ids[0]})).unwrap();
+    frames(&mut h);
+    assert!(h.painted_text().iter().any(|text| text == "A unsent draft"));
+    h.app.run("panel.edit", json!({})).unwrap();
+    frames(&mut h);
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(&mut h);
+    assert!(h.painted_text().iter().any(|text| text == "A unsent draft"));
+    for id in ids {
+        assert!(h.app.session.load_companion_conversation(PhotoId(id)).unwrap().is_none(), "unsent drafts are never messages");
+    }
+}
+
+#[test]
+fn real_reading_offset_is_photo_scoped_and_user_scroll_stops_tail_following() {
+    let mut session = Session::new();
+    session
+        .open_library_in(
+            lightcraft_engine::library::LibraryStores {
+                catalog: Box::new(lightcraft_catalog::MemStore::new()),
+                files: Box::new(lightcraft_catalog::MemStore::new()),
+                dir: "memory".into(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let a = session.active().unwrap();
+    let b = session.catalog.photos().find(|p| p.id != a).unwrap().id;
+    let messages: Vec<_> = (0..100)
+        .map(
+            |i| json!({"role":"assistant","text":format!("Paragraph {i}: real reading position must stay put when the assistant appends new text.")}),
+        )
+        .collect();
+    session.save_companion_conversation(a, json!({"schema_version":2,"messages":messages,"rounds":[]})).unwrap();
+    let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1000.0, 680.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(&mut h);
+    let timeout = Duration::from_secs(10);
+    let (connection, requests, events) = network::test_connection();
+    h.app.ai.next_connection = Some(connection);
+    h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
+    h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout);
+    let creation = requests.try_recv().unwrap();
+    events.try_send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"reading-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":a.0,"library_generation":creation.identity.scope.library_generation},"state":"queued"}}) }).unwrap();
+    frames(&mut h);
+    let messages = rect(&h, "ai:messages");
+    h.request("ui.move", json!({"x":messages.center().x,"y":messages.center().y}), timeout);
+    h.request("ui.scroll", json!({"dy":180.0}), timeout);
+    for _ in 0..20 {
+        h.step();
+    }
+    let before = h.app.session.companion_editor(a).unwrap().scroll_offset;
+    assert!(before > 0.0);
+    assert!(!h.app.session.companion_editor(a).unwrap().follow_tail);
+    events
+        .try_send(network::Event::Server {
+            kind: "text.delta".into(),
+            data: json!({"round_id":"reading-round","payload":{"message_id":"read-message","delta":"new tail text"}}),
+        })
+        .unwrap();
+    frames(&mut h);
+    assert!((h.app.session.companion_editor(a).unwrap().scroll_offset - before).abs() < 2.0);
+    h.app.run("panel.edit", json!({})).unwrap();
+    frames(&mut h);
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(&mut h);
+    assert!((h.app.session.companion_editor(a).unwrap().scroll_offset - before).abs() < 2.0);
+    h.app.run("library.select", json!({"ids":[b.0],"active":b.0})).unwrap();
+    frames(&mut h);
+    assert_eq!(h.app.session.companion_editor(b).unwrap().scroll_offset, 0.0);
+    h.app.run("library.select", json!({"ids":[a.0],"active":a.0})).unwrap();
+    frames(&mut h);
+    assert!((h.app.session.companion_editor(a).unwrap().scroll_offset - before).abs() < 2.0);
+}
+
+#[test]
+fn actual_drafts_without_jobs_save_and_reopen_in_both_languages() {
+    for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        let catalog = lightcraft_catalog::MemStore::new();
+        let files = lightcraft_catalog::MemStore::new();
+        let mut session = Session::new();
+        session
+            .open_library_in(
+                lightcraft_engine::library::LibraryStores {
+                    catalog: Box::new(catalog.clone()),
+                    files: Box::new(files.clone()),
+                    dir: "memory".into(),
+                    on_disk: false,
+                },
+                true,
+            )
+            .unwrap();
+        let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1000.0, 680.0], 1.0);
+        h.app.ui.language = locale;
+        h.app.run("ai.open", json!({})).unwrap();
+        frames(&mut h);
+        let a = h.app.session.active().unwrap();
+        let b = h.app.session.catalog.photos().find(|p| p.id != a).unwrap().id;
+        let timeout = Duration::from_secs(10);
+        h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+        h.request("ui.text", json!({"text":"A unsent draft 草稿"}), timeout);
+        h.app.run("library.select", json!({"ids":[b.0],"active":b.0})).unwrap();
+        frames(&mut h);
+        h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+        h.request("ui.text", json!({"text":"B 草稿 unsent"}), timeout);
+        h.app.run("panel.edit", json!({})).unwrap();
+        frames(&mut h);
+        h.app.session.persist().unwrap();
+        assert_eq!(h.app.run("ai.status", json!({})).unwrap()["busy"], false);
+        for id in [a, b] {
+            assert!(h.app.session.load_companion_conversation(id).unwrap().is_none());
+        }
+        let mut reopened = Session::new();
+        reopened
+            .open_library_in(
+                lightcraft_engine::library::LibraryStores {
+                    catalog: Box::new(catalog),
+                    files: Box::new(files),
+                    dir: "memory".into(),
+                    on_disk: false,
+                },
+                true,
+            )
+            .unwrap();
+        let mut h = Headless::new(LightcraftApp::new(reopened, Services::default()), [1000.0, 680.0], 1.0);
+        h.app.ui.language = locale;
+        h.app.run("library.select", json!({"ids":[a.0],"active":a.0})).unwrap();
+        h.app.run("ai.open", json!({})).unwrap();
+        frames(&mut h);
+        assert!(h.painted_text().iter().any(|text| text == "A unsent draft 草稿"));
+        h.app.run("library.select", json!({"ids":[b.0],"active":b.0})).unwrap();
+        frames(&mut h);
+        assert!(h.painted_text().iter().any(|text| text == "B 草稿 unsent"));
+        if let Ok(dir) = std::env::var("UX12_SCREENSHOT_DIR") {
+            h.app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+            h.app.services.png = Some(Box::new(|image| {
+                lightcraft_engine::export::encode_image(
+                    image,
+                    &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+                )
+                .unwrap()
+            }));
+            let path = std::path::Path::new(&dir).join(if locale == crate::i18n::Locale::En {
+                "drafts-reopened-en.png"
+            } else {
+                "drafts-reopened-zh-hans.png"
+            });
+            assert_eq!(h.request("ui.screenshot", json!({"path":path,"headless":true}), Duration::from_secs(20))["ok"], true);
+        }
+    }
+}
+
+#[test]
+fn rejected_other_photo_submission_does_not_replace_the_visible_authored_draft() {
+    let mut h = headless([1000.0, 680.0]);
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(&mut h);
+    let a = h.app.session.active().unwrap();
+    let b = h.app.session.catalog.photos().find(|p| p.id != a).unwrap().id;
+    let timeout = Duration::from_secs(10);
+    h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+    h.request("ui.text", json!({"text":"A authored draft"}), timeout);
+    h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
+    assert!(h.app.run("ai.start", json!({"photo":b.0,"prompt":"wrong B request"})).is_err());
+    frames(&mut h);
+    assert_eq!(h.app.session.companion_editor(a).unwrap().draft, "A authored draft");
+    assert!(h.painted_text().iter().any(|text| text == "A authored draft"));
+}
+
+#[test]
+fn native_library_switch_saves_jobless_drafts_and_equal_photo_ids_never_share_them() {
+    let dir = std::env::temp_dir().join(format!("lc-ux12-native-{}-{}", std::process::id(), LocalRoundId::new().unwrap().as_str()));
+    let old = dir.join("A");
+    let next = dir.join("B");
+    let mut other = Session::new().with_fs();
+    other.open_library(&next, true).unwrap();
+    other.close_library().unwrap();
+    drop(other);
+    let mut session = Session::new().with_fs();
+    session.open_library(&old, true).unwrap();
+    let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1000.0, 680.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(&mut h);
+    let a = h.app.session.active().unwrap();
+    let timeout = Duration::from_secs(10);
+    h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+    h.request("ui.text", json!({"text":"library A unsent draft"}), timeout);
+    h.app.run("app.openLibrary", json!({"path":next.to_string_lossy()})).unwrap();
+    frames(&mut h);
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(&mut h);
+    let b = h.app.session.active().unwrap();
+    assert_eq!(a, b);
+    assert_eq!(h.app.session.companion_editor(b).unwrap().draft, "");
+    h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+    h.request("ui.text", json!({"text":"library B independent draft"}), timeout);
+    h.app.run("app.openLibrary", json!({"path":old.to_string_lossy()})).unwrap();
+    frames(&mut h);
+    assert_eq!(h.app.session.companion_editor(a).unwrap().draft, "library A unsent draft");
+    assert!(h.painted_text().iter().any(|text| text == "library A unsent draft"));
+    h.app.run("app.openLibrary", json!({"path":next.to_string_lossy()})).unwrap();
+    frames(&mut h);
+    assert_eq!(h.app.session.companion_editor(b).unwrap().draft, "library B independent draft");
+    assert!(h.painted_text().iter().any(|text| text == "library B independent draft"));
+    h.app.session.close_library().unwrap();
+    drop(h);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn protected_outer_archive_keeps_visible_authored_drafts_and_reports_them_unsaved() {
+    let files = lightcraft_catalog::MemStore::new();
+    files.set("companion/state.json", b"protected unknown root".to_vec());
+    let mut session = Session::new();
+    session
+        .open_library_in(
+            lightcraft_engine::library::LibraryStores {
+                catalog: Box::new(lightcraft_catalog::MemStore::new()),
+                files: Box::new(files),
+                dir: "memory".into(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1000.0, 680.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(&mut h);
+    let a = h.app.session.active().unwrap();
+    let b = h.app.session.catalog.photos().find(|p| p.id != a).unwrap().id;
+    let timeout = Duration::from_secs(10);
+    h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+    h.request("ui.text", json!({"text":"visible draft must survive"}), timeout);
+    assert!(h.app.session.persist().is_err(), "the authored draft must remain dirty under protection");
+    assert!(h.app.session.unsaved().is_some());
+    h.app.run("library.select", json!({"ids":[b.0],"active":b.0})).unwrap();
+    frames(&mut h);
+    h.app.run("library.select", json!({"ids":[a.0],"active":a.0})).unwrap();
+    frames(&mut h);
+    assert!(h.painted_text().iter().any(|text| text == "visible draft must survive"));
+    assert_eq!(h.app.session.companion_editor(a).unwrap().draft, "visible draft must survive");
+}

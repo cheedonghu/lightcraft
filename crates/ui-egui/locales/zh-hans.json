@@ -2064,5 +2064,7 @@
   "Applying the correction…": "正在应用修正…",
   "Stopping generation…": "正在停止生成…",
   "Generation stopped; confirming submission cancellation…": "已停止生成，正在确认取消提交…",
-  "Generation stopped; keeping the latest complete result.": "已停止生成，保留最近一次完整结果。"
+  "Generation stopped; keeping the latest complete result.": "已停止生成，保留最近一次完整结果。",
+  "The AI draft is unavailable.": "AI 草稿不可用。",
+  "The AI draft belongs to a closed library.": "AI 草稿属于已关闭的图库。"
 }
