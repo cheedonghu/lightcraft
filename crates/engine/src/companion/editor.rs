@@ -205,7 +205,7 @@ mod tests {
     use std::io;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     fn open(files: impl Store + 'static, catalog: MemStore) -> Session {
         let mut session = Session::new();
@@ -241,6 +241,7 @@ mod tests {
         files: MemStore,
         fail: Arc<AtomicBool>,
         photo: PhotoId,
+        failures: Arc<AtomicUsize>,
     }
     impl Store for Failing {
         fn read(&mut self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -254,6 +255,7 @@ mod tests {
         }
         fn write_atomic(&mut self, key: &str, bytes: &[u8]) -> io::Result<()> {
             if key == name(self.photo) && self.fail.load(Ordering::Relaxed) {
+                self.failures.fetch_add(1, Ordering::Relaxed);
                 return Err(io::Error::other("injected editor failure"));
             }
             self.files.write_atomic(key, bytes)
@@ -281,7 +283,8 @@ mod tests {
         s.persist().unwrap();
         drop(s);
         let fail = Arc::new(AtomicBool::new(true));
-        let mut s = open(Failing { files: files.clone(), fail: fail.clone(), photo: ids[0] }, catalog.clone());
+        let mut s =
+            open(Failing { files: files.clone(), fail: fail.clone(), photo: ids[0], failures: Arc::new(AtomicUsize::new(0)) }, catalog.clone());
         s.set_companion_editor(ids[0], EditorState { draft: "new A".into(), ..Default::default() }).unwrap();
         s.set_companion_editor(ids[1], EditorState { draft: "new B".into(), ..Default::default() }).unwrap();
         assert!(s.persist().is_err());
@@ -295,6 +298,32 @@ mod tests {
         assert!(s.unsaved().is_none());
         let mut reopened = open(files, catalog);
         assert_eq!(reopened.companion_editor(ids[0]).unwrap().draft, "new A");
+    }
+    #[test]
+    fn failed_jobless_draft_backs_off_automatic_frames_but_explicit_save_retries_immediately() {
+        let files = MemStore::new();
+        let catalog = MemStore::new();
+        let s = open(files.clone(), catalog.clone());
+        let photo = s.active().unwrap();
+        drop(s);
+        let fail = Arc::new(AtomicBool::new(true));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let mut s = open(Failing { files: files.clone(), fail: fail.clone(), photo, failures: failures.clone() }, catalog.clone());
+        s.set_companion_editor(photo, EditorState { draft: "authored draft, zero jobs".into(), ..Default::default() }).unwrap();
+        assert!(s.persist().is_err());
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+        for _ in 0..10 {
+            s.persist_if_dirty();
+        }
+        assert_eq!(failures.load(Ordering::Relaxed), 1, "automatic frames must respect the existing save-error backoff");
+        assert_eq!(s.companion_dirty_editors(), vec![photo]);
+        assert!(s.unsaved().is_some());
+        fail.store(false, Ordering::Relaxed);
+        s.persist().unwrap();
+        assert!(s.companion_dirty_editors().is_empty());
+        assert!(s.unsaved().is_none());
+        let mut reopened = open(files, catalog);
+        assert_eq!(reopened.companion_editor(photo).unwrap().draft, "authored draft, zero jobs");
     }
     #[test]
     fn legacy_and_unknown_roots_are_never_overwritten_by_draft_saves() {

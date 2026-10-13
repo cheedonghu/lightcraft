@@ -230,11 +230,11 @@ impl Session {
                     self.companion_archive.legacy,
                     self.companion_archive.blocked.as_deref(),
                 );
-                if editors.is_err() {
-                    self.companion_archive.retry_at = Some(web_time::Instant::now() + std::time::Duration::from_secs(2));
-                }
                 let conversation = self.companion_archive.persist(lib);
-                editors.and(conversation)
+                let result = editors.and(conversation);
+                // A successful conversation flush cannot cancel a failed draft's backoff.
+                self.companion_archive.retry_at = result.as_ref().err().map(|_| web_time::Instant::now() + std::time::Duration::from_secs(2));
+                result
             }
             None => Ok(()),
         }
