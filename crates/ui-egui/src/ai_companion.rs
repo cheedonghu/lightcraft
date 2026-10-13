@@ -564,7 +564,9 @@ impl State {
         if let Some(plan) = plan {
             let rendered = snapshot.result.rendered.as_ref().map_err(Clone::clone)?;
             let op = app.session.develop_op(photo, (*settings).clone(), "AI edit plan").ok_or("照片不存在。")?;
-            app.session.commit_companion(&job.lease, &identity.local_round_id, job.checkpoint.revision, op).map_err(|e| e.to_string())?;
+            app.session
+                .commit_companion(&job.lease, &identity.local_round_id, job.checkpoint.revision, op)
+                .map_err(|e| tr(&e.to_string()).to_owned())?;
             app.session.accept(&snapshot.result);
             app.renderer.publish_companion(ctx, photo, snapshot.result.key, rendered, app.session.active() == Some(photo));
             let new_revision = app.session.photo_revision(photo);

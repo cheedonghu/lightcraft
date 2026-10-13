@@ -2043,5 +2043,8 @@
   "The requested photo must match the single selected photo.": "请求照片必须与当前单选照片一致。",
   "This photo is unavailable for AI processing.": "此照片不可用于 AI 处理。",
   "Manual editing is paused while AI processes this photo; stop it or wait for completion.": "AI 处理期间暂停手动编辑，停止或完成后恢复。",
-  "Checking photo availability. Please try again.": "正在检查照片是否可用，请稍后重试。"
+  "Checking photo availability. Please try again.": "正在检查照片是否可用，请稍后重试。",
+  "AI task ownership has ended.": "AI 任务保护已结束。",
+  "AI result is stale; the photo was not changed.": "AI 结果已过期，照片尚未改变。",
+  "AI publication may only update its task photo.": "AI 发布只能更新本轮任务照片。"
 }
