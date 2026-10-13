@@ -275,6 +275,7 @@ impl Fields {
                                     "local_round_id"
                                         | "photo_id"
                                         | "local_terminal"
+                                        | "trace_id"
                                         | "before_preview_message_id"
                                         | "recent_complete_hash"
                                         | "recent_complete_result"
@@ -292,6 +293,12 @@ impl Fields {
                             if self.in_stage {
                                 self.stage.insert("parameter_details_unavailable".into(), Value::Bool(true));
                             }
+                        }
+                        // Diagnostics are optional and small. Continue validating the complete
+                        // record/digest while ignoring an oversized diagnostic value.
+                        if !self.in_stage && self.name == "trace_id" && self.value.bytes.len() >= 4096 {
+                            self.capture = false;
+                            self.value.bytes.clear();
                         }
                         match self.value.byte(b, self.capture, 1024 * 1024 - self.retained)? {
                             1 => self.save()?,

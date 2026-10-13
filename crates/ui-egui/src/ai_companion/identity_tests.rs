@@ -247,7 +247,7 @@ fn manual_start_before_closed_poll_retires_admitted_and_unadmitted_jobs() {
             }
             if !retry_same_photo {
                 assert!(!app.ai.jobs.contains_key(&photo_a));
-                assert!(app.run("ai.status", json!({"photo":photo_a.0})).unwrap()["text"].as_str().unwrap().contains("断开"));
+                assert!(app.run("ai.status", json!({"photo":photo_a.0})).unwrap()["text"].as_str().unwrap().contains("connection was interrupted"));
             }
             poll(&mut app, &egui::Context::default());
             assert!(app.ai.is_busy(target), "old Closed must not terminate the manually submitted new round");

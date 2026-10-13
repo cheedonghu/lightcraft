@@ -136,20 +136,31 @@ fn public_ai_result_stays_visible_and_unsaved_recovery_only_writes_storage() {
         while requests.try_recv().is_ok() {}
         let revision = h.app.session.photo_revision(photo);
         failed.store(false, Ordering::Relaxed);
-        let recovery_deadline = Instant::now() + Duration::from_secs(6);
-        while h.app.session.unsaved().is_some() {
-            h.step();
-            assert!(Instant::now() < recovery_deadline, "ordinary client frames must retry repaired storage");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        h.step();
-        let saved_status = h.app.run("ai.status", json!({})).unwrap();
-        assert_eq!(saved_status["saveState"], "saved");
         let saved_notice = if language == crate::i18n::Locale::En {
             "AI history saved. Photo changes are kept."
         } else {
             "AI 对话记录已保存，照片修改已保留。"
         };
+        let recovery_deadline = Instant::now() + Duration::from_secs(6);
+        let mut saved_frames = 0;
+        let saved_status = loop {
+            h.step();
+            let status = h.app.run("ai.status", json!({})).unwrap();
+            if h.app.session.unsaved().is_none() && status["saveState"] == "saved" && status["text"].as_str().unwrap().contains(saved_notice) {
+                saved_frames += 1;
+                if saved_frames == 2 {
+                    break status;
+                }
+            } else {
+                saved_frames = 0;
+            }
+            assert!(
+                Instant::now() < recovery_deadline,
+                "ordinary client frames must confirm repaired storage, the UI-owned AI save receipt and saved notice"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(saved_status["saveState"], "saved");
         assert!(
             saved_status["text"].as_str().unwrap().contains(saved_notice),
             "recovered history must not keep claiming it is unsaved: {saved_status}"

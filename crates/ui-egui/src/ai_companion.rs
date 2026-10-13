@@ -14,6 +14,10 @@ mod card_tests;
 #[path = "ai_companion/disconnect_tests.rs"]
 mod disconnect_tests;
 mod drafts;
+mod errors;
+mod health;
+#[cfg(test)]
+mod health_task_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]
@@ -39,6 +43,7 @@ mod recovery_tests;
 #[cfg(test)]
 #[path = "ai_companion/revert_tests.rs"]
 mod revert_tests;
+mod task_entry;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +62,11 @@ use crate::LightcraftApp;
 
 pub struct State {
     open: bool,
+    health: health::Health,
+    telemetry: network::Telemetry,
+    task: Option<task_entry::Task>,
+    readonly_task: Option<PhotoScope>,
+    readonly_selection: Option<lightcraft_engine::Selection>,
     consent: bool,
     prompt: String,
     editor_photo: Option<PhotoId>,
@@ -88,6 +98,11 @@ impl Default for State {
         let (tx, rx) = mpsc::sync_channel(8);
         Self {
             open: false,
+            health: health::Health::default(),
+            telemetry: network::Telemetry::default(),
+            task: None,
+            readonly_task: None,
+            readonly_selection: None,
             consent: false,
             prompt: String::new(),
             editor_photo: None,
@@ -125,6 +140,7 @@ struct HistoryView {
     fragments: Vec<String>,
     bytes: usize,
     cards: Vec<card::Card>,
+    diagnostic: Option<String>,
     cards_bytes: usize,
     card_cursor: Option<u64>,
     card_pending: BTreeSet<String>,
@@ -215,6 +231,23 @@ impl Drop for WorkerAlive {
 }
 
 impl State {
+    fn leave_task_view(&mut self) {
+        if self.readonly_task.take().is_some() {
+            self.paging.cancel();
+        }
+        self.readonly_selection = None;
+    }
+    fn sync_task_selection(&mut self, app: &LightcraftApp) {
+        if self.readonly_task.is_some() && self.readonly_selection.as_ref().is_some_and(|selection| selection != &app.session.selection) {
+            self.leave_task_view();
+        }
+    }
+    fn displayed_photo(&self, app: &LightcraftApp) -> Option<PhotoId> {
+        self.readonly_task
+            .filter(|scope| scope.library_generation == app.session.library_generation())
+            .map(|scope| scope.photo)
+            .or_else(|| app.session.active())
+    }
     pub fn is_busy(&self, photo: PhotoId) -> bool {
         self.jobs.get(&photo).is_some_and(|j| !j.stopped)
     }
@@ -250,12 +283,12 @@ impl State {
             .try_send(network::Request { path, body, submission, round, identity, cancel })
             .map_err(|_| "AI 请求交付积压，请稍候；未自动重试。".into())
     }
-    fn connect(&mut self) -> Result<network::Connection, String> {
+    fn connect(&mut self, app: &LightcraftApp) -> Result<network::Connection, String> {
         #[cfg(test)]
         if let Some(connection) = self.next_connection.take() {
             return Ok(connection);
         }
-        network::connect(&std::env::var("PHOTO_COMPANION_ADDR").unwrap_or_else(|_| "127.0.0.1:18080".into()))
+        network::connect(&network::service_address(app.services.companion_address.as_deref()))
     }
     fn retire_disconnected_jobs(&mut self, app: &mut LightcraftApp) -> Result<(), String> {
         let photos: Vec<_> = self
@@ -267,7 +300,7 @@ impl State {
         // retaining its ownership list; no old route can outlive replacement.
         self.connection = None;
         for photo in &photos {
-            self.finish(*photo, "AI 事件连接已断开，保留最近完整结果。");
+            self.disconnected(*photo, "AI 事件连接已断开。");
         }
         // Cancel every old job even if one conversation cannot be saved. Never
         // establish a replacement connection when any of this saving fails.
@@ -283,6 +316,9 @@ impl State {
         }
     }
     pub(crate) fn admission(&self, app: &LightcraftApp, explicit: Option<PhotoId>) -> Result<PhotoId, String> {
+        if self.readonly_task.is_some() {
+            return Err(tr("Return to the selected photo before starting a new AI task.").into());
+        }
         if self.pending_confirmations.len() >= 96 {
             return Err(tr("AI history is waiting to be saved. Retry after saving completes.").into());
         }
@@ -346,8 +382,10 @@ impl State {
         }
         if self.connection.is_none() {
             self.connection_generation = self.connection_generation.checked_add(1).ok_or("AI 连接编号耗尽，请重新启动客户端。")?;
-            self.connection = Some(self.connect()?);
+            self.connection = Some(self.connect(app)?);
+            self.telemetry = network::Telemetry::default();
         }
+        self.telemetry.new_round();
         self.serial = self.serial.checked_add(1).ok_or("AI 提交编号耗尽，请重新启动客户端。")?;
         let generation = app.session.library_generation();
         let revision = app.session.photo_revision(photo);
@@ -429,6 +467,7 @@ impl State {
                 inflight_plan: None,
             },
         );
+        self.task = Some(task_entry::Task::new(identity.clone(), app.session.catalog.photo(photo).map(|p| p.file_name.clone()).unwrap_or_default()));
         let draft_revision = self.clear_submitted_draft(app, photo)?;
         if let Some(job) = self.jobs.get_mut(&photo) {
             job.draft_revision = draft_revision;
@@ -564,6 +603,24 @@ impl State {
         self.finish(photo, tr("Stopped generating. Keeping the latest complete result."));
         Ok(Value::Null)
     }
+    fn disconnected(&mut self, photo: PhotoId, diagnostic: &str) {
+        let Some(job) = self.jobs.get(&photo) else {
+            return;
+        };
+        let stopped = job.stopped;
+        let record = self
+            .conversations
+            .get_mut(&photo)
+            .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == job.identity.local_round_id.as_str()));
+        let published = record.as_deref().is_some_and(errors::published);
+        if let Some(record) = record {
+            if record.get("local_terminal").is_none() {
+                record["local_terminal"] = json!(if stopped { "cancelled" } else { "disconnected" });
+            }
+            record["transport_diagnostic"] = json!(diagnostic.chars().take(4096).collect::<String>());
+        }
+        self.finish(photo, &errors::notice(if stopped { "user_stop" } else { "network_failure" }, published));
+    }
     fn finish(&mut self, photo: PhotoId, notice: &str) {
         let Some(job) = self.jobs.remove(&photo) else { return };
         let completed = self.conversations.get(&photo).is_some_and(|c| {
@@ -593,11 +650,8 @@ impl State {
                         }
                     }
                 }
-                let terminal_notice = record
-                    .pointer("/local_failure/message")
-                    .and_then(Value::as_str)
-                    .map(|e| format!("处理未完成：{e}。保留最近完整结果。"))
-                    .unwrap_or_else(|| notice.into());
+                let terminal_notice =
+                    record.pointer("/local_failure/message").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| notice.into());
                 record["terminal_notice"] = json!(terminal_notice);
                 record["backend_round_id"] = if job.round.is_empty() { Value::Null } else { json!(job.round) };
             }
@@ -610,6 +664,16 @@ impl State {
                 .unwrap_or("failed");
             close_pending_tools(&mut conversation.messages, terminal);
             conversation.notice = notice.into();
+        }
+        if let Some(task) = self.task.as_mut().filter(|t| t.identity == job.identity) {
+            let terminal = self
+                .conversations
+                .get(&photo)
+                .and_then(|c| c.records.iter().find(|r| r["local_round_id"] == job.identity.local_round_id.as_str()))
+                .and_then(|r| r["local_terminal"].as_str())
+                .unwrap_or(if job.stopped { "cancelled" } else { "failed" });
+            task.terminal = Some(terminal.to_owned());
+            task.unread = true;
         }
         if !completed {
             self.restore_request(photo, &job);
@@ -666,6 +730,9 @@ impl State {
                 let state = payload.get("state").and_then(Value::as_str).ok_or("AI 状态无效。")?.to_owned();
                 let job = self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?;
                 let old = std::mem::replace(&mut job.state, state.clone());
+                if let Some(task) = self.task.as_mut().filter(|t| t.identity == job.identity) {
+                    task.phase = state.clone();
+                }
                 if let Some(conversation) = self.conversations.get_mut(&photo) {
                     conversation.notice = tr(phase_text(&state)).into();
                 }
@@ -694,6 +761,9 @@ impl State {
                     return Err("AI 文字超过限制。".into());
                 }
                 message.push_str(delta);
+                if !delta.is_empty() {
+                    self.telemetry.text();
+                }
             }
             "message.completed" => {
                 let id = payload.get("message_id").and_then(Value::as_str).ok_or("AI 消息编号缺失。")?;
@@ -776,14 +846,12 @@ impl State {
             "round.ended" => {
                 let state = payload.get("terminal_state").and_then(Value::as_str).unwrap_or("failed");
                 let reason = payload.get("reason_code").and_then(Value::as_str).unwrap_or("unknown");
-                let trace = data.get("trace_id").and_then(Value::as_str).unwrap_or("-");
-                let notice = if state == "completed" {
-                    "本轮完成。".to_owned()
-                } else if reason == "context_full" {
-                    format!("上下文满了，本轮已结束；未自动删减或重试。traceId={trace}")
-                } else {
-                    format!("处理未完成：{reason}; traceId={trace}。保留最近一次完整结果。")
-                };
+                let published = self
+                    .conversations
+                    .get(&photo)
+                    .and_then(|c| c.records.iter().find(|r| r["backend_round_id"] == round))
+                    .is_some_and(errors::published);
+                let notice = if state == "completed" { tr("This round is complete.").to_owned() } else { errors::notice(reason, published) };
                 if let Some(record) = self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["backend_round_id"] == round)) {
                     record["local_terminal"] = json!(state);
                     record["backend_terminal"] = json!(payload);
@@ -975,7 +1043,11 @@ impl State {
                         step["delivery_state"] = json!("queued");
                     }
                 }
-                self.finish(photo, &format!("处理未完成：{error}。保留最近完整结果。"));
+                let published = self
+                    .conversations
+                    .get(&photo)
+                    .is_some_and(|c| c.records.iter().any(|r| r["local_round_id"] == identity.local_round_id.as_str() && errors::published(r)));
+                self.finish(photo, &errors::notice("execution_failed", published));
                 return self.save(app, photo);
             }
         };
@@ -1094,7 +1166,17 @@ impl State {
             self.local_save_retry_at = None;
             self.local_save_after_frame = None;
             self.feedback_pending = false;
+            self.readonly_selection = None;
+            self.readonly_task = None;
+            self.task = None;
+            self.telemetry = network::Telemetry::default();
+            self.health = health::Health::default();
             self.generation = generation;
+        }
+        self.sync_task_selection(app);
+        self.health.poll();
+        if self.health.checking() {
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
         if self.feedback_pending {
             self.defer_local_saves_for_feedback(ctx);
@@ -1120,14 +1202,11 @@ impl State {
                 c.dirty_queued = false;
             }
         }
-        if let Some(photo) = app.session.active() {
-            self.prune_cache(app, photo);
-        }
         if self.paging.busy() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         if self.open
-            && let Some(photo) = app.session.active()
+            && let Some(photo) = self.displayed_photo(app)
             && let Err(error) = self.load(app, photo)
         {
             self.text = error;
@@ -1228,7 +1307,22 @@ impl State {
                             let _ = self.save(app, identity.scope.photo);
                             continue;
                         }
-                        self.mark_failure(identity.scope.photo, &error.to_string());
+                        let photo = identity.scope.photo;
+                        let record = self
+                            .conversations
+                            .get(&photo)
+                            .and_then(|c| c.records.iter().find(|r| r["local_round_id"] == identity.local_round_id.as_str()));
+                        let notice = errors::notice(error.code.as_deref().unwrap_or("network_failure"), record.is_some_and(errors::published));
+                        self.mark_failure(photo, &notice);
+                        if let Some(record) = self
+                            .conversations
+                            .get_mut(&photo)
+                            .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()))
+                        {
+                            record["diagnostic_reason_code"] = json!(error.code);
+                            record["trace_id"] = json!(error.trace);
+                        }
+
                         if path.ends_with("/stop") || (submission != 0 && !error.rejected) {
                             // A failed creation POST may have been accepted. Disconnect
                             // rather than abandon an unidentifiable server task.
@@ -1250,9 +1344,9 @@ impl State {
                         if !round.is_empty() {
                             let _ = self.stop(photo);
                         }
-                        self.finish(photo, &format!("处理未完成：{error}。保留最近完整结果。"));
+                        self.finish(photo, &notice);
                         if let Some(conversation) = self.conversations.get_mut(&photo) {
-                            conversation.notice = format!("处理未完成：{error}。保留最近完整结果。");
+                            conversation.notice = notice;
                         }
                         let _ = self.save(app, photo);
                     } else if path == "/v1/rounds" {
@@ -1260,13 +1354,17 @@ impl State {
                     }
                     Ok(())
                 }
+                network::Event::Heartbeat { sequence } => {
+                    self.telemetry.heartbeat(sequence);
+                    Ok(())
+                }
                 network::Event::Closed(error) => {
                     let photos: Vec<_> = self.jobs.keys().copied().collect();
                     for photo in photos {
-                        self.finish(photo, &error);
+                        self.disconnected(photo, &error);
                         let _ = self.save(app, photo);
                     }
-                    self.text = error;
+                    self.text = tr("The AI connection was interrupted. Check the local service, then start a new request.").into();
                     Ok(())
                 }
             };
@@ -1318,7 +1416,7 @@ impl State {
         if self.connection.as_ref().is_none_or(|c| !c.alive.load(Ordering::Relaxed)) && !self.jobs.is_empty() {
             let photos: Vec<_> = self.jobs.keys().copied().collect();
             for photo in photos {
-                self.finish(photo, "AI 事件连接已断开，保留最近完整结果。");
+                self.disconnected(photo, "AI 事件连接已断开。");
                 let _ = self.save(app, photo);
             }
         }
@@ -1397,15 +1495,25 @@ impl State {
     }
     fn fail_one(&mut self, app: &mut LightcraftApp, photo: PhotoId, error: &str) {
         let error = tr(error);
-        self.mark_failure(photo, error);
+        let published = self.jobs.get(&photo).is_some_and(|job| {
+            self.conversations
+                .get(&photo)
+                .is_some_and(|c| c.records.iter().any(|r| r["local_round_id"] == job.identity.local_round_id.as_str() && errors::published(r)))
+        });
+        let notice = errors::local_notice(error, published);
+        self.mark_failure(photo, &notice);
+        if let Some(job) = self.jobs.get(&photo)
+            && let Some(record) = self
+                .conversations
+                .get_mut(&photo)
+                .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == job.identity.local_round_id.as_str()))
+        {
+            record["local_failure"]["diagnostic"] = json!(error.chars().take(4096).collect::<String>());
+        }
         let _ = self.stop(photo);
         if let Some(c) = self.conversations.get_mut(&photo) {
             c.storage_notice = app.session.companion_history_unsaved(photo);
-            c.notice = if c.storage_notice {
-                tr("Photo changes are kept. AI history is not saved; saving will retry.").into()
-            } else {
-                format!("处理未完成：{error}。保留最近完整结果。")
-            };
+            c.notice = if c.storage_notice { tr("Photo changes are kept. AI history is not saved; saving will retry.").into() } else { notice };
         }
         let _ = self.save(app, photo);
     }
@@ -1501,12 +1609,19 @@ fn close_pending_tools(messages: &mut Vec<Value>, outcome: &str) {
     }
 }
 
+pub(crate) fn selection_intent(app: &mut LightcraftApp) {
+    app.ai.leave_task_view();
+}
+pub fn show_task_entry(app: &mut LightcraftApp, ui: &mut egui::Ui) {
+    task_entry::show(app, ui);
+}
+
 pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
     let mut state = std::mem::take(&mut app.ai);
     state.poll_inner(app, ctx);
     if state.open
         && !state.feedback_needs_paint(ctx)
-        && let Some(photo) = app.session.active()
+        && let Some(photo) = state.displayed_photo(app)
         && let Err(e) = state.load(app, photo)
     {
         state.text = e;
@@ -1575,18 +1690,35 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         state.local_save_retry_at = None;
         state.local_save_after_frame = None;
         state.feedback_pending = false;
+        state.readonly_selection = None;
+        state.readonly_task = None;
+        state.task = None;
+        state.telemetry = network::Telemetry::default();
+        state.health = health::Health::default();
         state.generation = app.session.library_generation();
     }
+    state.sync_task_selection(app);
     let photo = params.get("photo").and_then(Value::as_u64).map(PhotoId).or_else(|| app.session.active());
     let result = match id {
+        "ai.clear" | "ai.undo" if state.readonly_task.is_some() => {
+            Err(tr("Return to the selected photo before changing its AI conversation or edits.").into())
+        }
         "ai.open" => {
             state.open = true;
+            state.leave_task_view();
+            state.health.first_open(network::service_address(app.services.companion_address.as_deref()));
             app.session.end_interaction().map_err(|e| e.to_string()).and_then(|()| {
                 app.ui.right = crate::state::RightPanel::Ai;
                 app.ui.tool.clear();
                 crate::docking::reveal_command(app, "ai.open")?;
                 Ok(Value::Null)
             })
+        }
+        "ai.task" => task_entry::navigate(&mut state, app),
+        "ai.returnCurrent" => task_entry::return_current(&mut state, app),
+        "ai.health" => {
+            state.health.request(network::service_address(app.services.companion_address.as_deref()));
+            Ok(state.health.status())
         }
         "ai.start" => {
             if let Err(error) = state.sync_editor(app) {
@@ -1607,14 +1739,20 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             Ok(Value::Null)
         }),
         "ai.status" => {
-            if let Some(photo) = photo
+            let viewed_photo = if params.get("photo").is_some() { photo } else { state.displayed_photo(app) };
+            if let Some(photo) = viewed_photo
                 && let Err(error) = state.load(app, photo)
             {
                 app.ai = state;
                 return Some(Err(error));
             }
-            let conversation = photo.and_then(|p| state.conversations.get(&p));
+            let conversation = viewed_photo.and_then(|p| state.conversations.get(&p));
             Ok(json!({
+                "readonlyPhoto": state.readonly_task.map(|scope| scope.photo.0),
+                "viewedPhoto": viewed_photo.map(|p| p.0),
+                "task": state.task.as_ref().map(task_entry::Task::status),
+                "health": state.health.status(),
+                "transport": state.telemetry.status(state.connection.as_ref().is_some_and(|c| c.alive.load(Ordering::Relaxed) && !c.is_closing())),
                 "busy": photo.is_some_and(|p| state.jobs.contains_key(&p)),
                 "workerBusy": photo.is_some_and(|p| state.worker_busy(p)),
                 "photo": photo.map(|p| p.0),
@@ -1629,23 +1767,26 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 })).collect::<Vec<_>>(),
                 "round": photo.and_then(|p| state.jobs.get(&p)).map(|j| j.round.clone()),
                 "text": conversation.map(display_text).unwrap_or_else(|| state.text.clone()),
-                "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().chain(c.records.iter().filter_map(|r|card::from_record(r,None))).map(|card| present_card(app,&state,photo.unwrap_or(PhotoId(0)),card)).collect::<Vec<_>>()).unwrap_or_default(),
-                "historyLoading": state.paging.busy() || photo.is_some_and(|photo| state.paging.awaiting_page(photo)) || conversation.and_then(|c| c.view.as_ref()).is_some_and(|v|v.card_cursor.is_some()),
+                "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().chain(c.records.iter().filter_map(|r|card::from_record(r,None))).map(|card| present_card(app,&state,viewed_photo.unwrap_or(PhotoId(0)),card)).collect::<Vec<_>>()).unwrap_or_default(),
+                "historyLoading": state.paging.busy() || viewed_photo.is_some_and(|photo| state.paging.awaiting_page(photo)) || conversation.and_then(|c| c.view.as_ref()).is_some_and(|v|v.card_cursor.is_some()),
                 "activePhotos": state.jobs.keys().map(|p| p.0).collect::<Vec<_>>(),
                 "saveState": photo.map(|p| if app.session.companion_photo_unsaved(p) || state.pending_local_saves.contains(&p) { "unsaved" } else { "saved" }),
                 "cleanupPending": photo.is_some_and(|p| app.session.companion_photo_cleanup_pending(p)),
                 "cleanupError": photo.and_then(|p| app.session.companion_cleanup_error(p)),
             }))
         }
-        "ai.history" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
-            state.load(app, p)?;
-            let record = params.get("record").and_then(Value::as_u64).unwrap_or(0);
-            let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
-            let cursor = lightcraft_engine::companion::storage::HistoryCursor { record, offset };
-            state.navigate_page(app, p, cursor)?;
-            state.request_page(app, p, cursor)?;
-            Ok(json!({"requested":true}))
-        }),
+        "ai.history" => {
+            let viewed_photo = if params.get("photo").is_some() { photo } else { state.displayed_photo(app) };
+            viewed_photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
+                state.load(app, p)?;
+                let record = params.get("record").and_then(Value::as_u64).unwrap_or(0);
+                let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                let cursor = lightcraft_engine::companion::storage::HistoryCursor { record, offset };
+                state.navigate_page(app, p, cursor)?;
+                state.request_page(app, p, cursor)?;
+                Ok(json!({"requested":true}))
+            })
+        }
         "ai.undo" => params
             .get("local_round_id")
             .and_then(Value::as_str)
@@ -1681,7 +1822,8 @@ fn present_card(app: &LightcraftApp, state: &State, photo: PhotoId, card: card::
     if outcome == RoundRevertState::Reverted || (card.reverted && outcome == RoundRevertState::Unverified) {
         card.current_photo_has_later_edits = false;
     }
-    card.can_undo = card.photo == Some(photo)
+    card.can_undo = state.readonly_task.is_none()
+        && card.photo == Some(photo)
         && !state.jobs.contains_key(&photo)
         && !state.worker_busy(photo)
         && local.as_ref().is_some_and(|round| app.session.verify_round_revert(photo, round).is_ok());
@@ -1784,7 +1926,16 @@ fn append_visible_message(text: &mut String, message: &Value) {
 
 pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     app.ai.open = true;
+    if let Some(task) =
+        app.ai.task.as_mut().filter(|t| {
+            t.identity.scope.library_generation == app.session.library_generation() && Some(t.identity.scope.photo) == app.session.active()
+        })
+    {
+        task.unread = false;
+    }
+    app.ai.health.first_open(network::service_address(app.services.companion_address.as_deref()));
     let mut state = std::mem::take(&mut app.ai);
+    state.sync_task_selection(app);
     let result = if state.feedback_needs_paint(ui.ctx()) { state.sync_editor_deferred(app) } else { state.sync_editor(app) };
     if let Err(error) = result {
         state.text = error;
@@ -1793,7 +1944,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     egui::Frame::NONE.inner_margin(egui::Margin::same(12)).show(ui, |ui| {
         ui.horizontal(|ui| {
             let heading = ui.heading(tr("AI Assistant"));
-            if let Some(photo) = app.session.active().and_then(|id| app.session.catalog.photo(id)) {
+            if let Some(photo) = app.ai.displayed_photo(app).and_then(|id| app.session.catalog.photo(id)) {
                 heading.on_hover_text(photo.file_name.as_str());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1805,8 +1956,24 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             });
         });
         ui.separator();
+        if let Some(scope) = app.ai.readonly_task.filter(|scope| scope.library_generation == app.session.library_generation()) {
+            if ui.available_height() < 200.0 {
+                let height = ui.available_height().max(0.0);
+                let scroll = egui::ScrollArea::vertical()
+                    .id_salt(("ai-readonly-task", scope.library_generation, scope.photo.0))
+                    .auto_shrink([false, false])
+                    .min_scrolled_height(height)
+                    .max_height(height)
+                    .show(ui, |ui| readonly_task_body(app, ui, scope, true));
+                composer_widget(ui, "ai:composer", scroll.inner_rect);
+            } else {
+                readonly_task_body(app, ui, scope, false);
+            }
+            return;
+        }
         let selection = &app.session.selection;
         let Some(photo) = app.session.active().filter(|_| selection.ids.len() == 1) else {
+            health::show(app, ui, ui.available_height() < 200.0);
             let notice = ui.label(tr("Select exactly one photo to start an AI task."));
             crate::widgets::register(ui.ctx(), "ai:selectionNotice", notice.rect);
             return;
@@ -1841,6 +2008,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                     composer(app, ui, photo, true);
                     ui.separator();
                     message_area(app, ui, photo, 160.0);
+                    health::details(app, ui);
                 });
         } else {
             composer(app, &mut footer, photo, false);
@@ -1853,6 +2021,39 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         composer_widget(ui, "ai:composer", footer_rect);
         ui.advance_cursor_after_rect(body);
     });
+}
+fn readonly_task_body(app: &mut LightcraftApp, ui: &mut egui::Ui, scope: PhotoScope, compact: bool) {
+    if let Some(task) = &mut app.ai.task {
+        task.unread = false;
+        ui.label(&task.name);
+    }
+    if app.ai.jobs.contains_key(&scope.photo) {
+        let stop = ui.button(tr("Stop Generating"));
+        composer_widget(ui, "button:aiStop", stop.rect);
+        if stop.clicked() {
+            if let Err(error) = app.run("ai.stop", json!({"photo":scope.photo.0})) {
+                app.ai.text = error;
+            }
+            app.ai.defer_local_saves_for_feedback(ui.ctx());
+            app.session.defer_companion_retry(true);
+        }
+    }
+    let notice = ui.label(tr("The task photo is unavailable. Its saved conversation is kept."));
+    composer_widget(ui, "indicator:aiTaskReadOnly", notice.rect);
+    let back = ui.button(tr("View Selected Photo Conversation"));
+    composer_widget(ui, "button:aiSelectedConversation", back.rect);
+    if back.clicked() {
+        let _ = app.run("ai.returnCurrent", json!({}));
+    }
+    if let Some(trace) = app.ai.conversations.get(&scope.photo).and_then(errors::diagnostic).map(str::to_owned) {
+        let copy = ui.button(tr("Copy Diagnostic ID"));
+        composer_widget(ui, "button:aiCopyTrace", copy.rect);
+        if copy.clicked() {
+            ui.ctx().copy_text(trace);
+        }
+    }
+    let height = if compact { 240.0 } else { ui.available_height().max(0.0) };
+    message_area(app, ui, scope.photo, height);
 }
 fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
     let mut locate = false;
@@ -1895,7 +2096,7 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
                 .chain(conversation.records.iter().filter_map(|record| card::from_record(record, None)))
             {
                 let card = present_card(app, &app.ai, photo, card);
-                match card::show(ui, &card) {
+                match card::show(ui, &card, app.ai.readonly_task.is_none() && app.session.active() == Some(photo)) {
                     Some(card::Action::History) => locate = true,
                     Some(card::Action::Undo) => revert = Some(card.local_round_id),
                     None => {}
@@ -1954,7 +2155,10 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
                 .get(&photo)
                 .map(|job| if job.stopped { "Cancelling…" } else { phase_text(&job.state) })
                 .unwrap_or("Processing this photo…");
-            ui.label(tr(phase));
+            let phase_label = ui.label(tr(phase));
+            if app.ai.telemetry.recent_heartbeat() && app.ai.connection.as_ref().is_some_and(|c| c.alive.load(Ordering::Relaxed) && !c.is_closing()) {
+                phase_label.on_hover_text(tr("Connection active; heartbeat acknowledged. Model output is separate."));
+            }
             let stop = ui.button(tr("Stop Generating"));
             composer_widget(ui, "button:aiStop", stop.rect);
             if !sizing && stop.clicked() {
@@ -2003,6 +2207,30 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
     }
     if !compact {
         consent_control(app, ui, photo);
+    }
+    health::show(app, ui, compact);
+    // Reserve the optional diagnostic control before a cold history read completes,
+    // so its arrival cannot invalidate a held consent/submit gesture.
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui.painter().layout_no_wrap(tr("Copy Diagnostic ID").into(), font, ui.visuals().text_color());
+    let size = egui::vec2(
+        (galley.size().x + 2.0 * ui.spacing().button_padding.x).min(ui.available_width()),
+        ui.spacing().interact_size.y.max(galley.size().y + 2.0 * ui.spacing().button_padding.y),
+    );
+    let (slot, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    // Allocate the child in both states so later buttons retain their egui identities.
+    let mut diagnostic_row = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("ai-diagnostic", app.session.library_generation(), photo.0))
+            .max_rect(slot)
+            .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)),
+    );
+    if let Some(trace) = app.ai.conversations.get(&photo).and_then(errors::diagnostic).map(str::to_owned) {
+        let copy = diagnostic_row.add(egui::Button::new(tr("Copy Diagnostic ID")));
+        composer_widget(ui, "button:aiCopyTrace", copy.rect);
+        if !sizing && copy.clicked() {
+            ui.ctx().copy_text(trace);
+        }
     }
     if !busy {
         let admission = app.ai.admission(app, None);

@@ -174,7 +174,7 @@ pub(super) enum Action {
     History,
     Undo,
 }
-pub(super) fn show(ui: &mut egui::Ui, card: &Card) -> Option<Action> {
+pub(super) fn show(ui: &mut egui::Ui, card: &Card, navigation_available: bool) -> Option<Action> {
     let mut action = None;
     let frame = egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.strong(tr("Round result"));
@@ -236,12 +236,12 @@ pub(super) fn show(ui: &mut egui::Ui, card: &Card) -> Option<Action> {
             }
         });
         super::composer_widget(ui, &format!("button:aiParameters:{}", card.local_round_id), details.header_response.rect);
-        let locate = ui.button(tr("Open ordinary History"));
+        let locate = ui.add_enabled(navigation_available, egui::Button::new(tr("Open ordinary History")));
         super::composer_widget(ui, &format!("button:aiHistory:{}", card.local_round_id), locate.rect);
         if locate.clicked() {
             action = Some(Action::History);
         }
-        let undo = ui.add_enabled(card.can_undo, egui::Button::new(tr("Undo AI Round")));
+        let undo = ui.add_enabled(navigation_available && card.can_undo, egui::Button::new(tr("Undo AI Round")));
         super::composer_widget(ui, &format!("button:aiUndo:{}", card.local_round_id), undo.rect);
         if undo.clicked() {
             action = Some(Action::Undo);

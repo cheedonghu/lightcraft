@@ -198,6 +198,7 @@ impl State {
             fragments: page.fragments,
             bytes: page.bytes,
             cards: Vec::new(),
+            diagnostic: None,
             cards_bytes: 0,
             card_cursor: (total > 0 && (!wanted.is_empty() || !owners.is_empty())).then_some(0),
             card_pending: wanted,

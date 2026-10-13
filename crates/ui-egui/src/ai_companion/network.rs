@@ -24,16 +24,48 @@ pub enum Event {
     Connected { client: String, connection: String },
     Server { kind: String, data: Value },
     Response { submission: u64, round: String, path: String, identity: RoundIdentity, result: Result<Value, RequestFailure> },
+    Heartbeat { sequence: u64 },
     Closed(String),
+}
+/// Independent transport observations, never a model-response deadline.
+#[derive(Default)]
+pub struct Telemetry {
+    heartbeats: u64,
+    last_sequence: Option<u64>,
+    last_heartbeat: Option<Instant>,
+    last_text: Option<Instant>,
+}
+impl Telemetry {
+    pub fn heartbeat(&mut self, sequence: u64) {
+        self.last_sequence = Some(sequence);
+        self.heartbeats = self.heartbeats.saturating_add(1);
+        self.last_heartbeat = Some(Instant::now());
+    }
+    pub fn text(&mut self) {
+        self.last_text = Some(Instant::now());
+    }
+    pub fn new_round(&mut self) {
+        self.last_text = None;
+    }
+    pub fn recent_heartbeat(&self) -> bool {
+        self.last_heartbeat.is_some_and(|at| at.elapsed() <= Duration::from_secs(35))
+    }
+    pub fn status(&self, alive: bool) -> Value {
+        json!({"connectionAlive": alive, "heartbeats": self.heartbeats, "heartbeatSequence": self.last_sequence,
+        "lastHeartbeatAgeMs": self.last_heartbeat.map(|at| at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+        "lastTextAgeMs": self.last_text.map(|at| at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)})
+    }
 }
 pub struct RequestFailure {
     pub rejected: bool,
     pub cancelled_before_send: bool,
     message: String,
+    pub code: Option<String>,
+    pub trace: Option<String>,
 }
 impl From<String> for RequestFailure {
     fn from(message: String) -> Self {
-        Self { rejected: false, cancelled_before_send: false, message }
+        Self { rejected: false, cancelled_before_send: false, message, code: None, trace: None }
     }
 }
 impl From<&str> for RequestFailure {
@@ -80,11 +112,33 @@ impl Drop for Connection {
         self.cancel.store(true, Ordering::Relaxed);
     }
 }
-pub fn connect(address: &str) -> Result<Connection, String> {
-    let address: SocketAddr = address.parse().map_err(|_| "本地 AI 服务地址无效。")?;
-    if !address.ip().is_loopback() {
-        return Err("开发模式仅连接本机 AI 服务。".into());
+/// Both consumers resolve the same host configuration and loopback policy.
+pub fn service_address(host: Option<&str>) -> String {
+    host.map(str::to_owned).unwrap_or_else(|| std::env::var("PHOTO_COMPANION_ADDR").unwrap_or_else(|_| "127.0.0.1:18080".into()))
+}
+struct ServiceEndpoint(SocketAddr);
+impl ServiceEndpoint {
+    fn parse(address: &str) -> Result<Self, String> {
+        let address: SocketAddr = address.parse().map_err(|_| "The local AI service address is invalid.")?;
+        if !address.ip().is_loopback() {
+            return Err("Development mode only connects to the local AI service.".into());
+        }
+        Ok(Self(address))
     }
+}
+/// A bounded GET proves HTTP reachability only; no client/round identity is created.
+pub fn health(address: &str, cancel: &AtomicBool) -> Result<(), String> {
+    let address = ServiceEndpoint::parse(address)?.0;
+    let start = Instant::now();
+    cancelled(cancel, start, Duration::from_secs(15))?;
+    let mut stream = socket(address)?;
+    write!(stream, "GET /health HTTP/1.0\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+        .map_err(|_| "The local AI service could not be reached.")?;
+    let (status, _) = headers_scoped(&mut BufReader::new(stream), cancel, None, start)?;
+    if (200..300).contains(&status) { Ok(()) } else { Err("The local AI service health check failed.".into()) }
+}
+pub fn connect(address: &str) -> Result<Connection, String> {
+    let address = ServiceEndpoint::parse(address)?.0;
     let (requests, rx) = mpsc::sync_channel::<Request>(8);
     let (controls, control_rx) = mpsc::sync_channel::<Request>(8);
     let (tx, events) = mpsc::sync_channel::<Event>(32);
@@ -199,7 +253,13 @@ fn post_request(address: SocketAddr, path: &str, token: &str, body: &Value, canc
 }
 fn check_round(round: Option<&AtomicBool>, sent: usize) -> Result<(), RequestFailure> {
     if round.is_some_and(|r| r.load(Ordering::Relaxed)) {
-        return Err(RequestFailure { rejected: false, cancelled_before_send: sent == 0, message: "已取消未完成的 AI 请求。".into() });
+        return Err(RequestFailure {
+            rejected: false,
+            cancelled_before_send: sent == 0,
+            message: "已取消未完成的 AI 请求。".into(),
+            code: None,
+            trace: None,
+        });
     }
     Ok(())
 }
@@ -292,6 +352,8 @@ fn post_scoped(
         return Err(RequestFailure {
             rejected: status < 500 && result.get("code").and_then(Value::as_str).is_some(),
             cancelled_before_send: false,
+            code: result.get("code").and_then(Value::as_str).map(str::to_owned),
+            trace: result.get("trace_id").and_then(Value::as_str).map(str::to_owned),
             message: format!(
                 "{}; traceId={}",
                 result.get("code").and_then(Value::as_str).unwrap_or("request_failed"),
@@ -301,7 +363,9 @@ fn post_scoped(
     }
     if (path.ends_with("/execution") || path.ends_with("/input")) && (status != 202 || result.get("accepted").and_then(Value::as_bool) != Some(true))
     {
-        return Err(RequestFailure { rejected: false, cancelled_before_send: false, message: "后端回复无效。".into() });
+        return Err(RequestFailure {
+            rejected: false, cancelled_before_send: false, message: "后端回复无效。".into(), code: None, trace: None
+        });
     }
     Ok(result)
 }
@@ -428,6 +492,7 @@ fn receive(
             } else if kind == "ping" {
                 let ping = event.pointer("/payload/ping_seq").and_then(Value::as_u64).ok_or("心跳编号无效。")?;
                 post(address, &format!("/v1/clients/{client}/heartbeat"), &token, &json!({"connection_id":connection,"ping_seq":ping}), cancel)?;
+                emit(tx, Event::Heartbeat { sequence: ping }, cancel)?;
             } else {
                 emit(tx, Event::Server { kind: kind.clone(), data: event }, cancel)?;
             }
