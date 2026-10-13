@@ -34,23 +34,9 @@ impl State {
                 archive.get("messages").and_then(Value::as_array).ok_or("AI 对话记录无效。")?.clone()
             };
             conversation.rounds = archive.get("rounds").and_then(Value::as_array).cloned().unwrap_or_default();
-            if let Some(saved) = archive.get("checkpoint").filter(|v| !v.is_null()) {
-                let original: DevelopSettings =
-                    serde_json::from_value(saved.get("original").cloned().ok_or("AI 撤回起点缺失。")?).map_err(|_| "AI 撤回起点无效。")?;
-                let expected: DevelopSettings =
-                    serde_json::from_value(saved.get("expected").cloned().ok_or("AI 编辑结果缺失。")?).map_err(|_| "AI 编辑结果无效。")?;
-                let p = app.session.catalog.photo(photo).ok_or("照片不存在。")?;
-                conversation.checkpoint = Some(Checkpoint {
-                    photo,
-                    generation: app.session.library_generation(),
-                    original: Arc::new(original),
-                    expected: Arc::new(expected),
-                    revision: app.session.photo_revision(photo),
-                    content: lightcraft_engine::media::content_key(p),
-                    eligible: saved.get("eligible").and_then(Value::as_bool) == Some(true),
-                    local_round_id: saved.get("local_round_id").and_then(Value::as_str).map(str::to_owned),
-                });
-            }
+            // A disk record is historical display data. Runtime publication or a
+            // separately verified durable certificate must grant revert authority;
+            // never replace a saved version/source with the current photo's identity.
         }
         app.session.pin_companion_prefix(photo, conversation.prefix.clone()).map_err(|e| e.to_string())?;
         self.conversations.insert(photo, conversation);

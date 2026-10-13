@@ -2175,4 +2175,14 @@
   "Connection active; heartbeat acknowledged. Model output is separate.": "连接仍在，心跳已确认；模型文字输出另行观察。",
   "Return to Current Photo": "返回当前照片",
   "Return to the selected photo before changing its AI conversation or edits.": "请先返回所选照片，再修改其 AI 会话或编辑效果。"
+,
+  "Choose the round to revert.": "请选择要撤回的轮次。",
+  "This round has no verified revert permission; use ordinary History.": "无法验证本轮撤回资格，请使用普通历史恢复。",
+  "The photo has later edits; use ordinary History. The current photo was kept.": "照片已有后续编辑，请使用历史恢复，未覆盖当前照片。",
+  "The round revert permission is stale; the photo was kept.": "本轮撤回资格已失效，未覆盖当前照片。",
+  "This round was reverted.": "已撤回本轮。",
+  "This round was reverted. The conversation was kept.": "已撤回本轮，保留对话。",
+  "This round's edits were reverted. The photo was restored to its round starting state.": "本轮修改已撤回，照片已恢复到本轮起点。",
+  "Revert unavailable; use ordinary History.": "无法撤回本轮，请使用普通历史恢复。",
+  "Choose a valid photo to revert.": "请选择有效照片以撤回本轮。"
 }
