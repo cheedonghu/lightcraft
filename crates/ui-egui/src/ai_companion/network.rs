@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use lightcraft_engine::companion::RoundIdentity;
 use serde_json::{Value, json};
 
 pub struct Request {
@@ -15,11 +16,12 @@ pub struct Request {
     pub body: Value,
     pub submission: u64,
     pub round: String,
+    pub identity: RoundIdentity,
 }
 pub enum Event {
     Connected { client: String, connection: String },
     Server { kind: String, data: Value },
-    Response { submission: u64, round: String, path: String, result: Result<Value, RequestFailure> },
+    Response { submission: u64, round: String, path: String, identity: RoundIdentity, result: Result<Value, RequestFailure> },
     Closed(String),
 }
 pub struct RequestFailure {
@@ -287,7 +289,13 @@ fn receive(address: SocketAddr, requests: mpsc::Receiver<Request>, tx: &mpsc::Sy
                                 let result = post_request(address, &request.path, &token, &request.body, &cancel);
                                 if emit(
                                     &tx,
-                                    Event::Response { submission: request.submission, round: request.round, path: request.path, result },
+                                    Event::Response {
+                                        submission: request.submission,
+                                        round: request.round,
+                                        path: request.path,
+                                        identity: request.identity,
+                                        result,
+                                    },
                                     &cancel,
                                 )
                                 .is_err()
@@ -318,4 +326,11 @@ fn receive(address: SocketAddr, requests: mpsc::Receiver<Request>, tx: &mpsc::Sy
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_connection() -> (Connection, mpsc::Receiver<Request>, mpsc::SyncSender<Event>) {
+    let (requests, receiver) = mpsc::sync_channel(8);
+    let (sender, events) = mpsc::sync_channel(32);
+    (Connection { requests, events, alive: Arc::new(AtomicBool::new(true)), cancel: Arc::new(AtomicBool::new(false)) }, receiver, sender)
 }

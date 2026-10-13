@@ -28,15 +28,9 @@ fn error(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("AI archive: {e}"))
 }
 impl Archive {
-    pub(crate) fn load(store: &mut dyn Store, dir: &Path, on_disk: bool) -> Self {
+    pub(crate) fn load(store: &mut dyn Store, _dir: &Path, _on_disk: bool) -> Self {
         let mut read = || -> Result<Self> {
-            if on_disk && std::fs::metadata(dir.join(STATE_FILE)).is_ok_and(|m| m.len() > MAX_ARCHIVE) {
-                return Err(error("file exceeds 64 MiB"));
-            }
-            let Some(bytes) = store.read(STATE_FILE).map_err(error)? else { return Ok(Self::default()) };
-            if bytes.len() as u64 > MAX_ARCHIVE {
-                return Err(error("file exceeds 64 MiB"));
-            }
+            let Some(bytes) = store.read_limited(STATE_FILE, MAX_ARCHIVE).map_err(error)? else { return Ok(Self::default()) };
             let saved: Saved = serde_json::from_slice(&bytes).map_err(error)?;
             if saved.format != "lightcraft-companion" || saved.version != 1 {
                 return Err(error("unsupported format; the file was left unchanged"));
@@ -80,11 +74,7 @@ impl Archive {
             if bytes.len() as u64 > MAX_ARCHIVE {
                 return Err(error("file exceeds 64 MiB"));
             }
-            if library.on_disk {
-                std::fs::create_dir_all(library.dir.join("companion")).map_err(error)?;
-            }
-            library.files.write_atomic(STATE_FILE, &bytes).map_err(error)?;
-            sync_directory(library)
+            library.files.write_atomic(STATE_FILE, &bytes).map_err(error)
         })();
         match result {
             Ok(()) => {
@@ -140,44 +130,21 @@ impl crate::library::Library {
             return Err(error("preview exceeds limits"));
         }
         let name = format!("companion/preview-{}-{:032x}.bin", photo.0, lightcraft_preview::hash_bytes(data).0);
-        if self.on_disk {
-            std::fs::create_dir_all(self.dir.join("companion")).map_err(error)?;
-        }
         self.files.write_atomic(&name, data).map_err(error)?;
-        sync_directory(self)?;
         Ok(name)
     }
     pub fn read_companion_attachment(&mut self, name: &str) -> Result<Vec<u8>> {
         validate_attachment(name)?;
-        if self.on_disk && std::fs::metadata(self.dir.join(name)).map_err(error)?.len() > 128 * 1024 {
-            return Err(error("preview exceeds limits"));
-        }
-        let bytes = self.files.read(name).map_err(error)?.ok_or_else(|| error("preview is missing"))?;
+        let bytes = self.files.read_limited(name, 128 * 1024).map_err(error)?.ok_or_else(|| error("preview is missing"))?;
         if bytes.is_empty() || bytes.len() > 128 * 1024 {
             return Err(error("preview exceeds limits"));
         }
         Ok(bytes)
     }
-    pub fn remove_companion_attachment(&self, name: &str) -> Result<()> {
+    pub fn remove_companion_attachment(&mut self, name: &str) -> Result<()> {
         validate_attachment(name)?;
-        if self.on_disk {
-            match std::fs::remove_file(self.dir.join(name)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(error(e)),
-            }
-        }
-        sync_directory(self)
+        self.files.remove(name).map_err(error)
     }
-}
-fn sync_directory(library: &crate::library::Library) -> Result<()> {
-    #[cfg(unix)]
-    if library.on_disk {
-        std::fs::File::open(library.dir.join("companion")).and_then(|f| f.sync_all()).map_err(error)?;
-    }
-    #[cfg(not(unix))]
-    let _ = library;
-    Ok(())
 }
 fn validate_attachment(name: &str) -> Result<()> {
     let valid = name.len() <= 96

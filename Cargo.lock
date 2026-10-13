@@ -3216,6 +3216,7 @@ version = "0.7.0"
 dependencies = [
  "ab_glyph",
  "crc32fast",
+ "getrandom 0.4.3",
  "harfrust",
  "jxl-oxide",
  "libc",
