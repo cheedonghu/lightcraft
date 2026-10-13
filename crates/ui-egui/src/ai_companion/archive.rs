@@ -189,9 +189,31 @@ impl State {
     ) -> Result<(), String> {
         let Some(prefix) = self.conversations.get(&photo).and_then(|c| c.prefix.clone()) else { return Ok(()) };
         let page = app.session.companion_history_slice_at(&prefix, cursor, 256 * 1024).map_err(|e| e.to_string())?;
+        let wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
+        let owners: VecDeque<_> = page
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                lightcraft_engine::companion::storage::HistoryItem::Fragment { record, .. } => Some(*record),
+                _ => None,
+            })
+            .collect();
+        let total = if prefix.record_count > 0 { prefix.record_count } else { prefix.round_count };
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
-        conversation.view =
-            Some(HistoryView { items: page.items, cursor, next: page.next, messages: page.records, fragments: page.fragments, bytes: page.bytes });
+        conversation.view = Some(HistoryView {
+            items: page.items,
+            cursor,
+            next: page.next,
+            messages: page.records,
+            fragments: page.fragments,
+            bytes: page.bytes,
+            cards: Vec::new(),
+            cards_bytes: 0,
+            card_cursor: (total > 0 && (!wanted.is_empty() || !owners.is_empty())).then_some(0),
+            card_pending: wanted,
+            card_owners: owners,
+            card_scan: None,
+        });
         self.accept_page(app, photo, cursor);
         self.prune_cache(app, photo);
         Ok(())
@@ -204,7 +226,7 @@ impl State {
                 .conversations
                 .values()
                 .map(|c| {
-                    c.view.as_ref().map(|v| v.bytes).unwrap_or(0).saturating_add(
+                    c.view.as_ref().map(|v| v.bytes.saturating_add(v.cards_bytes)).unwrap_or(0).saturating_add(
                         c.messages
                             .iter()
                             .chain(c.records.iter())

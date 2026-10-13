@@ -255,5 +255,7 @@
   "Scanning photos for faces: {left} left · {faces} faces so far": "Scanning photos for faces: {left} left · {faces} faces so far",
   "{}× slower than {}": "{}× slower than {}",
   "Shows the model's terms, then downloads {} from {host} and installs it{}. Nothing else is sent.": "Shows the model's terms, then downloads {} from {host} and installs it{}. Nothing else is sent.",
-  "{faces} faces learned.": "{faces} faces learned."
+  "{faces} faces learned.": "{faces} faces learned.",
+  "{before} → {after}": "{before} → {after}",
+  "Point Color {n}": "Point Color {n}"
 }

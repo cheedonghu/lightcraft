@@ -16,7 +16,7 @@ pub(super) mod reader_pins;
 mod recovery;
 mod retirement;
 use pagination::load_index;
-pub use pagination::{HistoryCursor, HistoryItem, HistoryReader, HistorySlice, RoundSearch, record_size};
+pub use pagination::{DisplayRecord, DisplayScan, HistoryCursor, HistoryItem, HistoryReader, HistorySlice, RoundSearch, record_size};
 pub(crate) use pagination::{TailUpdate, persist_tail, retry_receipt};
 pub use reader_pins::HistoryRetention;
 pub use retirement::CleanupReport;

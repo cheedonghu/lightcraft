@@ -2192,5 +2192,9 @@
   "Applying the correction…": "Applying the correction…",
   "Stopping generation…": "Stopping generation…",
   "Generation stopped; confirming submission cancellation…": "Generation stopped; confirming submission cancellation…",
-  "Generation stopped; keeping the latest complete result.": "Generation stopped; keeping the latest complete result."
+  "Generation stopped; keeping the latest complete result.": "Generation stopped; keeping the latest complete result.",
+  "Samples": "Зразки",
+  "Combination": "Поєднання",
+  "On": "Увімкнено",
+  "Historical parameter details are unavailable.": "Історичні відомості про параметри недоступні."
 }
