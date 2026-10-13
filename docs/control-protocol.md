@@ -70,7 +70,7 @@ and preview attachments; `ai.clear` removes that context without changing edits.
 to overwrite subsequent manual edits. Accounts, budgets, and browser support remain later work.
 See the adjacent backend's `.scratch/photo-companion-v1/validation.md`. Widgets are
 `button:aiOpen`, `icon:ai`, `button:aiCollapse`, `field:aiPrompt`, `checkbox:aiConsent`, `button:aiStart`, `button:aiStop`,
-`button:aiUndo`, and `button:aiClear`. `ai:messages` identifies the independently scrolling message viewport; `ai:stage` identifies the fixed status area. Input and consent remain outside message scrolling, and the checkbox remains reachable during an active task.
+`button:aiUndo`, and `button:aiClear`. `ai:messages` identifies the independently scrolling message viewport; `ai:stage` identifies the fixed status area. In ordinary Tools panes, input and consent remain outside message scrolling. Supported short floating/stacked panes use a compact scrolling body with Stop and consent first; the remaining input/actions/history stay reachable through its scrollbar. Composer control rectangles are registered only within the visible clip, so hidden controls cannot target the photo underneath. `ai:composer` identifies this viewport.
 
 | Method | Params | Result |
 |---|---|---|

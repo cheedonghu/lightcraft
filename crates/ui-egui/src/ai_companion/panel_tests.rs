@@ -271,3 +271,151 @@ fn multiline_draft_scrolls_inside_a_fixed_composer_without_sizing_consuming_inpu
         assert!(tools.contains_rect(rect(&h, id)));
     }
 }
+
+fn short_tools(h: &mut Headless, stacked: bool, height: f32) {
+    if stacked {
+        frames(h);
+        // Stack heights are relative weights. Keep the companion body at the
+        // requested height while the library consumes the remaining stack.
+        let rest = (rect(h, "panel:right_panel").height() - 26.0 - height).max(1.0);
+        h.app.ui.left_panel = true;
+        use craft_ui::docking::{Layout, Node, StackEntry};
+        use craft_ui::layout::{SplitAxis, SplitSize};
+        h.app.ui.docking = Some(crate::docking::Workspace {
+            layout: Layout {
+                root: Some(Node::Split {
+                    axis: SplitAxis::Horizontal,
+                    size: SplitSize::FixedSecond(320.0),
+                    first: Box::new(Node::Tabs { panels: vec![Panel::Canvas], active: 0 }),
+                    second: Box::new(Node::Stack {
+                        entries: vec![
+                            StackEntry { panel: Panel::Tools, open: true, height: Some(height) },
+                            StackEntry { panel: Panel::Library, open: true, height: Some(rest) },
+                        ],
+                    }),
+                }),
+                floating: Vec::new(),
+            },
+            hidden: Vec::new(),
+        });
+    } else {
+        h.app.run("ui.dock", json!({"operation":"float","panel":"tools","rect":[450,100,320,height]})).unwrap();
+    }
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(h);
+    assert!(rect(h, "panel:right_panel").height() <= height + 1.0, "the supported Tools pane actually stays short");
+}
+
+fn reachable(h: &mut Headless, id: &str, direction: f32) -> egui::Rect {
+    for _ in 0..30 {
+        if let Some((_, target)) = h.app.widgets.iter().find(|(key, _)| key == id)
+            && target.height() >= 12.0
+        {
+            assert!(rect(h, "panel:right_panel").contains_rect(*target), "{id} must be visibly inside Tools");
+            return *target;
+        }
+        let composer = rect(h, "ai:composer");
+        h.app.synthetic.push(egui::Event::PointerMoved(egui::pos2(composer.right() - 2.0, composer.center().y)));
+        h.app.synthetic.push(egui::Event::MouseWheel {
+            phase: egui::TouchPhase::Move,
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, direction * 35.0),
+            modifiers: egui::Modifiers::NONE,
+        });
+        frames(h);
+    }
+    panic!("{id} never reachable in short Tools");
+}
+
+#[test]
+fn supported_short_floating_and_stacked_tools_keep_active_controls_on_their_own_surface() {
+    for (stacked, height) in [(false, 200.0), (true, 200.0), (false, 120.0), (true, 120.0)] {
+        for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+            let mut h = headless([1000.0, 680.0]);
+            h.app.ui.language = language;
+            let (connection, requests, _events) = network::test_connection();
+            h.app.ai.connection = Some(connection);
+            h.app.ai.generation = h.app.session.library_generation();
+            h.app.run("ai.open", json!({})).unwrap();
+            frames(&mut h);
+            let timeout = Duration::from_secs(10);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
+            assert_eq!(requests.try_recv().unwrap().path, "/v1/rounds");
+            let photo = h.app.session.active().unwrap();
+            let cancel = h.app.ai.jobs.get(&photo).unwrap().cancel.clone();
+            short_tools(&mut h, stacked, height);
+            let zoom = h.app.ui.zoom;
+            let tools = rect(&h, "panel:right_panel");
+            for (id, target) in
+                h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:ai") || id.starts_with("checkbox:ai") || id == "field:aiPrompt")
+            {
+                assert!(tools.contains_rect(*target), "{id} clips outside {tools:?}: {target:?}");
+            }
+            reachable(&mut h, "checkbox:aiConsent", -1.0);
+            short_snapshot(&mut h, &format!("short-active-{}-{}-{}", if stacked { "stack" } else { "float" }, height as usize, language.code()));
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
+            assert!(!h.app.ai.consent);
+            assert!(cancel.load(Ordering::Relaxed));
+            assert_eq!(h.app.ui.zoom, zoom, "AI consent cannot click/zoom the photo behind its pane");
+            reachable(&mut h, "checkbox:aiConsent", 1.0);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
+            assert!(h.app.ai.consent);
+            assert!(cancel.load(Ordering::Relaxed), "re-consent never revives the stopped job");
+            reachable(&mut h, "button:aiStop", 1.0);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStop"}), timeout)["ok"], true);
+            assert_eq!(h.app.ui.zoom, zoom);
+        }
+    }
+}
+
+#[test]
+fn supported_short_tools_allow_idle_draft_clear_and_start_through_visible_widgets() {
+    for (stacked, height) in [(false, 240.0), (true, 240.0), (false, 120.0), (true, 120.0)] {
+        for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+            let mut h = headless([1000.0, 680.0]);
+            h.app.ui.language = language;
+            let photo = h.app.session.active().unwrap();
+            h.app
+                .session
+                .set_photo_companion(photo, Some(json!({"schema_version":1,"messages":[{"role":"user","text":"kept legacy text"}],"rounds":[]})))
+                .unwrap();
+            let (connection, requests, _events) = network::test_connection();
+            h.app.ai.connection = Some(connection);
+            h.app.ai.generation = h.app.session.library_generation();
+            short_tools(&mut h, stacked, height);
+            let timeout = Duration::from_secs(10);
+            reachable(&mut h, "field:aiPrompt", -1.0);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout)["ok"], true);
+            assert_eq!(h.request("ui.text", json!({"text":"Please keep natural colors."}), timeout)["ok"], true);
+            assert_eq!(h.app.ai.prompt, "Please keep natural colors.");
+            let zoom = h.app.ui.zoom;
+            reachable(&mut h, "button:aiClear", -1.0);
+            short_snapshot(&mut h, &format!("short-idle-{}-{}-{}", if stacked { "stack" } else { "float" }, height as usize, language.code()));
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClear"}), timeout)["ok"], true);
+            assert!(h.app.session.photo_companion(photo).unwrap().is_none());
+            assert_eq!(h.app.ai.prompt, "Please keep natural colors.");
+            reachable(&mut h, "checkbox:aiConsent", 1.0);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
+            reachable(&mut h, "button:aiStart", -1.0);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
+            assert_eq!(requests.try_recv().unwrap().path, "/v1/rounds");
+            assert_eq!(h.app.session.companion_task_photo(), Some(photo));
+            assert_eq!(h.app.ui.zoom, zoom);
+        }
+    }
+}
+
+fn short_snapshot(h: &mut Headless, name: &str) {
+    if let Ok(dir) = std::env::var("UX06_SCREENSHOT_DIR") {
+        h.app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+        h.app.services.png = Some(Box::new(|image| {
+            lightcraft_engine::export::encode_image(
+                image,
+                &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+            )
+            .unwrap()
+        }));
+        assert_eq!(h.request("ui.screenshot", json!({"path":format!("{dir}/{name}.png"),"headless":true}), Duration::from_secs(20))["ok"], true);
+    }
+}

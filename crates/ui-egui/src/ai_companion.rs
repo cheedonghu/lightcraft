@@ -1331,7 +1331,10 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     app.ai.open = true;
     egui::Frame::NONE.inner_margin(egui::Margin::same(12)).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.heading(tr("AI Assistant"));
+            let heading = ui.heading(tr("AI Assistant"));
+            if let Some(photo) = app.session.active().and_then(|id| app.session.catalog.photo(id)) {
+                heading.on_hover_text(photo.file_name.as_str());
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let close = ui.button(tr("Collapse"));
                 crate::widgets::register(ui.ctx(), "button:aiCollapse", close.rect);
@@ -1347,7 +1350,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             crate::widgets::register(ui.ctx(), "ai:selectionNotice", notice.rect);
             return;
         };
-        if let Some(p) = app.session.catalog.photo(photo) {
+        if ui.available_height() >= 200.0
+            && let Some(p) = app.session.catalog.photo(photo)
+        {
             ui.label(p.file_name.as_str());
         }
         if ui.available_height() >= 500.0 {
@@ -1357,32 +1362,54 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         // Measure with a disabled, invisible UI and independent widget IDs. This pass
         // cannot dispatch actions, touch a draft or register control targets.
         let mut measure = ui.new_child(egui::UiBuilder::new().id_salt("ai-composer-measure").max_rect(body).sizing_pass().invisible());
-        composer(app, &mut measure, photo);
-        let height = measure.min_rect().height().min(body.height());
+        composer(app, &mut measure, photo, false);
+        let compact = measure.min_rect().height() > body.height();
+        let height = if compact { body.height().max(0.0) } else { measure.min_rect().height() };
         let footer_rect = egui::Rect::from_min_max(egui::pos2(body.left(), body.bottom() - height), body.max);
         let mut footer = ui.new_child(egui::UiBuilder::new().id_salt("ai-composer").max_rect(footer_rect));
-        composer(app, &mut footer, photo);
-        let bottom = (footer_rect.top() - 8.0).max(body.top());
-        let messages = egui::Rect::from_min_max(body.min, egui::pos2(body.right(), bottom));
-        let mut messages_ui = ui.new_child(egui::UiBuilder::new().id_salt("ai-message-viewport").max_rect(messages));
-        messages_ui.set_clip_rect(messages.intersect(ui.clip_rect()));
-        let scroll = egui::ScrollArea::vertical()
-            .id_salt(("ai-messages", photo.0))
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .max_height(messages.height())
-            .min_scrolled_height(0.0)
-            .show(&mut messages_ui, |ui| {
-                if let Some(conversation) = app.ai.conversations.get(&photo) {
-                    ui.label(display_text(conversation));
-                } else if !app.ai.text.is_empty() {
-                    ui.label(&app.ai.text);
-                }
-            });
-        crate::widgets::register(ui.ctx(), "ai:messages", scroll.inner_rect);
+        footer.set_clip_rect(footer_rect.intersect(ui.clip_rect()));
+        if compact {
+            // Supported short/floating/stacked Tools panes scroll their compact body.
+            // Stop and consent precede the draft; full-size panes retain a fixed footer.
+            egui::ScrollArea::vertical()
+                .id_salt(("ai-compact-composer", photo.0, app.ai.jobs.contains_key(&photo)))
+                .auto_shrink([false, false])
+                .min_scrolled_height(0.0)
+                .max_height(height)
+                .show(&mut footer, |ui| {
+                    composer(app, ui, photo, true);
+                    ui.separator();
+                    message_area(app, ui, photo, 160.0);
+                });
+        } else {
+            composer(app, &mut footer, photo, false);
+            let bottom = (footer_rect.top() - 8.0).max(body.top());
+            let messages = egui::Rect::from_min_max(body.min, egui::pos2(body.right(), bottom));
+            let mut messages_ui = ui.new_child(egui::UiBuilder::new().id_salt("ai-message-viewport").max_rect(messages));
+            messages_ui.set_clip_rect(messages.intersect(ui.clip_rect()));
+            message_area(app, &mut messages_ui, photo, messages.height());
+        }
+        composer_widget(ui, "ai:composer", footer_rect);
         ui.advance_cursor_after_rect(body);
     });
 }
+fn message_area(app: &LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
+    let scroll = egui::ScrollArea::vertical()
+        .id_salt(("ai-messages", photo.0))
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .max_height(height)
+        .min_scrolled_height(0.0)
+        .show(ui, |ui| {
+            if let Some(conversation) = app.ai.conversations.get(&photo) {
+                ui.label(display_text(conversation));
+            } else if !app.ai.text.is_empty() {
+                ui.label(&app.ai.text);
+            }
+        });
+    composer_widget(ui, "ai:messages", scroll.inner_rect);
+}
+
 fn phase_text(phase: &str) -> &'static str {
     match phase {
         "submitting" => "Submitting…",
@@ -1397,12 +1424,13 @@ fn phase_text(phase: &str) -> &'static str {
 }
 
 fn composer_widget(ui: &egui::Ui, id: &str, rect: egui::Rect) {
-    if !ui.is_sizing_pass() {
-        crate::widgets::register(ui.ctx(), id, rect);
+    let visible = rect.intersect(ui.clip_rect());
+    if !ui.is_sizing_pass() && visible.is_positive() {
+        crate::widgets::register(ui.ctx(), id, visible);
     }
 }
 
-fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
+fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact: bool) {
     let sizing = ui.is_sizing_pass();
     let busy = app.ai.jobs.contains_key(&photo);
     let worker = app.ai.worker_busy(photo);
@@ -1431,6 +1459,9 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
         }
     });
     composer_widget(ui, "ai:stage", stage.response.rect);
+    if compact {
+        consent_control(app, ui, photo);
+    }
     if app.session.companion_task_photo() == Some(photo) {
         ui.label(tr("Manual editing is paused while AI processes this photo; stop it or wait for completion."));
     }
@@ -1450,15 +1481,8 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
         },
     );
     composer_widget(ui, "field:aiPrompt", input.inner_rect);
-    let mut consent = app.ai.consent;
-    let checkbox = ui.checkbox(&mut consent, tr("Allow compressed previews to be sent to the cloud model"));
-    composer_widget(ui, "checkbox:aiConsent", checkbox.rect);
-    if !sizing && checkbox.changed() {
-        if let Err(error) = app.ai.set_consent(consent) {
-            app.ai.text = error.clone();
-            app.ai.conversations.entry(photo).or_default().notice = error;
-        }
-        app.ai.defer_local_saves_for_feedback(ui.ctx());
+    if !compact {
+        consent_control(app, ui, photo);
     }
     if !busy {
         let admission = app.ai.admission(app, None);
@@ -1488,5 +1512,21 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
                 }
             }
         });
+    }
+}
+
+fn consent_control(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
+    let sizing = ui.is_sizing_pass();
+    let mut consent = app.ai.consent;
+    let checkbox = ui
+        .checkbox(&mut consent, tr("Allow compressed previews to be sent to the cloud model"))
+        .on_hover_text(tr("Allow compressed previews to be sent to the cloud model"));
+    composer_widget(ui, "checkbox:aiConsent", checkbox.rect);
+    if !sizing && checkbox.changed() {
+        if let Err(error) = app.ai.set_consent(consent) {
+            app.ai.text = error.clone();
+            app.ai.conversations.entry(photo).or_default().notice = error;
+        }
+        app.ai.defer_local_saves_for_feedback(ui.ctx());
     }
 }
