@@ -183,6 +183,56 @@ fn history_folder_ancestry_rejects_a_task_added_after_the_original_op() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn chained_folder_aliases_reject_forward_and_history_without_effects() {
+    for mode in ["forward", "undo", "redo"] {
+        for relative in [false, true] {
+            let root = root();
+            let old = root.join("old");
+            let moved = root.join("moved");
+            let outside = root.join("outside");
+            std::fs::create_dir(&old).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(old.join("b.png"), b"B source").unwrap();
+            std::fs::write(outside.join("a.png"), b"A source").unwrap();
+            let mut s = Session::with_demo();
+            let a = s.active().unwrap();
+            let b = s.catalog.photos().find(|p| p.id != a).unwrap().id;
+            set_source(&mut s, b, &old.join("b.png"));
+            if mode != "forward" {
+                crate::cmd::browse::move_folder(&mut s, &old.to_string_lossy(), &moved.to_string_lossy()).unwrap();
+            }
+            if mode == "redo" {
+                s.undo_step().unwrap();
+            }
+            let current = if mode == "undo" { &moved } else { &old };
+            let link_target = if relative { PathBuf::from("../outside") } else { outside.clone() };
+            std::os::unix::fs::symlink(link_target, current.join("link")).unwrap();
+            let task = root.join("task.png");
+            let task_target = if relative { current.strip_prefix(&root).unwrap().join("link/a.png") } else { current.join("link/a.png") };
+            std::os::unix::fs::symlink(task_target, &task).unwrap();
+            set_source(&mut s, a, &task);
+            let _lease = s.acquire_companion_lease(a, LocalRoundId::new().unwrap()).unwrap();
+            s.selection = Selection::single(b);
+            s.begin_interaction("independent B gesture").unwrap();
+            assert_eq!(std::fs::read(&task).unwrap(), b"A source");
+            if mode == "forward" {
+                let before_state = state(&s);
+                let before_files = files(&root);
+                let result = crate::cmd::browse::move_folder(&mut s, &old.to_string_lossy(), &moved.to_string_lossy());
+                assert_eq!(state(&s), before_state, "forward rejection must preserve all session state: {result:?}");
+                assert_eq!(files(&root), before_files, "forward rejection must preserve physical traversal entries: {result:?}");
+                assert!(result.unwrap_err().to_string().contains("Manual editing is paused"));
+            } else {
+                assert_rejected_without_effects(&mut s, &root, mode == "redo");
+            }
+            assert_eq!(std::fs::read(&task).unwrap(), b"A source");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
 fn repair(from: PathBuf, to: PathBuf) -> SidecarMove {
     SidecarMove {
         companions: vec![RetainedPacket { version: Some(RealFs.packet_version(&from).unwrap()), path: from.clone() }],
@@ -316,4 +366,20 @@ fn independent_file_and_folder_history_remains_available() {
         assert_eq!(std::fs::read(target.join("a.png")).unwrap(), b"A source");
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn folder_traversal_cycles_are_bounded_without_locking_independent_entries() {
+    let root = root();
+    let folder = root.join("independent");
+    std::fs::create_dir(&folder).unwrap();
+    std::os::unix::fs::symlink("cycle-b", root.join("cycle-a")).unwrap();
+    std::os::unix::fs::symlink("cycle-a", root.join("cycle-b")).unwrap();
+    assert!(!folder_affects_path(&folder, &root.join("cycle-a/task.png")));
+    // An expanding cycle does not repeat a spelling: the depth bound must also
+    // stop it, independently of the visited-path set.
+    std::os::unix::fs::symlink("expanding/again", root.join("expanding")).unwrap();
+    assert!(!folder_affects_path(&folder, &root.join("expanding/task.png")));
+    std::fs::remove_dir_all(root).unwrap();
 }

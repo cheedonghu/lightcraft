@@ -510,23 +510,30 @@ fn same_path(fs: &dyn MoveFs, a: &Path, b: &Path) -> bool {
 fn folder_affects_path(folder: &Path, source: &Path) -> bool {
     let folder_is_link = std::fs::symlink_metadata(folder).is_ok_and(|metadata| metadata.file_type().is_symlink());
     let resolved_folder = resolved_path(folder);
-    for ancestor in source.ancestors() {
-        let mut cursor = ancestor.to_path_buf();
-        let mut seen = HashSet::new();
-        for _ in 0..64 {
-            if !seen.insert(cursor.clone()) {
-                break;
-            }
-            if folder_is_link {
-                if cursor.ancestors().any(|part| same_entry(part, folder)) {
-                    return true;
-                }
-            } else if resolved_path(&cursor).starts_with(&resolved_folder) {
+    let mut cursor = source.to_path_buf();
+    let mut seen = HashSet::new();
+    // Walk in native component order. Inspect every traversal entry before
+    // canonicalization can erase it, then restart at each followed link target.
+    for _ in 0..64 {
+        if !seen.insert(cursor.clone()) {
+            break;
+        }
+        let ancestors: Vec<_> = cursor.ancestors().collect();
+        let mut next = None;
+        for ancestor in ancestors.into_iter().rev() {
+            if same_entry(ancestor, folder) || (!folder_is_link && resolved_path(ancestor).starts_with(&resolved_folder)) {
                 return true;
             }
-            let Ok(target) = std::fs::read_link(&cursor) else { break };
-            cursor = if target.is_absolute() { target } else { cursor.parent().unwrap_or_else(|| Path::new("")).join(target) };
+            if let Ok(target) = std::fs::read_link(ancestor) {
+                let target = if target.is_absolute() { target } else { ancestor.parent().unwrap_or_else(|| Path::new("")).join(target) };
+                // Carry the remaining components through directory links;
+                // their target ancestors may contain further traversal links.
+                next = cursor.strip_prefix(ancestor).ok().map(|suffix| target.join(suffix));
+                break;
+            }
         }
+        let Some(target) = next else { break };
+        cursor = target;
     }
     false
 }
