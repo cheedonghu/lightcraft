@@ -2,6 +2,7 @@
 pub(crate) mod archive;
 mod identity;
 mod mutation_guard;
+pub mod storage;
 pub use identity::{LocalRoundId, PhotoScope, RoundIdentity};
 pub use mutation_guard::LeaseToken;
 pub(crate) use mutation_guard::MutationGuard;
