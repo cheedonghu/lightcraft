@@ -17,6 +17,8 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "ai_companion/library_tests.rs"]
 mod library_tests;
+#[cfg(test)]
+mod native_history_tests;
 mod network;
 mod paging;
 #[cfg(test)]
@@ -403,12 +405,14 @@ impl State {
             }
             return Err(error);
         }
-        if let Some(reader) = reader
-            && let Err(error) =
-                self.begin_history(reader, identity.clone(), history_tail, self.jobs.get(&photo).ok_or("AI 轮次不存在。")?.cancel.clone())
-        {
-            self.fail_one(app, photo, &error);
-            return Err(error);
+        if let Some(reader) = reader {
+            let job = self.jobs.get(&photo).ok_or("AI 轮次不存在。")?;
+            // This owned envelope belongs to the leased submission, not later drafts.
+            let (prompt, original, cancel) = (job.prompt.clone(), job.checkpoint.original.clone(), job.cancel.clone());
+            if let Err(error) = self.begin_history(reader, identity.clone(), history_tail, prompt, original, cancel) {
+                self.fail_one(app, photo, &error);
+                return Err(error);
+            }
         }
         Ok(json!({"started":true,"photo":photo.0,"localRoundId":identity.local_round_id}))
     }

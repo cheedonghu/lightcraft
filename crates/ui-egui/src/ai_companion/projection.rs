@@ -22,7 +22,18 @@ impl HistoryProjection {
     pub(super) fn new(photo: PhotoId) -> Self {
         Self { photo, messages: Vec::new(), pending: BTreeSet::new(), used: BTreeSet::new(), text: 0, images: 0, bytes: 0 }
     }
-    pub(super) fn push(&mut self, source: &Value, mut attachment: impl FnMut(&Value) -> Result<Vec<u8>, String>) -> Result<(), String> {
+    pub(super) fn push(&mut self, source: &Value, attachment: impl FnMut(&Value) -> Result<Vec<u8>, String>) -> Result<(), String> {
+        self.push_cancellable(source, attachment, || false)
+    }
+    pub(super) fn push_cancellable(
+        &mut self,
+        source: &Value,
+        mut attachment: impl FnMut(&Value) -> Result<Vec<u8>, String>,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        if cancelled() {
+            return Err("cancelled".into());
+        }
         let object = source.as_object().ok_or_else(invalid)?;
         if let Some(complete) = object.get("complete_state") {
             match complete.as_str() {
@@ -97,6 +108,9 @@ impl HistoryProjection {
             let mut pictures = Vec::new();
             let mut picture_bytes = 0usize;
             for image in images {
+                if cancelled() {
+                    return Err("cancelled".into());
+                }
                 let mime = image.get("mime_type").and_then(Value::as_str).ok_or_else(invalid)?;
                 if !matches!(mime, "image/jpeg" | "image/png") {
                     return Err(invalid());
@@ -138,6 +152,9 @@ impl HistoryProjection {
                 } else {
                     return Err(invalid());
                 };
+                if cancelled() {
+                    return Err("cancelled".into());
+                }
                 if data.is_empty() || data.len() > MAX_IMAGE {
                     return Err(limit());
                 }
