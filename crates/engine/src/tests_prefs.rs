@@ -365,3 +365,61 @@ fn modification_badges_follow_source_reset_copy_filters_and_history() {
     }
     let _ = std::fs::remove_dir_all(&src);
 }
+
+#[test]
+fn migrated_custom_import_white_balance_returns_to_the_logical_default_look() {
+    use lightcraft_catalog::{MediaKind, Op, Photo, PhotoId, Source};
+    use lightcraft_develop::{DevelopSettings, WbMode, WbScale};
+    let mut s = Session::new();
+    let id = PhotoId(101);
+    let mut p = Photo::new(id, Source::File { path: "/photos/legacy.ARW".into() }, "legacy.ARW", "ARW", 64, 64, "");
+    p.kind = MediaKind::Raw;
+    p.meta.camera = "SONY ILCE-7M3".into();
+    p.as_shot_wb = Some((4986.0, -2.0));
+    let mut baseline = DevelopSettings::for_raw(6500.0, 0.0);
+    baseline.wb.mode = WbMode::Custom;
+    p.import_look = Some(Arc::new(baseline.clone()));
+    p.develop = Arc::new(baseline.clone());
+    s.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+    s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    let check = |s: &mut Session, edited: bool| {
+        assert_eq!(s.catalog.photo(id).unwrap().is_edited(), edited);
+        for filter in
+            [json!({"edited": true}), json!({"text": "edited:yes"}), json!({"ruleSet": {"rules": [{"field": "edited", "op": "is", "value": true}]}})]
+        {
+            assert_eq!(s.execute("catalog.query", &json!({"filter": filter})).unwrap()["total"], if edited { 1 } else { 0 });
+        }
+    };
+    check(&mut s, false);
+    // An ordinary control write migrates the stored relative WB to the camera's current Kelvin scale.
+    s.execute("develop.set", &json!({"values": {"wb.temp": 4986.0, "wb.tint": -2.0}})).unwrap();
+    let wb = s.catalog.photo(id).unwrap().develop.wb;
+    assert_eq!((wb.mode, wb.temp, wb.tint, wb.scale), (WbMode::Custom, 4986.0, -2.0, WbScale::Kelvin));
+    check(&mut s, false);
+    s.execute("develop.set", &json!({"control": "wb.temp", "value": 5100.0})).unwrap();
+    check(&mut s, true);
+    s.execute("develop.set", &json!({"control": "wb.temp", "value": 4986.0})).unwrap();
+    check(&mut s, false);
+    // A non-neutral Legacy default uses exactly the same conversion as the renderer.
+    baseline.wb.temp = 5800.0;
+    baseline.wb.tint = 3.0;
+    let mut p = (**s.catalog.photo(id).unwrap()).clone();
+    p.import_look = Some(Arc::new(baseline.clone()));
+    p.develop = Arc::new(baseline.clone());
+    s.catalog.apply(Op::RemovePhoto { id }).unwrap();
+    s.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+    let reference = s.source_info(id);
+    let effective = lightcraft_pipeline::local::effective_wb(&reference, &baseline);
+    s.execute("develop.set", &json!({"values": {"wb.temp": effective.0, "wb.tint": effective.1}})).unwrap();
+    check(&mut s, false);
+    s.execute("develop.set", &json!({"control": "wb.tint", "value": effective.1 + 1.0})).unwrap();
+    check(&mut s, true);
+    s.execute("develop.reset", &json!({})).unwrap();
+    check(&mut s, false);
+    assert_eq!(s.catalog.photo(id).unwrap().develop.wb, baseline.wb, "Reset preserves the intentional Custom import WB");
+    // A system representation conversion (no actual parameter change) is neutral too.
+    let mut converted = baseline;
+    lightcraft_pipeline::local::normalize_wb(&mut converted, &reference);
+    s.set_develop(id, converted, "system WB conversion").unwrap();
+    check(&mut s, false);
+}

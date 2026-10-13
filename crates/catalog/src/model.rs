@@ -471,8 +471,16 @@ impl Photo {
         let mut defaults = self.reset_defaults(None);
         // A process upgrade is a system rendering choice, not a logical parameter edit.
         defaults.process = self.develop.process;
-        // As Shot reads the source's current WB; stored numbers can predate a decoder update.
-        if self.develop.wb.mode == WbMode::AsShot && defaults.wb.mode == WbMode::AsShot {
+        let reference = lightcraft_develop::white_balance::WbReference {
+            kelvin: self.develops_raw() && !self.relative_wb(),
+            legacy_relative: self.fitted_look(),
+            as_shot: self.as_shot_wb.unwrap_or((5500.0, 0.0)),
+        };
+        // AsShot reads the source's current reference. Custom values keep their differences, but
+        // converting an old relative default look to its equivalent Kelvin values is not an edit.
+        if (self.develop.wb.mode == WbMode::AsShot && defaults.wb.mode == WbMode::AsShot)
+            || self.develop.wb.normalized(reference) == defaults.wb.normalized(reference)
+        {
             defaults.wb = self.develop.wb;
         }
         *self.develop != defaults
