@@ -202,6 +202,7 @@ impl State {
         photo: PhotoId,
         cursor: lightcraft_engine::companion::storage::HistoryCursor,
     ) -> Result<(), String> {
+        self.bottom_reading.remove(&photo);
         self.ensure_editor(app, photo)?;
         let prefix = self.conversations.get(&photo).and_then(|c| c.prefix.as_ref());
         let epoch = prefix.map(|h| h.conversation_epoch);
@@ -211,6 +212,7 @@ impl State {
             editor.data.reading_epoch = epoch;
             editor.data.reading_count = count;
             editor.data.follow_tail = false;
+            editor.data.scroll_offset = 0.0;
             editor.restore_scroll = true;
             if editor.known_draft {
                 app.session.set_companion_editor(photo, editor.data.clone()).map_err(|e| e.to_string())?;
@@ -236,5 +238,26 @@ impl State {
                 self.text = error.to_string();
             }
         }
+    }
+}
+
+impl State {
+    pub(super) fn ensure_bottom(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
+        self.ensure_editor(app, photo)?;
+        let header = self.conversations.get(&photo).and_then(|c| c.prefix.clone());
+        if let Some(header) = header {
+            let cursor = lightcraft_engine::companion::storage::HistoryCursor { record: header.message_count.saturating_sub(1), offset: 0 };
+            self.navigate_page(app, photo, cursor)?;
+            self.bottom_reading.insert(photo);
+            self.request_page(app, photo, cursor)?;
+        }
+        if let Some(editor) = self.editors.get_mut(&photo) {
+            editor.data.follow_tail = true;
+            editor.restore_scroll = true;
+            if editor.known_draft {
+                app.session.set_companion_editor(photo, editor.data.clone()).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 }

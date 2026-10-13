@@ -273,6 +273,10 @@ impl Fields {
                                 matches!(
                                     self.name.as_str(),
                                     "local_round_id"
+                                        | "role"
+                                        | "display_kind"
+                                        | "local_message_id"
+                                        | "images"
                                         | "photo_id"
                                         | "local_terminal"
                                         | "trace_id"

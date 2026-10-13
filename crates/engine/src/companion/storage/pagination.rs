@@ -1034,7 +1034,7 @@ impl Session {
         rounds_display(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, cursor, count)
     }
 }
-fn message_round_id(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Option<String>> {
+fn message_display(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Value> {
     let entry = entry(store, header.photo_id, header.message_root.as_ref(), header.message_count, index)?;
     let source = RecordReader {
         store,
@@ -1053,9 +1053,16 @@ fn message_round_id(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> 
     if id.is_some_and(|id| id.is_empty() || id.len() > 128) {
         return Err(error("invalid local round identity"));
     }
-    Ok(id.map(str::to_owned))
+    Ok(owner)
+}
+fn message_round_id(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Option<String>> {
+    Ok(message_display(store, header, index)?["local_round_id"].as_str().map(str::to_owned))
 }
 impl HistoryReader {
+    /// Bounded selected presentation fields, verified against the complete captured record digest.
+    pub fn message_display(&mut self, index: u64) -> Result<Value> {
+        message_display(self.store.as_mut(), &self.header, index)
+    }
     pub fn message_round_id(&mut self, index: u64) -> Result<Option<String>> {
         message_round_id(self.store.as_mut(), &self.header, index)
     }
