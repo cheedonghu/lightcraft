@@ -22,7 +22,7 @@ mod persistence_tests;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::i18n::tr;
 use base64ct::{Base64, Encoding};
@@ -46,6 +46,9 @@ pub struct State {
     #[cfg(test)]
     next_connection: Option<network::Connection>,
     conversations: BTreeMap<PhotoId, Conversation>,
+    pending_local_saves: BTreeSet<PhotoId>,
+    local_save_retry_at: Option<Instant>,
+    local_save_after_frame: Option<u64>,
     jobs: BTreeMap<PhotoId, Job>,
     workers: BTreeMap<PhotoId, Arc<AtomicBool>>,
     tx: mpsc::SyncSender<WorkerMessage>,
@@ -66,6 +69,9 @@ impl Default for State {
             #[cfg(test)]
             next_connection: None,
             conversations: BTreeMap::new(),
+            pending_local_saves: BTreeSet::new(),
+            local_save_retry_at: None,
+            local_save_after_frame: None,
             jobs: BTreeMap::new(),
             workers: BTreeMap::new(),
             tx,
@@ -148,6 +154,7 @@ impl State {
         self.consent = consent;
         if !consent {
             let photos: Vec<_> = self.jobs.keys().copied().collect();
+            self.pending_local_saves.extend(photos.iter().copied());
             let mut error = None;
             for photo in photos {
                 if let Err(e) = self.stop(photo) {
@@ -159,6 +166,24 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    fn defer_local_saves_for_feedback(&mut self, ctx: &egui::Context) {
+        self.local_save_after_frame = Some(ctx.cumulative_frame_nr());
+    }
+
+    fn flush_local_saves(&mut self, app: &mut LightcraftApp) -> Result<(), String> {
+        let photos: Vec<_> = self.pending_local_saves.iter().copied().collect();
+        let mut error = None;
+        for photo in photos {
+            if let Err(e) = self.save(app, photo) {
+                error.get_or_insert(e);
+            }
+        }
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub fn is_busy(&self, photo: PhotoId) -> bool {
@@ -306,7 +331,7 @@ impl State {
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
         conversation.records.push(json!({"local_round_id":identity.local_round_id,"photo_id":photo.0,"request_text":prompt,"submission_seq":identity.submission_seq,"connection_generation":identity.connection_generation,"runtime_library_generation":identity.scope.library_generation,"original":self.jobs.get(&photo).map(|j| &j.checkpoint.original),"stages":[],"phase":"submitting"}));
         conversation.messages.push(json!({"role":"user","text":prompt,"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request"}));
-        conversation.notice = "正在提交…".into();
+        conversation.notice = tr("Submitting…").into();
         self.save(app, photo)?;
         Ok(json!({"started":true,"photo":photo.0,"localRoundId":identity.local_round_id}))
     }
@@ -355,11 +380,11 @@ impl State {
             if let Some(conversation) = self.conversations.get_mut(&photo) {
                 conversation.pending.clear();
                 close_pending_tools(&mut conversation.messages);
-                conversation.notice = "已停止生成，正在确认取消提交。".into();
+                conversation.notice = tr("Generation stopped; confirming submission cancellation…").into();
             }
             return Ok(Value::Null);
         }
-        self.finish(photo, "已停止生成，保留最近一次完整结果。");
+        self.finish(photo, tr("Generation stopped; keeping the latest complete result."));
         Ok(Value::Null)
     }
     fn finish(&mut self, photo: PhotoId, notice: &str) {
@@ -426,7 +451,7 @@ impl State {
                 if self.send(format!("/v1/rounds/{round}/stop"), json!({"reason":"user_stop"}), 0, round.into()).is_err() {
                     self.connection = None;
                 }
-                self.finish(photo, "已停止生成，保留最近一次完整结果。");
+                self.finish(photo, tr("Generation stopped; keeping the latest complete result."));
                 self.save(app, photo)?;
                 return Ok(());
             }
@@ -452,6 +477,10 @@ impl State {
                 let state = payload.get("state").and_then(Value::as_str).ok_or("AI 状态无效。")?.to_owned();
                 let job = self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?;
                 let old = std::mem::replace(&mut job.state, state.clone());
+                if let Some(conversation) = self.conversations.get_mut(&photo) {
+                    conversation.notice = tr(phase_text(&state)).into();
+                }
+
                 if let Some(record) = self
                     .conversations
                     .get_mut(&photo)
@@ -824,6 +853,9 @@ impl State {
             }
             self.connection = None;
             self.conversations.clear();
+            self.pending_local_saves.clear();
+            self.local_save_retry_at = None;
+            self.local_save_after_frame = None;
             self.generation = generation;
         }
         self.workers.retain(|_, alive| alive.load(Ordering::Relaxed));
@@ -972,6 +1004,27 @@ impl State {
             }
             let _ = self.save(app, photo);
         }
+        if !self.pending_local_saves.is_empty() {
+            let ready = self.local_save_retry_at.is_none_or(|at| Instant::now() >= at)
+                && self.local_save_after_frame.is_none_or(|frame| ctx.cumulative_frame_nr() > frame);
+            if ready {
+                if let Err(error) = self.flush_local_saves(app) {
+                    self.text = error.clone();
+                    for photo in &self.pending_local_saves {
+                        if let Some(conversation) = self.conversations.get_mut(photo) {
+                            conversation.notice = error.clone();
+                        }
+                    }
+                    self.local_save_retry_at = Instant::now().checked_add(Duration::from_secs(1));
+                } else {
+                    self.local_save_retry_at = None;
+                    self.local_save_after_frame = None;
+                }
+            }
+            if !self.pending_local_saves.is_empty() {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
+        }
         if !self.jobs.is_empty() || !self.workers.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -1102,6 +1155,7 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
 pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
     let mut state = std::mem::take(&mut app.ai);
     let result = (|| {
+        state.flush_local_saves(app)?;
         let photos: Vec<_> = state.jobs.keys().copied().collect();
         for photo in photos {
             // Close unfinished tool messages while the old library still owns them.
@@ -1129,6 +1183,9 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         }
         state.connection = None;
         state.conversations.clear();
+        state.pending_local_saves.clear();
+        state.local_save_retry_at = None;
+        state.local_save_after_frame = None;
         state.generation = app.session.library_generation();
     }
     let photo = params.get("photo").and_then(Value::as_u64).map(PhotoId).or_else(|| app.session.active());
@@ -1153,8 +1210,13 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             explicit.and_then(|p| state.start_for(app, p))
         }
         "ai.stop" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
+            if state.jobs.contains_key(&p) {
+                state.pending_local_saves.insert(p);
+                if let Some(ctx) = &app.tasks.repaint {
+                    state.defer_local_saves_for_feedback(ctx);
+                }
+            }
             state.stop(p)?;
-            state.save(app, p)?;
             Ok(Value::Null)
         }),
         "ai.status" => {
@@ -1274,7 +1336,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 let close = ui.button(tr("Collapse"));
                 crate::widgets::register(ui.ctx(), "button:aiCollapse", close.rect);
                 if close.clicked() {
-                    let _ = app.run("panel.close", json!({}));
+                    let _ = app.run("panel.ai", json!({}));
                 }
             });
         });
@@ -1292,14 +1354,14 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             ui.label(tr("Understand and naturally optimize your photo. Originals stay on this computer."));
         }
         let body = ui.available_rect_before_wrap();
-        // Retain the measured footer height between frames. The content is rendered
-        // once, so sizing never dispatches a second click or consent transition.
-        let height_key = ui.id().with(("ai-composer-height", photo.0));
-        let height = ui.ctx().data(|data| data.get_temp::<f32>(height_key)).unwrap_or(250.0).min(body.height());
+        // Measure with a disabled, invisible UI and independent widget IDs. This pass
+        // cannot dispatch actions, touch a draft or register control targets.
+        let mut measure = ui.new_child(egui::UiBuilder::new().id_salt("ai-composer-measure").max_rect(body).sizing_pass().invisible());
+        composer(app, &mut measure, photo);
+        let height = measure.min_rect().height().min(body.height());
         let footer_rect = egui::Rect::from_min_max(egui::pos2(body.left(), body.bottom() - height), body.max);
         let mut footer = ui.new_child(egui::UiBuilder::new().id_salt("ai-composer").max_rect(footer_rect));
         composer(app, &mut footer, photo);
-        ui.ctx().data_mut(|data| data.insert_temp(height_key, footer.min_rect().height()));
         let bottom = (footer_rect.top() - 8.0).max(body.top());
         let messages = egui::Rect::from_min_max(body.min, egui::pos2(body.right(), bottom));
         let mut messages_ui = ui.new_child(egui::UiBuilder::new().id_salt("ai-message-viewport").max_rect(messages));
@@ -1321,19 +1383,46 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         ui.advance_cursor_after_rect(body);
     });
 }
+fn phase_text(phase: &str) -> &'static str {
+    match phase {
+        "submitting" => "Submitting…",
+        "queued" => "Waiting in the queue…",
+        "awaiting_input" => "Uploading photo context…",
+        "analyzing_initial" => "AI is analyzing the photo…",
+        "awaiting_initial_execution" => "Applying the edit plan…",
+        "analyzing_review" => "AI is reviewing the result…",
+        "awaiting_correction_execution" => "Applying the correction…",
+        _ => "Processing this photo…",
+    }
+}
+
+fn composer_widget(ui: &egui::Ui, id: &str, rect: egui::Rect) {
+    if !ui.is_sizing_pass() {
+        crate::widgets::register(ui.ctx(), id, rect);
+    }
+}
+
 fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
+    let sizing = ui.is_sizing_pass();
     let busy = app.ai.jobs.contains_key(&photo);
     let worker = app.ai.worker_busy(photo);
     let stage = ui.horizontal_wrapped(|ui| {
         if busy {
             ui.spinner();
-            ui.label(tr("Processing this photo…"));
+            let phase = app
+                .ai
+                .jobs
+                .get(&photo)
+                .map(|job| if job.stopped { "Stopping generation…" } else { phase_text(&job.state) })
+                .unwrap_or("Processing this photo…");
+            ui.label(tr(phase));
             let stop = ui.button(tr("Stop Generating"));
-            crate::widgets::register(ui.ctx(), "button:aiStop", stop.rect);
-            if stop.clicked()
-                && let Err(error) = app.run("ai.stop", json!({}))
-            {
-                app.ai.text = error;
+            composer_widget(ui, "button:aiStop", stop.rect);
+            if !sizing && stop.clicked() {
+                app.ai.defer_local_saves_for_feedback(ui.ctx());
+                if let Err(error) = app.run("ai.stop", json!({})) {
+                    app.ai.text = error;
+                }
             }
         } else if worker {
             ui.label(tr("Finishing processing for this photo…"));
@@ -1341,25 +1430,35 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
             ui.label(tr("Ready for your request"));
         }
     });
-    crate::widgets::register(ui.ctx(), "ai:stage", stage.response.rect);
+    composer_widget(ui, "ai:stage", stage.response.rect);
     if app.session.companion_task_photo() == Some(photo) {
         ui.label(tr("Manual editing is paused while AI processes this photo; stop it or wait for completion."));
     }
-    let input = ui.add_enabled(
-        !busy,
-        egui::TextEdit::multiline(&mut app.ai.prompt)
-            .desired_width(f32::INFINITY)
-            .desired_rows(2)
-            .hint_text(tr("For example: review this photo, then naturally optimize it")),
+    // The draft viewport is fixed, so measuring needs no copy of user text.
+    let mut measured_prompt = String::new();
+    let prompt = if sizing { &mut measured_prompt } else { &mut app.ai.prompt };
+    let input = egui::ScrollArea::vertical().id_salt("ai-prompt-scroll").min_scrolled_height(48.0).max_height(48.0).auto_shrink([false, false]).show(
+        ui,
+        |ui| {
+            ui.add_enabled(
+                !busy,
+                egui::TextEdit::multiline(prompt)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(2)
+                    .hint_text(tr("For example: review this photo, then naturally optimize it")),
+            )
+        },
     );
-    crate::widgets::register(ui.ctx(), "field:aiPrompt", input.rect);
+    composer_widget(ui, "field:aiPrompt", input.inner_rect);
     let mut consent = app.ai.consent;
     let checkbox = ui.checkbox(&mut consent, tr("Allow compressed previews to be sent to the cloud model"));
-    crate::widgets::register(ui.ctx(), "checkbox:aiConsent", checkbox.rect);
-    if checkbox.changed()
-        && let Err(error) = app.ai.set_consent(consent)
-    {
-        app.ai.text = error;
+    composer_widget(ui, "checkbox:aiConsent", checkbox.rect);
+    if !sizing && checkbox.changed() {
+        app.ai.defer_local_saves_for_feedback(ui.ctx());
+        if let Err(error) = app.ai.set_consent(consent) {
+            app.ai.text = error.clone();
+            app.ai.conversations.entry(photo).or_default().notice = error;
+        }
     }
     if !busy {
         let admission = app.ai.admission(app, None);
@@ -1367,8 +1466,9 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
             ui.label(message);
         }
         let start = ui.add_enabled(admission.is_ok(), egui::Button::new(tr("Analyze and Optimize")));
-        crate::widgets::register(ui.ctx(), "button:aiStart", start.rect);
-        if start.clicked()
+        composer_widget(ui, "button:aiStart", start.rect);
+        if !sizing
+            && start.clicked()
             && let Err(error) = app.run("ai.start", json!({}))
         {
             app.ai.text = error.clone();
@@ -1379,8 +1479,9 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
                 [(tr("Undo AI Round"), "button:aiUndo", "ai.undo"), (tr("Delete Conversation"), "button:aiClear", "ai.clear")]
             {
                 let button = ui.add_enabled(!worker, egui::Button::new(label));
-                crate::widgets::register(ui.ctx(), widget, button.rect);
-                if button.clicked()
+                composer_widget(ui, widget, button.rect);
+                if !sizing
+                    && button.clicked()
                     && let Err(error) = app.run(command, json!({}))
                 {
                     app.ai.conversations.entry(photo).or_default().notice = error;

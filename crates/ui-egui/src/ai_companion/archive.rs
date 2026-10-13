@@ -91,6 +91,7 @@ impl State {
         }
         // Normal journal persistence, independent of the already visible execution result.
         app.session.persist_if_dirty();
+        self.pending_local_saves.remove(&photo);
         Ok(())
     }
     pub(super) fn history(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<Vec<Value>, String> {
