@@ -55,6 +55,10 @@ pub(super) fn entry(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRo
             {
                 return Err(error("invalid record bounds"));
             }
+            let payload = record.chunk_payload.unwrap_or(BLOCK);
+            if payload == 0 || payload > BLOCK || (record.chunk_payload.is_some() && payload != BLOCK - 32) {
+                return Err(error("invalid chunk layout"));
+            }
             return Ok(record);
         }
         if let Some(jump) = index.jumps.iter().rev().find(|j| j.upper > cursor && j.upper < index.start) {
@@ -871,4 +875,94 @@ fn complete_escape_prefix(bytes: &[u8]) -> usize {
         }
     }
     cursor
+}
+
+mod projection;
+mod scan;
+pub use scan::{DisplayRecord, DisplayScan};
+fn display_record(store: &mut dyn Store, photo: PhotoId, entry: &Entry) -> Result<Value> {
+    if entry.length <= 256 * 1024 {
+        let bytes = range(store, photo, entry, 0, entry.length)?;
+        if digest(&bytes) != entry.digest {
+            return Err(error("round digest mismatch"));
+        }
+        return serde_json::from_slice(&bytes).map_err(error);
+    }
+    let source = RecordReader { store, photo, entry, offset: 0, hash: lightcraft_preview::Hasher128::new(), cached: Vec::new(), cached_start: 0 };
+    let (record, source) = projection::read(source)?;
+    if source.offset != entry.length as u64 || source.hash.finish().to_string() != entry.digest {
+        return Err(error("round digest mismatch"));
+    }
+    if serialized_length(&record)? > 1024 * 1024 {
+        return Err(error("round display exceeds view budget; local history retained"));
+    }
+    Ok(record)
+}
+fn rounds_display(store: &mut dyn Store, header: &PhotoHeader, cursor: u64, count: usize) -> Result<RecordPage> {
+    if count == 0 || count > 32 {
+        return Err(error("round display page must contain 1..32 records"));
+    }
+    let (root, total) =
+        if header.record_count > 0 { (header.record_root.as_ref(), header.record_count) } else { (header.round_root.as_ref(), header.round_count) };
+    let end = cursor.saturating_add(count as u64).min(total);
+    let mut records = Vec::new();
+    let mut bytes = 0;
+    let mut next = cursor;
+    for index in cursor..end {
+        let e = entry(store, header.photo_id, root, total, index)?;
+        let record = display_record(store, header.photo_id, &e)?;
+        let size = serialized_length(&record)?;
+        if bytes + size > 1024 * 1024 && !records.is_empty() {
+            break;
+        }
+        if size > 1024 * 1024 {
+            return Err(error("round display exceeds view budget; local history retained"));
+        }
+        bytes += size;
+        records.push(record);
+        next = index + 1;
+    }
+    Ok(RecordPage { records, next_cursor: (next < total).then_some(next) })
+}
+impl HistoryReader {
+    /// Captured graph, bounded page. Callers can scan off the frame and cancel between calls.
+    pub fn rounds_display(&mut self, cursor: u64, count: usize) -> Result<RecordPage> {
+        rounds_display(self.store.as_mut(), &self.header, cursor, count)
+    }
+}
+impl Session {
+    pub fn companion_rounds_display_at(&mut self, header: &PhotoHeader, cursor: u64, count: usize) -> Result<RecordPage> {
+        rounds_display(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, cursor, count)
+    }
+}
+fn message_round_id(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Option<String>> {
+    let entry = entry(store, header.photo_id, header.message_root.as_ref(), header.message_count, index)?;
+    let source = RecordReader {
+        store,
+        photo: header.photo_id,
+        entry: &entry,
+        offset: 0,
+        hash: lightcraft_preview::Hasher128::new(),
+        cached: Vec::new(),
+        cached_start: 0,
+    };
+    let (owner, source) = projection::read(source)?;
+    if source.offset != entry.length as u64 || source.hash.finish().to_string() != entry.digest {
+        return Err(error("message owner digest mismatch"));
+    }
+    let id = owner["local_round_id"].as_str();
+    if id.is_some_and(|id| id.is_empty() || id.len() > 128) {
+        return Err(error("invalid local round identity"));
+    }
+    Ok(id.map(str::to_owned))
+}
+impl HistoryReader {
+    pub fn message_round_id(&mut self, index: u64) -> Result<Option<String>> {
+        message_round_id(self.store.as_mut(), &self.header, index)
+    }
+}
+impl Session {
+    pub fn companion_message_round_id_at(&mut self, header: &PhotoHeader, index: u64) -> Result<Option<String>> {
+        message_round_id(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, index)
+    }
 }

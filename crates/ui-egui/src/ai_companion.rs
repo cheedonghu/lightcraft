@@ -6,6 +6,10 @@ mod archive;
 #[cfg(test)]
 #[path = "ai_companion/cancellation_tests.rs"]
 mod cancellation_tests;
+mod card;
+#[cfg(test)]
+#[path = "ai_companion/card_tests.rs"]
+mod card_tests;
 #[cfg(test)]
 #[path = "ai_companion/disconnect_tests.rs"]
 mod disconnect_tests;
@@ -127,6 +131,12 @@ struct HistoryView {
     messages: Vec<Value>,
     fragments: Vec<String>,
     bytes: usize,
+    cards: Vec<card::Card>,
+    cards_bytes: usize,
+    card_cursor: Option<u64>,
+    card_pending: BTreeSet<String>,
+    card_owners: VecDeque<u64>,
+    card_scan: Option<lightcraft_engine::companion::storage::DisplayScan>,
 }
 struct Conversation {
     scope: Option<PhotoScope>,
@@ -767,6 +777,8 @@ impl State {
                 let local_round_id = job.identity.local_round_id.clone();
                 let stage = if job.plans.is_empty() { "initial" } else { "correction" };
                 let before = job.checkpoint.expected.clone();
+                let (display_before, display_target) =
+                    card::capture_pair(&before, candidate.as_ref().unwrap_or(before.as_ref()), &snapshot.context.info);
                 let model_call = self
                     .conversations
                     .get(&photo)
@@ -783,7 +795,7 @@ impl State {
                     self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == local_round_id.as_str()))
                     && let Some(stages) = record.get_mut("stages").and_then(Value::as_array_mut)
                 {
-                    stages.push(json!({"stage":stage,"backend_stage":data.get("stage"),"model_call_id":model_call,"plan_id":plan_id,"tool_call_id":payload.get("tool_call_id"),"reason":payload.get("reason"),"operations":payload.get("operations"),"before_state":before,"proposed_state":candidate.as_ref().ok(),"execution_outcome":if candidate.is_ok() {"not_executed"} else {"validation_failed"}}));
+                    stages.push(json!({"stage":stage,"backend_stage":data.get("stage"),"model_call_id":model_call,"plan_id":plan_id,"tool_call_id":payload.get("tool_call_id"),"reason":payload.get("reason"),"operations":payload.get("operations"),"before_state":before,"display_before":display_before,"display_target":display_target,"proposed_state":candidate.as_ref().ok(),"execution_outcome":if candidate.is_ok() {"not_executed"} else {"validation_failed"}}));
                 }
                 if let Some(id) = payload.get("tool_call_id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                     self.conversations
@@ -1032,11 +1044,17 @@ impl State {
             conversation.checkpoint = Some(checkpoint.clone());
             if let Some(record) = conversation.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()) {
                 record["recent_complete_result"] = json!(settings);
+                record["recent_complete_hash"] = json!(settings.hash64());
                 if let Some(stages) = record.get_mut("stages").and_then(Value::as_array_mut)
                     && let Some(step) = stages.iter_mut().find(|s| s["plan_id"] == plan_id)
                 {
                     step["before_state"] = json!(before);
                     step["applied_state"] = json!(settings);
+                    let (display_before, display_actual) = card::capture_pair(&before, &settings, &snapshot.context.info);
+                    if step.get("display_before").is_none() {
+                        step["display_before"] = display_before;
+                    }
+                    step["display_actual"] = display_actual;
                     step["effective_control_values"] = lightcraft_engine::companion::control_list(&settings, &snapshot.context.info);
                     step["execution_outcome"] = json!("succeeded");
                     step["delivery_state"] = json!("not_sent");
@@ -1686,6 +1704,8 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 })).collect::<Vec<_>>(),
                 "round": photo.and_then(|p| state.jobs.get(&p)).map(|j| j.round.clone()),
                 "text": conversation.map(display_text).unwrap_or_else(|| state.text.clone()),
+                "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().map(|card| { let invalidated=c.checkpoint.as_ref().is_some_and(|p|p.local_round_id.as_deref()==Some(card.local_round_id.as_str()) && !p.eligible); card.for_current(photo.and_then(|p|app.session.develop_of(p)).as_deref(),invalidated) }).chain(c.records.iter().filter_map(|r|card::from_record(r,photo.and_then(|p|app.session.develop_of(p)).as_deref()))).collect::<Vec<_>>()).unwrap_or_default(),
+                "historyLoading": state.paging.busy() || photo.is_some_and(|photo| state.paging.awaiting_page(photo)) || conversation.and_then(|c| c.view.as_ref()).is_some_and(|v|v.card_cursor.is_some()),
                 "activePhotos": state.jobs.keys().map(|p| p.0).collect::<Vec<_>>(),
             }))
         }
@@ -1901,17 +1921,21 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     });
 }
 fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
+    let mut locate = false;
     let controls_top = ui.cursor().top();
     history_controls(app, ui, photo);
     let controls_height = (ui.cursor().top() - controls_top).max(0.0);
     let height = (height - controls_height).max(0.0);
     let expected = app.ai.editors.get(&photo).and_then(|e| e.data.reading_cursor);
-    let ready = app.ai.conversations.get(&photo).is_none_or(|c| {
-        c.prefix.is_none()
-            || c.view
-                .as_ref()
-                .is_some_and(|view| Some(view.cursor) == expected && (view.bytes > 0 || c.prefix.as_ref().is_some_and(|h| h.message_count == 0)))
-    });
+    let ready = !app.ai.paging.awaiting_page(photo)
+        && app.ai.conversations.get(&photo).is_none_or(|c| {
+            c.prefix.is_none()
+                || c.view.as_ref().is_some_and(|view| {
+                    view.card_cursor.is_none()
+                        && Some(view.cursor) == expected
+                        && (view.bytes > 0 || c.prefix.as_ref().is_some_and(|h| h.message_count == 0))
+                })
+        });
     let final_page = app.ai.conversations.get(&photo).is_none_or(|c| c.view.as_ref().is_none_or(|view| view.next.is_none()));
     let editor = app.ai.editors.get_mut(&photo);
     let tail = editor.as_ref().is_none_or(|e| e.data.follow_tail);
@@ -1928,6 +1952,18 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
     let scroll = area.show(ui, |ui| {
         if let Some(conversation) = app.ai.conversations.get(&photo) {
             ui.label(display_text(conversation));
+            for card in conversation.view.iter().flat_map(|v| v.cards.iter()) {
+                let invalidated = conversation
+                    .checkpoint
+                    .as_ref()
+                    .is_some_and(|p| p.local_round_id.as_deref() == Some(card.local_round_id.as_str()) && !p.eligible);
+                locate |= card::show(ui, &card.clone().for_current(app.session.develop_of(photo).as_deref(), invalidated));
+            }
+            for record in &conversation.records {
+                if let Some(card) = card::from_record(record, app.session.develop_of(photo).as_deref()) {
+                    locate |= card::show(ui, &card);
+                }
+            }
         } else if !app.ai.text.is_empty() {
             ui.label(&app.ai.text);
         }
@@ -1936,6 +1972,9 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
     let at_bottom = scroll.state.offset.y + scroll.inner_rect.height() >= scroll.content_size.y - 2.0;
     if ready {
         drafts::scroll_position(app, photo, scroll.state.offset.y, at_bottom && final_page);
+    }
+    if locate {
+        let _ = app.run("panel.activity", json!({}));
     }
 }
 
@@ -2109,4 +2148,10 @@ fn history_controls(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) 
             let _ = app.run("ai.history", json!({"photo":photo.0,"record":next.record,"offset":next.offset}));
         }
     });
+    if app.ai.paging.busy()
+        || app.ai.paging.awaiting_page(photo)
+        || app.ai.conversations.get(&photo).and_then(|c| c.view.as_ref()).is_some_and(|v| v.card_cursor.is_some())
+    {
+        ui.label(tr("Loading AI history…"));
+    }
 }
