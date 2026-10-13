@@ -64,7 +64,8 @@ pub trait Store: Send {
 /// Files in a directory.
 pub struct FsStore {
     dir: PathBuf,
-    /// Open append handle (kept between appends; dropped on rewrite/truncate).
+    /// Open append handle, kept between appends. Every removal/rewrite/truncate drops it:
+    /// native aliases can identify the same file even when their keys differ.
     appender: Option<(String, std::fs::File)>,
 }
 
@@ -162,9 +163,7 @@ impl Store for FsStore {
 
     fn remove(&mut self, name: &str) -> io::Result<()> {
         let path = self.path(name)?;
-        if self.appender.as_ref().is_some_and(|(n, _)| n == name) {
-            self.appender = None;
-        }
+        self.appender = None;
         match std::fs::remove_file(&path) {
             Ok(()) => sync_directory(path.parent().unwrap_or(&self.dir)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -182,9 +181,7 @@ impl Store for FsStore {
 
     fn write_atomic_with(&mut self, name: &str, fill: &mut dyn FnMut(&mut dyn io::Write) -> io::Result<()>) -> io::Result<u64> {
         let path = self.prepare_parent(name)?;
-        if self.appender.as_ref().is_some_and(|(n, _)| n == name) {
-            self.appender = None;
-        }
+        self.appender = None;
         // Preserve recovery from the old fixed temp name. Unlinking a leftover symlink removes
         // only that link; it never opens its target. `.tmp` is reserved by the storage writer.
         let legacy_tmp = self.dir.join(format!("{name}.tmp"));
@@ -205,11 +202,10 @@ impl Store for FsStore {
         validate_name(name)?;
         if self.appender.as_ref().is_none_or(|(n, _)| n != name) {
             let path = self.prepare_parent(name)?;
-            let existed = path.exists();
             let f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-            if !existed {
-                sync_directory(path.parent().unwrap_or(&self.dir))?;
-            }
+            // An earlier attempt can create the file and then fail this sync. Retry it on
+            // every new handle, even when the name already exists, before writing any bytes.
+            sync_directory(path.parent().unwrap_or(&self.dir))?;
             self.appender = Some((name.to_string(), f));
         }
         let Some((_, f)) = self.appender.as_mut() else { return Err(io::Error::other("appender not open")) };
@@ -224,9 +220,7 @@ impl Store for FsStore {
     }
 
     fn truncate(&mut self, name: &str, len: u64) -> io::Result<()> {
-        if self.appender.as_ref().is_some_and(|(n, _)| n == name) {
-            self.appender = None;
-        }
+        self.appender = None;
         let f = match std::fs::OpenOptions::new().write(true).open(self.path(name)?) {
             Ok(f) => f,
             // nothing to cut (an append that failed before creating the file)

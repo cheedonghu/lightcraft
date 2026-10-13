@@ -179,3 +179,95 @@ fn native_write_failure_preserves_previous_committed_bytes() {
     assert_eq!(std::fs::read_dir(dir.join("companion/photos/1")).unwrap().count(), 1);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn native_append_retries_parent_sync_after_failed_creation_sync() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp("append-sync-retry");
+    let mut store = FsStore::open(&dir).unwrap();
+    let original = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    if std::fs::File::open(&dir).is_ok() {
+        // Privileged users can bypass this actual-filesystem permission fault.
+        std::fs::set_permissions(&dir, original).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        eprintln!("directory permission fault unavailable; parent-sync retry fixture not exercised");
+        return;
+    }
+    let first = store.append("catalog.log", b"one");
+    let retry = store.append("catalog.log", b"two");
+    std::fs::set_permissions(&dir, original).unwrap();
+    let file_was_created = dir.join("catalog.log").exists();
+    store.append("catalog.log", b"saved").unwrap();
+    let bytes = store.read("catalog.log").unwrap().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(file_was_created, "the failed first sync must leave the newly created name to retry");
+    assert_eq!(first.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(retry.unwrap_err().kind(), io::ErrorKind::PermissionDenied, "an existing file must not bypass the failed parent sync");
+    assert_eq!(bytes, b"saved", "failed sync attempts must not report appended bytes as durable");
+}
+
+#[test]
+fn native_case_alias_remove_closes_cached_appender() {
+    let dir = temp("alias-remove");
+    let mut store = FsStore::open(&dir).unwrap();
+    store.append("catalog.log", b"old").unwrap();
+    if !dir.join("CATALOG.log").exists() {
+        std::fs::remove_dir_all(dir).unwrap();
+        eprintln!("temporary volume is case-sensitive; alias deletion fixture not exercised");
+        return;
+    }
+    store.remove("CATALOG.log").unwrap();
+    store.append("catalog.log", b"new").unwrap();
+    let bytes = store.read("catalog.log").unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(bytes, Some(b"new".to_vec()), "append must write to the reachable file after deletion through a case alias");
+}
+
+#[test]
+fn native_case_alias_replace_closes_cached_appender() {
+    let dir = temp("alias-replace");
+    let mut store = FsStore::open(&dir).unwrap();
+    store.append("catalog.log", b"old").unwrap();
+    if !dir.join("CATALOG.log").exists() {
+        std::fs::remove_dir_all(dir).unwrap();
+        eprintln!("temporary volume is case-sensitive; alias replacement fixture not exercised");
+        return;
+    }
+    store.write_atomic("CATALOG.log", b"replacement").unwrap();
+    store.append("catalog.log", b"+new").unwrap();
+    let bytes = store.read("catalog.log").unwrap().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(bytes, b"replacement+new", "append must follow the replacement rather than the old inode");
+}
+
+#[cfg(unix)]
+#[test]
+fn native_case_alias_truncate_reopens_appender_and_checks_parent_sync() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp("alias-truncate");
+    let mut store = FsStore::open(&dir).unwrap();
+    store.append("catalog.log", b"old").unwrap();
+    if !dir.join("CATALOG.log").exists() {
+        std::fs::remove_dir_all(dir).unwrap();
+        eprintln!("temporary volume is case-sensitive; alias truncation fixture not exercised");
+        return;
+    }
+    store.truncate("CATALOG.log", 1).unwrap();
+    let original = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    if std::fs::File::open(&dir).is_ok() {
+        std::fs::set_permissions(&dir, original).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        eprintln!("directory permission fault unavailable; alias truncation reopen fixture not exercised");
+        return;
+    }
+    let appended = store.append("catalog.log", b"discard");
+    std::fs::set_permissions(&dir, original).unwrap();
+    store.append("catalog.log", b"+new").unwrap();
+    let bytes = store.read("catalog.log").unwrap().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(appended.unwrap_err().kind(), io::ErrorKind::PermissionDenied, "truncation through a case alias must close the cached handle");
+    assert_eq!(bytes, b"o+new");
+}
