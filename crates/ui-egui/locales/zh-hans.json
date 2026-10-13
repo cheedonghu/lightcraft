@@ -2050,5 +2050,7 @@
   "Checking photo availability. Please try again.": "正在检查照片是否可用，请稍后重试。",
   "AI task ownership has ended.": "AI 任务保护已结束。",
   "AI result is stale; the photo was not changed.": "AI 结果已过期，照片尚未改变。",
-  "AI publication may only update its task photo.": "AI 发布只能更新本轮任务照片。"
+  "AI publication may only update its task photo.": "AI 发布只能更新本轮任务照片。",
+  "The complete AI history exceeds the service limit. Local history is retained.": "AI 完整历史超过服务限制，完整本地历史仍保留，未删减。",
+  "The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.": "AI 历史不完整或无效，完整本地历史仍保留。请修复附件或删除整段对话后重试。"
 }

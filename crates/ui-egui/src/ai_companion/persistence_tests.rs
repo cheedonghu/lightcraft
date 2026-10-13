@@ -258,7 +258,8 @@ fn invalid_plan_failure_reopens_as_failed_without_claiming_user_cancellation() {
     requests.try_recv().unwrap();
     phase(&mut state, &mut app, photo, "awaiting_initial_execution");
     let revision = app.session.photo_revision(photo);
-    events.try_send(network::Event::Server {kind:"edit.plan".into(),data:json!({"round_id":"round","payload":{"plan_id":"invalid","expected_revision":revision,"capability_version":"lightcraft-v2","operations":[{"type":"set_controls","values":{"not.a.control":1.0}}]}})}).unwrap();
+    state.server(&mut app, &egui::Context::default(), "message.completed", &json!({"round_id":"round","payload":{"message_id":"plan-message","tool_calls":[{"id":"invalid-call","name":"apply_edit_plan","arguments":{"operations":[{"type":"set_controls","values":{"not.a.control":1.0}}]}}]}})).unwrap();
+    events.try_send(network::Event::Server {kind:"edit.plan".into(),data:json!({"round_id":"round","payload":{"plan_id":"invalid","tool_call_id":"invalid-call","expected_revision":revision,"capability_version":"lightcraft-v2","operations":[{"type":"set_controls","values":{"not.a.control":1.0}}]}})}).unwrap();
     state.poll_inner(&mut app, &egui::Context::default());
     assert!(state.jobs.is_empty());
     assert!(requests.try_recv().unwrap().path.ends_with("/stop"));
@@ -268,6 +269,10 @@ fn invalid_plan_failure_reopens_as_failed_without_claiming_user_cancellation() {
     assert_eq!(record["local_terminal"], "failed");
     assert_eq!(record["stages"][0]["execution_outcome"], "validation_failed");
     assert_eq!(*reopened.session.develop_of(photo).unwrap(), *original);
+    let mut reading = State::default();
+    let history = reading.history(&mut reopened, photo).unwrap();
+    assert!(history.iter().any(|m| m["role"] == "tool" && m["text"].as_str().is_some_and(|t| t.contains("plan_proposed"))));
+    assert!(history.iter().any(|m| m["role"] == "user" && m["text"].as_str().is_some_and(|t| t.contains("validation_failed"))));
 }
 
 #[test]
