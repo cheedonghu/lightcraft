@@ -95,6 +95,18 @@ fn failed_archive_write_keeps_the_change_and_retries_atomically() {
         fn read(&mut self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
             self.memory.read(name)
         }
+        fn read_limited(&mut self, name: &str, max_bytes: u64) -> std::io::Result<Option<Vec<u8>>> {
+            self.memory.read_limited(name, max_bytes)
+        }
+        fn read_range(&mut self, name: &str, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+            self.memory.read_range(name, offset, length)
+        }
+        fn remove(&mut self, name: &str) -> std::io::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::other("injected attachment deletion failure"));
+            }
+            self.memory.remove(name)
+        }
         fn write_atomic(&mut self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
             if name == STATE_FILE && self.fail.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(std::io::Error::other("injected archive failure"));
@@ -117,16 +129,103 @@ fn failed_archive_write_keeps_the_change_and_retries_atomically() {
     let id = s.catalog.photos().next().unwrap().id;
     s.set_photo_companion(id, Some(json!({"messages":["saved"]}))).unwrap();
     let before = files.get(STATE_FILE).unwrap();
+    let name = s.library.as_mut().unwrap().companion_attachment(id, b"preview").unwrap();
+    assert_eq!(s.library.as_mut().unwrap().files.read_range(&name, 1, 3).unwrap(), b"rev");
     fail.store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(s.set_photo_companion(id, Some(json!({"messages":["queued"]}))).is_err());
     assert_eq!(files.get(STATE_FILE).unwrap(), before);
+    assert!(s.library.as_mut().unwrap().remove_companion_attachment(&name).is_err());
+    assert_eq!(s.library.as_mut().unwrap().read_companion_attachment(&name).unwrap(), b"preview");
     assert!(s.unsaved().unwrap().1.contains("injected archive failure"));
     let identity = s.library_identity.clone();
     assert!(s.close_library().is_err(), "a successful catalog snapshot cannot hide an unsaved AI archive");
     assert!(std::sync::Arc::ptr_eq(&identity, &s.library_identity));
     fail.store(false, std::sync::atomic::Ordering::Relaxed);
     s.persist().unwrap();
+    s.library.as_mut().unwrap().remove_companion_attachment(&name).unwrap();
+    assert!(s.library.as_mut().unwrap().read_companion_attachment(&name).is_err());
     assert!(s.unsaved().is_none());
     let saved: Value = serde_json::from_slice(&files.get(STATE_FILE).unwrap()).unwrap();
     assert_eq!(saved["photos"][id.0.to_string()]["messages"][0], "queued");
+}
+
+#[test]
+fn temporary_library_attachment_removal_survives_reopen_and_is_idempotent() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut session = open(catalog.clone(), Box::new(files.clone()));
+    let id = session.catalog.photos().next().unwrap().id;
+    let library = session.library.as_mut().unwrap();
+    let name = library.companion_attachment(id, b"preview").unwrap();
+    library.remove_companion_attachment(&name).unwrap();
+    library.remove_companion_attachment(&name).unwrap();
+    assert!(library.read_companion_attachment(&name).is_err(), "removed attachments must no longer hydrate in temporary libraries");
+    assert!(files.get(&name).is_none());
+    session.close_library().unwrap();
+    let mut session = open(catalog, Box::new(files));
+    assert!(session.library.as_mut().unwrap().read_companion_attachment(&name).is_err());
+}
+
+#[test]
+fn companion_hydration_uses_only_the_bounded_store_capability() {
+    struct BoundedOnly(MemStore);
+    impl Store for BoundedOnly {
+        fn read(&mut self, _: &str) -> std::io::Result<Option<Vec<u8>>> {
+            Err(std::io::Error::other("unbounded reads forbidden"))
+        }
+        fn read_limited(&mut self, name: &str, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+            self.0.read_limited(name, limit)
+        }
+        fn write_atomic(&mut self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+            self.0.write_atomic(name, bytes)
+        }
+        fn append(&mut self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+            self.0.append(name, bytes)
+        }
+        fn truncate(&mut self, name: &str, len: u64) -> std::io::Result<()> {
+            self.0.truncate(name, len)
+        }
+        fn describe(&self) -> String {
+            "bounded-only".into()
+        }
+    }
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut session = open(catalog.clone(), Box::new(files.clone()));
+    let id = session.catalog.photos().next().unwrap().id;
+    let conversation = json!({"messages":["saved"]});
+    session.set_photo_companion(id, Some(conversation.clone())).unwrap();
+    let name = session.library.as_mut().unwrap().companion_attachment(id, b"preview").unwrap();
+    session.close_library().unwrap();
+    let mut session = open(catalog, Box::new(BoundedOnly(files.clone())));
+    assert_eq!(session.photo_companion(id).unwrap(), Some(&conversation));
+    assert_eq!(session.library.as_mut().unwrap().read_companion_attachment(&name).unwrap(), b"preview");
+    files.set(&name, vec![0; 128 * 1024 + 1]);
+    assert!(session.library.as_mut().unwrap().read_companion_attachment(&name).unwrap_err().to_string().contains("read limit"));
+}
+
+#[test]
+fn native_archive_and_attachments_save_reopen_and_delete_through_store() {
+    let dir = std::env::temp_dir().join(format!("lc-ux02-archive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut session = Session::new();
+    session.open_library(&dir, true).unwrap();
+    let id = session.catalog.photos().next().unwrap().id;
+    let before = std::fs::read(dir.join(SNAPSHOT)).unwrap();
+    let value = json!({"messages":["native conversation"]});
+    session.set_photo_companion(id, Some(value.clone())).unwrap();
+    let name = session.library.as_mut().unwrap().companion_attachment(id, b"preview").unwrap();
+    assert_eq!(std::fs::read(dir.join(SNAPSHOT)).unwrap(), before);
+    session.close_library().unwrap();
+    drop(session);
+    let mut session = Session::new();
+    session.open_library(&dir, false).unwrap();
+    assert_eq!(session.photo_companion(id).unwrap(), Some(&value));
+    let library = session.library.as_mut().unwrap();
+    assert_eq!(library.read_companion_attachment(&name).unwrap(), b"preview");
+    library.remove_companion_attachment(&name).unwrap();
+    library.remove_companion_attachment(&name).unwrap();
+    assert!(library.read_companion_attachment(&name).is_err());
+    session.close_library().unwrap();
+    drop(session);
+    assert!(!dir.join(&name).exists());
+    std::fs::remove_dir_all(dir).unwrap();
 }
