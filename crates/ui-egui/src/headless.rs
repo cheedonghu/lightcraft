@@ -2198,6 +2198,41 @@ mod tests {
     }
 
     #[test]
+    fn modified_badges_stay_visible_without_selection_and_respect_settings() {
+        let mut h = demo([1200.0, 800.0]);
+        let t = Duration::from_secs(10);
+        let ids = h.app.session.visible_cloned();
+        let edited = *ids
+            .iter()
+            .find(|id| {
+                let photo = h.app.session.catalog.photo(**id).unwrap();
+                photo.rating == 0 && photo.flag == lightcraft_catalog::Flag::None && photo.label.is_none() && !photo.is_edited()
+            })
+            .unwrap();
+        h.app.run("library.select", json!({"ids": [edited.0]})).unwrap();
+        h.app.run("develop.set", json!({"control": "wb.temp", "value": 5800.0})).unwrap();
+        h.app.run("library.select", json!({"ids": [ids[1].0]})).unwrap();
+        h.app.ui.settings.grid_badges = crate::state::GridBadges::Auto;
+        h.settle(SETTLE);
+        let has = |h: &mut Headless, id: &str| {
+            let w = h.request("ui.widgets", json!({"filter": id}), t);
+            w["result"].as_array().unwrap().iter().any(|w| w["id"] == id)
+        };
+        let grid = format!("badge:modified:grid:{}", edited.0);
+        assert!(has(&mut h, &grid), "Auto shows an unselected WB-only edited photo");
+        h.app.ui.settings.grid_badges = crate::state::GridBadges::Never;
+        h.settle(SETTLE);
+        assert!(!has(&mut h, &grid));
+        h.app.ui.view = crate::state::ViewMode::Detail;
+        h.settle(SETTLE);
+        let film = format!("badge:modified:film:{}", edited.0);
+        assert!(has(&mut h, &film), "filmstrip uses the same edited state");
+        h.app.ui.settings.film_badges = false;
+        h.settle(SETTLE);
+        assert!(!has(&mut h, &film));
+    }
+
+    #[test]
     fn crop_default_browsing_is_read_only_and_drag_is_one_edit() {
         let mut h = demo([1200.0, 800.0]);
         let photos: Vec<_> = h.app.session.visible_cloned().into_iter().filter(|id| !h.app.session.catalog.photo(*id).unwrap().is_edited()).collect();
