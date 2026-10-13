@@ -64,7 +64,7 @@ impl eframe::App for App {
             // Quit from the menu bar: save exactly what closing the window saves (settings and
             // library, after the unsaved-changes check; otherwise its prompt shows), then end the
             // process instead of closing the viewport while AppKit is terminating (PR #444).
-            eframe::App::on_exit(self);
+            eframe::App::on_exit(self, None);
             std::process::exit(0);
         }
         self.0.logic(ctx);
@@ -77,6 +77,12 @@ impl eframe::App for App {
         self.0.ui(ui);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // A host exit can bypass may_close (or follow an unsaved Quit Anyway).
+        // Revoke uploads before any settings/library I/O or GPU wait.
+        lightcraft_ui_egui::ai_companion::before_exit(&mut self.0);
+        if let Err(e) = lightcraft_ui_egui::ai_companion::before_library_change(&mut self.0) {
+            log::error!("saving AI records failed: {e}");
+        }
         if let Err(e) = self.1.save(&self.0) {
             log::error!("{e}");
         }

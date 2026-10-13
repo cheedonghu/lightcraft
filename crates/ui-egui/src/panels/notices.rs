@@ -19,6 +19,7 @@ pub fn logic(app: &mut LightcraftApp) {
 /// written are retried — the log, then a snapshot of everything in memory.
 pub fn may_close(app: &mut LightcraftApp) -> bool {
     if app.quit_confirmed {
+        crate::ai_companion::before_exit(app);
         return true;
     }
     // before the library is touched: a Cancel here keeps working with it
@@ -38,6 +39,7 @@ pub fn may_close(app: &mut LightcraftApp) -> bool {
         return false;
     }
     if app.session.unsaved().is_none() {
+        crate::ai_companion::before_exit(app);
         return true;
     }
     let _ = app.session.persist();
@@ -47,7 +49,10 @@ pub fn may_close(app: &mut LightcraftApp) -> bool {
         log::error!("quit: library not saved: {e}");
     }
     match app.session.unsaved() {
-        None => true,
+        None => {
+            crate::ai_companion::before_exit(app);
+            true
+        }
         Some((n, e)) => {
             app.quit_prompt = Some(QuitPrompt::Unsaved(crate::i18n::tr_format!(
                 "{n} change{} couldn't be written to disk: {e}\nIf you quit now, {} lost.",
@@ -135,6 +140,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
             Choice::QuitAnyway => {
                 app.quit_prompt = None;
                 app.quit_confirmed = true;
+                crate::ai_companion::before_exit(app);
                 app.ui.quit = true;
             }
             Choice::Cancel | Choice::Ok => app.quit_prompt = None,

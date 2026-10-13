@@ -947,6 +947,7 @@ impl LightcraftApp {
     /// on other threads (export, denoise, the device warm-up). `false`: the deadline passed first
     /// (the host exits anyway). The app renders nothing afterwards.
     pub fn shutdown(&mut self, timeout: std::time::Duration) -> bool {
+        ai_companion::before_exit(self);
         lightcraft_engine::gpu::begin_shutdown();
         #[cfg(not(target_arch = "wasm32"))]
         let t0 = std::time::Instant::now();

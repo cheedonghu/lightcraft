@@ -1344,7 +1344,9 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
             }
         }
         "app.quit" => {
-            app.ui.quit = true;
+            if crate::panels::notices::may_close(app) {
+                app.ui.quit = true;
+            }
             Ok(Value::Null)
         }
         "dialog.saveMetadataPreset" => {

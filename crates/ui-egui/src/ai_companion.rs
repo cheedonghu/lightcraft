@@ -19,6 +19,8 @@ mod identity_tests;
 #[path = "ai_companion/library_tests.rs"]
 mod library_tests;
 #[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
 mod native_history_tests;
 mod network;
 mod paging;
@@ -49,6 +51,7 @@ use crate::LightcraftApp;
 pub struct State {
     open: bool,
     consent: bool,
+    exiting: bool,
     prompt: String,
     editor_photo: Option<PhotoId>,
     editors: BTreeMap<PhotoId, drafts::Editor>,
@@ -58,6 +61,7 @@ pub struct State {
     serial: u64,
     connection_generation: u64,
     connection: Option<network::Connection>,
+    retiring_connection: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     next_connection: Option<network::Connection>,
     pending_confirmations: Vec<(RoundIdentity, Option<String>)>,
@@ -80,6 +84,7 @@ impl Default for State {
         Self {
             open: false,
             consent: false,
+            exiting: false,
             prompt: String::new(),
             editor_photo: None,
             editors: BTreeMap::new(),
@@ -89,6 +94,7 @@ impl Default for State {
             serial: 0,
             connection_generation: 0,
             connection: None,
+            retiring_connection: None,
             #[cfg(test)]
             next_connection: None,
             pending_confirmations: Vec::new(),
@@ -247,7 +253,7 @@ impl State {
             .collect();
         // The receiver may still contain Closed. Drop that connection only after
         // retaining its ownership list; no old route can outlive replacement.
-        self.connection = None;
+        self.retire_connection();
         for photo in &photos {
             self.finish(*photo, "AI 事件连接已断开，保留最近完整结果。");
         }
@@ -265,6 +271,9 @@ impl State {
         }
     }
     pub(crate) fn admission(&self, app: &LightcraftApp, explicit: Option<PhotoId>) -> Result<PhotoId, String> {
+        if self.exiting || app.quit_confirmed {
+            return Err(tr("The app is closing. AI tasks cannot start.").into());
+        }
         if self.pending_confirmations.len() >= 96 {
             return Err(tr("AI history is waiting to be saved. Retry after saving completes.").into());
         }
@@ -274,7 +283,8 @@ impl State {
         if !self.consent {
             return Err(tr("Please consent to sending compressed previews first.").into());
         }
-        if self.connection.as_ref().is_some_and(|c| c.is_closing() && c.alive.load(Ordering::Relaxed))
+        if self.retiring_connection.as_ref().is_some_and(|alive| alive.load(Ordering::Relaxed))
+            || self.connection.as_ref().is_some_and(|c| c.is_closing() && c.alive.load(Ordering::Relaxed))
             || !self.jobs.is_empty()
             || self.workers.values().any(|a| a.load(Ordering::Relaxed))
             || app.session.companion_task_photo().is_some()
@@ -503,6 +513,16 @@ impl State {
     fn close_connection(&self) {
         if let Some(connection) = &self.connection {
             connection.close();
+        }
+    }
+    fn retire_connection(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.close();
+            if connection.alive.load(Ordering::Relaxed) {
+                // Keep the real transport's join/retirement guard across library
+                // generations even though its old event outlet is discarded.
+                self.retiring_connection = Some(connection.alive.clone());
+            }
         }
     }
     fn stop(&mut self, photo: PhotoId) -> Result<Value, String> {
@@ -1053,7 +1073,7 @@ impl State {
                 let _ = self.stop(photo);
                 self.finish(photo, "图库已关闭，保留最近一次完整结果。");
             }
-            self.connection = None;
+            self.retire_connection();
             self.paging.cancel();
             self.pending_confirmations.clear();
             self.confirmation_retry_at = None;
@@ -1154,7 +1174,7 @@ impl State {
                                 self.pending_confirmations.push((identity.clone(), Some(plan_id.to_owned())));
                             } else {
                                 self.text = tr("AI history is waiting to be saved. Retry after saving completes.").into();
-                                self.connection = None;
+                                self.retire_connection();
                             }
                         }
                         let _ = self.save(app, identity.scope.photo);
@@ -1474,18 +1494,38 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
     }
     app.ai = state;
 }
+/// Irreversibly cancel old publishers without storage I/O. Safe to repeat even
+/// after a failed save or a confirmed unsaved exit.
+pub fn cancel_for_library_change(app: &mut LightcraftApp) {
+    let state = &mut app.ai;
+    let photos: Vec<_> = state.jobs.keys().copied().collect();
+    // Revoke every round before any stop control, draft staging or storage can fail.
+    for job in state.jobs.values() {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
+    state.pending_local_saves.extend(photos.iter().copied());
+    state.pending_local_saves.extend(state.conversations.iter().filter_map(|(photo, c)| c.dirty.then_some(*photo)));
+    for photo in photos {
+        let _ = state.stop(photo);
+        state.finish(photo, "图库已关闭，保留最近一次完整结果。");
+    }
+    state.paging.cancel();
+    // Closing the transport also cancels unsent content for already-completed
+    // rounds whose actual effects must remain intact.
+    state.close_connection();
+}
+/// A host or user has committed to exiting; consent/connection changes cannot
+/// authorize content again. Cancellation itself performs no storage I/O.
+pub fn before_exit(app: &mut LightcraftApp) {
+    app.ai.exiting = true;
+    cancel_for_library_change(app);
+}
 pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
+    cancel_for_library_change(app);
     let mut state = std::mem::take(&mut app.ai);
     let result = (|| {
         state.stage_editors(app)?;
         state.flush_local_saves(app)?;
-        let photos: Vec<_> = state.jobs.keys().copied().collect();
-        for photo in photos {
-            // Close unfinished tool messages while the old library still owns them.
-            let _ = state.stop(photo);
-            state.finish(photo, "图库已关闭，保留最近一次完整结果。");
-            state.save(app, photo)?;
-        }
         state.stage_editors(app)?;
         state.flush_local_saves(app)?;
         app.session.persist().map_err(|e| e.to_string())?;
@@ -1504,7 +1544,7 @@ pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
             return Err(error);
         }
         state.paging.cancel();
-        state.connection = None;
+        state.retire_connection();
         Ok(())
     })();
     app.ai = state;
@@ -1522,7 +1562,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             let _ = state.stop(photo);
             state.finish(photo, "图库已关闭，保留最近一次完整结果。");
         }
-        state.connection = None;
+        state.retire_connection();
         state.paging.cancel();
         state.pending_confirmations.clear();
         state.confirmation_retry_at = None;
