@@ -22,6 +22,7 @@
 //! [`lightcraft_catalog::journal`]) and on [`Session::close_library`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lightcraft_catalog::{FsStore, Journal, LibraryLock, LoadReport, Store};
 use lightcraft_develop::Preset;
@@ -98,7 +99,7 @@ pub struct Library {
     blocked: Vec<&'static str>,
     /// Keeps other processes out of this library while it's open (last: released after the
     /// journal's background snapshot has landed).
-    lock: Option<LibraryLock>,
+    lock: Option<Arc<LibraryLock>>,
 }
 
 /// Where a library's files live (see [`Session::open_library_in`]).
@@ -137,6 +138,11 @@ struct ViewFile {
 }
 
 impl Library {
+    /// Captured readers can outlive a library switch. Share the existing native
+    /// lock until their actual retirement so another process cannot collect A.
+    pub(crate) fn retain_read_lock(&self) -> Option<Arc<LibraryLock>> {
+        self.lock.clone()
+    }
     pub fn journal(&self) -> &Journal {
         &self.journal
     }
@@ -322,7 +328,7 @@ impl Session {
         let reusing = reused.is_some();
         let mut lock = match reused {
             Some(l) => Some(l),
-            None => Some(LibraryLock::acquire(&dir, &program_name()).map_err(|e| EngineError::LibraryInUse(e.to_string()))?),
+            None => Some(Arc::new(LibraryLock::acquire(&dir, &program_name()).map_err(|e| EngineError::LibraryInUse(e.to_string()))?)),
         };
         if let Err(e) = self.open_stores(stores, seed_demo, &mut lock) {
             if reusing && let Some(lib) = self.library.as_mut() {
@@ -349,7 +355,7 @@ impl Session {
     }
 
     /// Open `stores`; the new library takes `lock` once nothing can fail any more.
-    fn open_stores(&mut self, stores: LibraryStores, seed_demo: bool, lock: &mut Option<LibraryLock>) -> Result<()> {
+    fn open_stores(&mut self, stores: LibraryStores, seed_demo: bool, lock: &mut Option<Arc<LibraryLock>>) -> Result<()> {
         let LibraryStores { dir, mut catalog, mut files, on_disk } = stores;
         self.media.smart_dir = on_disk.then(|| crate::smart::dir(&dir));
         // the current library may be these same files: let its background snapshot land first
@@ -469,7 +475,7 @@ impl Session {
             forgot_local: None,
             presets_written,
             view_written,
-            settings_warnings: unlocked_warning(lock.as_ref()).into_iter().chain(settings.warnings).collect(),
+            settings_warnings: unlocked_warning(lock.as_deref()).into_iter().chain(settings.warnings).collect(),
             warnings_reported: 0,
             blocked: settings.blocked,
             lock: lock.take(),

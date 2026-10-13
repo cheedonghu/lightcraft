@@ -272,7 +272,8 @@ fn invalid_plan_failure_reopens_as_failed_without_claiming_user_cancellation() {
     requests.try_recv().unwrap();
     phase(&mut state, &mut app, photo, "awaiting_initial_execution");
     let revision = app.session.photo_revision(photo);
-    events.try_send(network::Event::Server {kind:"edit.plan".into(),data:json!({"round_id":"round","payload":{"plan_id":"invalid","expected_revision":revision,"capability_version":"lightcraft-v2","operations":[{"type":"set_controls","values":{"not.a.control":1.0}}]}})}).unwrap();
+    state.server(&mut app, &egui::Context::default(), "message.completed", &json!({"round_id":"round","payload":{"message_id":"plan-message","tool_calls":[{"id":"invalid-call","name":"apply_edit_plan","arguments":{"operations":[{"type":"set_controls","values":{"not.a.control":1.0}}]}}]}})).unwrap();
+    events.try_send(network::Event::Server {kind:"edit.plan".into(),data:json!({"round_id":"round","payload":{"plan_id":"invalid","tool_call_id":"invalid-call","expected_revision":revision,"capability_version":"lightcraft-v2","operations":[{"type":"set_controls","values":{"not.a.control":1.0}}]}})}).unwrap();
     state.poll_inner(&mut app, &egui::Context::default());
     assert!(state.jobs.is_empty());
     assert!(requests.try_recv().unwrap().path.ends_with("/stop"));
@@ -282,6 +283,10 @@ fn invalid_plan_failure_reopens_as_failed_without_claiming_user_cancellation() {
     assert_eq!(record["local_terminal"], "failed");
     assert_eq!(record["stages"][0]["execution_outcome"], "validation_failed");
     assert_eq!(*reopened.session.develop_of(photo).unwrap(), *original);
+    let mut reading = State::default();
+    let history = reading.history(&mut reopened, photo).unwrap();
+    assert!(history.iter().any(|m| m["role"] == "tool" && m["text"].as_str().is_some_and(|t| t.contains("plan_proposed"))));
+    assert!(history.iter().any(|m| m["role"] == "user" && m["text"].as_str().is_some_and(|t| t.contains("validation_failed"))));
 }
 
 #[test]
@@ -326,6 +331,75 @@ fn post_failure_and_explicit_stop_preserve_published_result_but_have_distinct_te
         assert_eq!(record["stages"][0]["execution_outcome"], "succeeded");
         assert_eq!(record["recent_complete_result"]["light"]["exposure"], 0.3);
         assert_eq!(reopened.session.develop_of(photo).unwrap().light.exposure, 0.3);
+    }
+}
+
+#[test]
+fn real_stop_or_failure_recovers_the_owning_request_and_preserves_another_photo_draft() {
+    use crate::headless::Headless;
+    for stop in [true, false] {
+        let mut h = Headless::new(self::app(MemStore::new(), MemStore::new()), [1000.0, 680.0], 1.0);
+        h.app.run("ai.open", json!({})).unwrap();
+        for _ in 0..4 {
+            h.step();
+        }
+        let a = h.app.session.active().unwrap();
+        let b = h.app.session.catalog.photos().find(|p| p.id != a).unwrap().id;
+        let timeout = Duration::from_secs(10);
+        let (connection, requests, events) = network::test_connection();
+        h.app.ai.next_connection = Some(connection);
+        h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+        h.request("ui.text", json!({"text":"A submitted immutable request"}), timeout);
+        h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
+        assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
+        let creation = requests.try_recv().unwrap();
+        assert_eq!(h.app.session.companion_editor(a).unwrap().draft, "");
+        events.try_send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"draft-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":a.0,"library_generation":creation.identity.scope.library_generation},"state":"queued"}}) }).unwrap();
+        for _ in 0..4 {
+            h.step();
+        }
+        h.app.run("library.select", json!({"ids":[b.0],"active":b.0})).unwrap();
+        for _ in 0..4 {
+            h.step();
+        }
+        h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+        h.request("ui.text", json!({"text":"B newer unsent request"}), timeout);
+        if stop {
+            h.app.run("ai.stop", json!({"photo":a.0})).unwrap();
+        } else {
+            events
+                .try_send(network::Event::Server {
+                    kind: "round.ended".into(),
+                    data: json!({"round_id":"draft-round","payload":{"terminal_state":"failed","reason_code":"fixture_failure"}}),
+                })
+                .unwrap();
+        }
+        for _ in 0..5 {
+            h.step();
+        }
+        assert_eq!(h.app.session.companion_editor(a).unwrap().draft, "A submitted immutable request");
+        assert_eq!(h.app.session.companion_editor(b).unwrap().draft, "B newer unsent request");
+        assert_eq!(h.app.run("ai.status", json!({"photo":a.0})).unwrap()["busy"], false);
+        assert!(requests.try_iter().all(|request| request.path != "/v1/rounds"), "restoration never submits");
+        h.app.run("library.select", json!({"ids":[a.0],"active":a.0})).unwrap();
+        for _ in 0..4 {
+            h.step();
+        }
+        h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
+        h.request("ui.key", json!({"key":"A","cmd":true}), timeout);
+        h.request("ui.text", json!({"text":"A later authored draft"}), timeout);
+        events
+            .try_send(network::Event::Server {
+                kind: "round.ended".into(),
+                data: json!({"round_id":"draft-round","payload":{"terminal_state":"failed","reason_code":"late_failure"}}),
+            })
+            .unwrap();
+        for _ in 0..4 {
+            h.step();
+        }
+        h.app.session.persist().unwrap();
+        assert_eq!(h.app.session.companion_editor(a).unwrap().draft, "A later authored draft");
+        assert_eq!(h.app.session.companion_editor(b).unwrap().draft, "B newer unsent request");
     }
 }
 

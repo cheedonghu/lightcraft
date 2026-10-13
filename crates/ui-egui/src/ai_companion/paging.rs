@@ -70,6 +70,7 @@ impl State {
                         fragments: page.fragments,
                         bytes: page.bytes,
                     });
+                    self.accept_page(app, message.scope.photo, message.cursor);
                 }
                 Err(error) => {
                     conversation.notice = error;
@@ -159,6 +160,8 @@ impl State {
         mut reader: HistoryReader,
         identity: RoundIdentity,
         tail: Vec<Value>,
+        prompt: String,
+        settings: Arc<DevelopSettings>,
         cancel: Arc<AtomicBool>,
     ) -> Result<(), String> {
         let tx = self.tx.clone();
@@ -169,7 +172,7 @@ impl State {
             .name("companion-model-history".into())
             .spawn(move || {
                 let _guard = guard;
-                let result = assemble(&mut reader, tail, &cancel);
+                let result = assemble(&mut reader, tail, &cancel, &prompt, &settings);
                 if !cancel.load(Ordering::Relaxed) && tx.try_send(WorkerMessage::HistoryPrepared { identity, result }).is_err() {
                     cancel.store(true, Ordering::Relaxed);
                 }
@@ -179,88 +182,35 @@ impl State {
         Ok(())
     }
 }
-fn assemble(reader: &mut HistoryReader, tail: Vec<Value>, cancel: &AtomicBool) -> Result<Vec<Value>, String> {
-    if reader.header().message_count.saturating_add(tail.len() as u64) > 1024 {
-        return Err(tr("The complete AI history exceeds the service limit. Local history is retained.").into());
-    }
-    let mut messages = Vec::new();
-    let mut text = 0usize;
-    let mut bytes = 0usize;
-    let mut images = 0usize;
+fn assemble(
+    reader: &mut HistoryReader,
+    tail: Vec<Value>,
+    cancel: &AtomicBool,
+    prompt: &str,
+    settings: &DevelopSettings,
+) -> Result<Vec<Value>, String> {
+    let mut projection = projection::HistoryProjection::new(reader.header().photo_id);
     let mut cursor = 0;
     while cursor < reader.header().message_count {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        let page = reader.messages(cursor, 1, (32 * 1024 * 1024usize).saturating_sub(bytes)).map_err(|e| e.to_string())?;
-        for message in page.records {
-            append(reader, message, &mut messages, &mut text, &mut bytes, &mut images, cancel)?;
+        let page = reader.messages(cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
+        for message in &page.records {
+            projection.push_cancellable(message, |picture| reader.preview(picture).map_err(|e| e.to_string()), || cancel.load(Ordering::Relaxed))?;
         }
         cursor = page.next_cursor.unwrap_or(reader.header().message_count);
     }
-    for message in tail {
-        append(reader, message, &mut messages, &mut text, &mut bytes, &mut images, cancel)?;
+    for message in &tail {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        projection.push_cancellable(message, |picture| reader.preview(picture).map_err(|e| e.to_string()), || cancel.load(Ordering::Relaxed))?;
     }
-    Ok(messages)
-}
-fn append(
-    reader: &mut HistoryReader,
-    mut message: Value,
-    messages: &mut Vec<Value>,
-    text: &mut usize,
-    bytes: &mut usize,
-    images: &mut usize,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
-    if let Some(object) = message.as_object_mut() {
-        for key in ["local_round_id", "local_message_id", "stage", "model_call_id", "tool_request_id", "complete_state", "display_kind"] {
-            object.remove(key);
-        }
-    }
-    *text = text.saturating_add(message.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0));
-    if let Some(calls) = message.get("tool_calls") {
-        *text = text.saturating_add(lightcraft_engine::companion::storage::record_size(calls).map_err(|e| e.to_string())?);
-    }
-    if *text > 256 * 1024 {
-        return Err(tr("The complete AI history exceeds the service limit. Local history is retained.").into());
-    }
-    let mut projected_size = lightcraft_engine::companion::storage::record_size(&message).map_err(|e| e.to_string())?;
-    if let Some(pictures) = message.get_mut("images").and_then(Value::as_array_mut) {
-        *images = images.saturating_add(pictures.len());
-        if *images > 256 {
-            return Err(tr("The complete AI history exceeds the service limit. Local history is retained.").into());
-        }
-        for picture in pictures {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("cancelled".into());
-            }
-            if picture.get("attachment").is_some() {
-                let stored_size = lightcraft_engine::companion::storage::record_size(picture).map_err(|e| e.to_string())?;
-                let length = picture.get("length").and_then(Value::as_u64).ok_or("missing preview length")?;
-                if length > 128 * 1024 {
-                    return Err("invalid preview length".into());
-                }
-                let encoded = usize::try_from(length.div_ceil(3).saturating_mul(4)).map_err(|e| e.to_string())?;
-                projected_size = projected_size.saturating_sub(stored_size).saturating_add(encoded).saturating_add(128);
-                if bytes.saturating_add(projected_size) > 32 * 1024 * 1024 {
-                    return Err(tr("The complete AI history exceeds the service limit. Local history is retained.").into());
-                }
-                let data = reader.preview(picture).map_err(|e| e.to_string())?;
-                let object = picture.as_object_mut().ok_or("invalid image")?;
-                for key in ["attachment", "digest", "length", "width", "height"] {
-                    object.remove(key);
-                }
-                picture["data"] = json!(Base64::encode_string(&data));
-            }
-        }
-    }
-    *bytes = bytes.saturating_add(lightcraft_engine::companion::storage::record_size(&message).map_err(|e| e.to_string())?);
-    if *bytes > 32 * 1024 * 1024 {
-        return Err(tr("The complete AI history exceeds the service limit. Local history is retained.").into());
-    }
-    messages.push(message);
-    Ok(())
+    let history = projection.finish()?;
+    projection::reserve_input(&history, prompt, settings)?;
+    Ok(history)
 }

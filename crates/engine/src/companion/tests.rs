@@ -127,3 +127,16 @@ fn complete_candidate_preserves_unnamed_settings_and_maps_frozen_mask_frame() {
         json!({"operations":[{"type":"set_controls","values":{"light.exposure":1}},{"type":"set_controls","values":{"light.exposure":2}}]});
     assert!(candidate(&original, &duplicate, &context).is_err());
 }
+
+#[test]
+fn historical_model_images_validate_actual_encoding_and_dimensions() {
+    let options = crate::export::ExportOptions { format: crate::export::ExportFormat::Png, ..Default::default() };
+    let image = lightcraft_raster::Rgba8::filled(16, 16, [12, 40, 60, 255]);
+    let bytes = crate::export::encode_image(&image, &options).unwrap();
+    assert!(super::validate_history_image("image/png", &bytes).is_ok());
+    assert!(super::validate_history_image("image/jpeg", &bytes).is_err());
+    assert!(super::validate_history_image("image/png", &bytes[..bytes.len() / 2]).is_err());
+    let wide = lightcraft_raster::Rgba8::filled(641, 1, [12, 40, 60, 255]);
+    let bytes = crate::export::encode_image(&wide, &options).unwrap();
+    assert!(super::validate_history_image("image/png", &bytes).is_err());
+}

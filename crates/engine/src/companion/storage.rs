@@ -586,21 +586,34 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
 }
 /// Ownership and HEAD are already durable. Pending removal is cleanup debt and
 /// can never reverse the accepted conversation commit.
-pub(crate) fn reconcile_visible_pending(store: &mut dyn Store, photo: PhotoId) -> Result<()> {
+pub(crate) fn reconcile_visible_pending(store: &mut dyn Store, photo: PhotoId, known_published: Option<&str>) -> Result<()> {
     let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
     let Some(p) = p else { return Ok(()) };
     let visible: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
     recovery::validate(&p, photo, &visible)?;
     if visible.as_ref() == Some(&p.head) {
-        commit(store, &p)?;
+        let h = header(store, photo)?.ok_or_else(|| error("published manifest missing"))?;
+        if h.conversation_epoch != p.expected_epoch
+            || (known_published != Some(p.transaction_id.as_str()) && !retirement::publication_confirmed(store, &p)?)
+        {
+            return Err(error("publication confirmation unavailable; pending graph protected"));
+        }
+        // Repeat the small proof write after an ambiguous directory-sync error.
+        retirement::confirm_publication(store, &p)?;
         store.remove(&format!("{}/pending.json", base(photo))).map_err(error)?;
     }
     Ok(())
 }
-pub(crate) fn finish_pending(store: &mut dyn Store, photo: PhotoId) {
-    if let Err(e) = store.remove(&format!("{}/pending.json", base(photo))) {
-        log::warn!("archive pending cleanup: {e}");
+pub(crate) fn finish_pending(store: &mut dyn Store, photo: PhotoId) -> Result<()> {
+    let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    if let Some(p) = p {
+        retirement::confirm_publication(store, &p)?;
     }
+    store.remove(&format!("{}/pending.json", base(photo))).map_err(error)
+}
+pub(crate) fn published_pending_transaction(store: &mut dyn Store, photo: PhotoId) -> Result<Option<String>> {
+    let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    Ok(p.filter(|p| !p.head.manifest_digest.is_empty()).map(|p| p.transaction_id))
 }
 pub(crate) fn activate(store: &mut dyn Store) -> Result<()> {
     if let Some(root) = read::<Value>(store, STATE_FILE, SMALL)?
@@ -613,7 +626,9 @@ pub(crate) fn activate(store: &mut dyn Store) -> Result<()> {
 impl Session {
     /// Retain a main-frame/resumable reader from capture until actual retirement.
     pub fn retain_companion_history(&mut self, header: &PhotoHeader) -> Result<HistoryRetention> {
-        reader_pins::capture(&self.companion_archive.readers, self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header)
+        let library = self.library.as_mut().ok_or_else(|| error("library closed"))?;
+        let lock = library.retain_read_lock();
+        reader_pins::capture(&self.companion_archive.readers, library.files.as_mut(), header, lock)
     }
     /// A bounded cleanup timer needs future frames even after the last AI job ends.
     pub fn companion_cleanup_pending(&self) -> bool {
@@ -626,6 +641,9 @@ impl Session {
         self.companion_archive.cleanup_errors.get(&photo).map(String::as_str)
     }
     pub fn companion_photo_unsaved(&self, photo: PhotoId) -> bool {
+        self.companion_archive.editors.dirty_for(photo) || self.companion_history_unsaved(photo)
+    }
+    pub fn companion_history_unsaved(&self, photo: PhotoId) -> bool {
         self.companion_archive.tails.contains_key(&photo)
             || self.companion_archive.dirty_photos.contains(&photo)
             || self.companion_archive.revert_dirty.contains(&photo)
@@ -697,7 +715,10 @@ impl Session {
             activate(store)?;
             self.companion_archive.v2 = true;
         }
-        finish_pending(store, pending.photo);
+        self.companion_archive.cleanup_published.insert(pending.photo, pending.transaction_id.clone());
+        if let Err(e) = finish_pending(store, pending.photo) {
+            self.companion_archive.cleanup_errors.insert(pending.photo, e.to_string());
+        }
         self.companion_archive.cleanup_photos.insert(pending.photo);
         Ok(CommitReceipt { photo: pending.photo, conversation_epoch: pending.expected_epoch, transaction_id: pending.transaction_id.clone() })
     }

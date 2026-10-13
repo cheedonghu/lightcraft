@@ -133,7 +133,12 @@ fn public_ai_result_stays_visible_and_unsaved_recovery_only_writes_storage() {
         while requests.try_recv().is_ok() {}
         let revision = h.app.session.photo_revision(photo);
         failed.store(false, Ordering::Relaxed);
-        h.app.session.persist().unwrap();
+        let recovery_deadline = Instant::now() + Duration::from_secs(6);
+        while h.app.session.unsaved().is_some() {
+            h.step();
+            assert!(Instant::now() < recovery_deadline, "ordinary client frames must retry repaired storage");
+            std::thread::sleep(Duration::from_millis(2));
+        }
         h.step();
         let saved_status = h.app.run("ai.status", json!({})).unwrap();
         assert_eq!(saved_status["saveState"], "saved");

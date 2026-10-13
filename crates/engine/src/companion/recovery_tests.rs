@@ -5,7 +5,7 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Default)]
-struct FaultPlan(Arc<Mutex<Option<(String, bool, bool)>>>);
+struct FaultPlan(Arc<Mutex<Option<(String, bool, bool)>>>, Arc<Mutex<usize>>);
 #[derive(Clone)]
 struct FaultStore<S = MemStore> {
     memory: S,
@@ -15,6 +15,11 @@ impl<S> FaultStore<S> {
     fn fault(&self, key: &str, removal: bool) -> Option<bool> {
         let mut plan = self.plan.0.lock().unwrap();
         if plan.as_ref().is_some_and(|(part, _, remove)| *remove == removal && key.contains(part)) {
+            let mut skip = self.plan.1.lock().unwrap();
+            if *skip > 0 {
+                *skip -= 1;
+                return None;
+            }
             plan.take().map(|(_, after, _)| after)
         } else {
             None
@@ -205,6 +210,179 @@ fn native_atomic_head_failures_keep_actual_photo_changes_and_recover_without_rep
         reopened.close_library().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[test]
+fn editor_failure_with_cleanup_work_keeps_backoff_and_independent_drafts_during_reclamation() {
+    let files = MemStore::new();
+    let plan = FaultPlan::default();
+    let meter = Arc::new(Mutex::new(IoCount::default()));
+    let mut s = open(MeterStore { inner: FaultStore { memory: files.clone(), plan: plan.clone() }, meter: meter.clone() });
+    let ids: Vec<_> = s.catalog.photos().take(2).map(|p| p.id).collect();
+    let photo = ids[0];
+    let old = super::EditorState { draft: "saved independent draft".into(), ..Default::default() };
+    s.set_companion_editor(photo, old.clone()).unwrap();
+    s.persist().unwrap();
+    for n in 0..5 {
+        s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":format!("history {n}")}],"rounds":[]})).unwrap();
+    }
+    let new = super::EditorState { draft: "new unsaved draft".into(), ..Default::default() };
+    s.set_companion_editor(photo, new.clone()).unwrap();
+    *plan.0.lock().unwrap() = Some(("/editor.json".into(), false, false));
+    assert!(s.persist().is_err());
+    assert!(s.companion_photo_unsaved(photo));
+    assert!(!s.companion_history_unsaved(photo), "an editor-only fault cannot claim conversation history is unsaved");
+    assert!(s.companion_cleanup_pending());
+    *meter.lock().unwrap() = IoCount::default();
+    for _ in 0..10 {
+        *plan.0.lock().unwrap() = Some(("/editor.json".into(), false, false));
+        s.persist_if_dirty();
+    }
+    assert_eq!(meter.lock().unwrap().calls, 0, "cleanup timer cannot bypass editor failure backoff");
+    s.save_companion_conversation(ids[1], json!({"schema_version":2,"messages":[{"text":"B saved"}],"rounds":[]})).unwrap();
+    assert!(s.companion_photo_unsaved(photo));
+    assert!(!s.companion_photo_unsaved(ids[1]));
+    assert!(s.unsaved().is_some());
+    let mut done = false;
+    for _ in 0..1000 {
+        if !s.collect_companion(photo, 8).unwrap().pending {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    let mut before_repair = open(files.clone());
+    assert_eq!(before_repair.companion_editor(photo).unwrap(), old, "GC leaves the independent saved editor graph intact");
+    *plan.0.lock().unwrap() = None;
+    s.persist().unwrap();
+    assert!(!s.companion_photo_unsaved(photo));
+    let mut reopened = open(files);
+    assert_eq!(reopened.companion_editor(photo).unwrap(), new);
+    assert_eq!(reopened.companion_messages_page(ids[1], 0, 1).unwrap().records[0]["text"], "B saved");
+}
+
+#[test]
+fn committed_pending_removal_retry_has_bounded_observed_io_without_reverifying_the_whole_history() {
+    let files = MemStore::new();
+    let plan = FaultPlan::default();
+    let meter = Arc::new(Mutex::new(IoCount::default()));
+    let mut s = open(MeterStore { inner: FaultStore { memory: files, plan: plan.clone() }, meter: meter.clone() });
+    let photo = s.active().unwrap();
+    let messages: Vec<_> = (0..256).map(|n| json!({"text":format!("saved message {n}")})).collect();
+    *plan.0.lock().unwrap() = Some(("/pending.json".into(), false, true));
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":messages,"rounds":[]})).unwrap();
+    assert!(s.companion_pending(photo).unwrap().is_some());
+    *meter.lock().unwrap() = IoCount::default();
+    s.persist().unwrap();
+    let count = meter.lock().unwrap();
+    assert_eq!(count.unbounded_reads, 0);
+    assert!(
+        count.largest_read <= 32 * 1024,
+        "cleanup-only confirmation must not request a full record or large metadata budget: {}",
+        count.largest_read
+    );
+    assert!(count.calls <= 80, "two work units cannot reverify all 256 records: {} calls", count.calls);
+    drop(count);
+    assert!(s.companion_pending(photo).unwrap().is_none());
+    assert!(s.unsaved().is_none());
+    assert_eq!(s.companion_messages_page(photo, 0, 1).unwrap().records[0]["text"], "saved message 0");
+    assert_eq!(s.companion_photo_header(photo).unwrap().unwrap().message_count, 256);
+    assert_eq!(s.companion_messages_page(photo, 255, 1).unwrap().records[0]["text"], "saved message 255");
+}
+
+#[test]
+fn publication_confirmation_fault_is_bounded_retryable_cleanup_debt_and_never_unsaved_data() {
+    for after in [false, true] {
+        let plan = FaultPlan::default();
+        let meter = Arc::new(Mutex::new(IoCount::default()));
+        let mut s = open(MeterStore { inner: FaultStore { memory: MemStore::new(), plan: plan.clone() }, meter: meter.clone() });
+        let photo = s.active().unwrap();
+        *plan.0.lock().unwrap() = Some(("/gc/owners/".into(), after, false));
+        *plan.1.lock().unwrap() = 1; // allocation transfer first; publication proof second
+        s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"durably published"}],"rounds":[]})).unwrap();
+        assert!(s.unsaved().is_none());
+        assert!(!s.companion_photo_unsaved(photo));
+        assert!(s.companion_cleanup_pending());
+        assert!(s.companion_cleanup_error(photo).is_some());
+        assert!(s.companion_pending(photo).unwrap().is_some());
+        *plan.0.lock().unwrap() = Some(("/gc/owners/".into(), after, false));
+        *meter.lock().unwrap() = IoCount::default();
+        s.persist().unwrap();
+        assert!(s.unsaved().is_none());
+        assert!(s.companion_cleanup_error(photo).is_some());
+        assert!(s.companion_pending(photo).unwrap().is_some());
+        assert!(meter.lock().unwrap().calls <= 80);
+        assert!(meter.lock().unwrap().largest_read <= 32 * 1024);
+        s.persist().unwrap();
+        assert!(s.companion_pending(photo).unwrap().is_none());
+        assert!(s.companion_cleanup_error(photo).is_none());
+        assert_eq!(s.companion_messages_page(photo, 0, 1).unwrap().records[0]["text"], "durably published");
+    }
+}
+
+#[test]
+#[ignore = "executed in a real child process by native_reader_holds_library_lock_until_actual_retirement"]
+fn native_reader_lock_child() {
+    let dir = std::env::var_os("LC_UX09_CHILD_LIBRARY").unwrap();
+    let expected = std::env::var("LC_UX09_CHILD_EXPECT_OPEN").unwrap() == "yes";
+    let mut s = Session::new().with_fs();
+    match s.open_library(std::path::Path::new(&dir), false) {
+        Ok(_) => {
+            assert!(expected, "a second process opened A before its real reader retired");
+            let photo = s.active().unwrap();
+            s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"second process current"}],"rounds":[]})).unwrap();
+            for _ in 0..1000 {
+                if !s.collect_companion(photo, 8).unwrap().pending {
+                    break;
+                }
+            }
+            assert_eq!(s.companion_messages_page(photo, 0, 1).unwrap().records[0]["text"], "second process current");
+            s.close_library().unwrap();
+        }
+        Err(crate::EngineError::LibraryInUse(_)) => assert!(!expected, "old lock remained after actual reader retirement"),
+        Err(e) => panic!("unexpected native opener error: {e}"),
+    }
+}
+
+#[test]
+fn native_reader_holds_library_lock_until_actual_retirement_after_switching_library() {
+    let root = std::env::temp_dir().join(format!("lightcraft-ux09-process-{}", LocalRoundId::new().unwrap().as_str()));
+    let a = root.join("A");
+    let b = root.join("B");
+    let mut s = Session::new().with_fs();
+    s.open_library(&a, true).unwrap();
+    let photo = s.active().unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"live captured A"}],"rounds":[]})).unwrap();
+    let header = s.companion_photo_header(photo).unwrap().unwrap();
+    let view = s.retain_companion_history(&header).unwrap();
+    let mut reader = s.companion_reader(&header).unwrap().unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        release_rx.recv().unwrap();
+        reader.messages(0, 1, 1024).unwrap().records[0]["text"].clone()
+    });
+    s.open_library(&b, true).unwrap();
+    s.execute("photo.rate", &json!({"rating":3})).unwrap();
+    let probe = |expected: bool| {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "companion::recovery_tests::native_reader_lock_child", "--ignored", "--test-threads=1"])
+            .env("LC_UX09_CHILD_LIBRARY", &a)
+            .env("LC_UX09_CHILD_EXPECT_OPEN", if expected { "yes" } else { "no" })
+            .status()
+            .unwrap()
+            .success()
+    };
+    let protected = probe(false);
+    release_tx.send(()).unwrap();
+    let actual = worker.join().unwrap();
+    assert!(protected, "another process must remain excluded while the actual captured A reader is alive");
+    assert_eq!(actual, "live captured A");
+    assert!(probe(false), "the captured main-frame view still protects A after the native worker retires");
+    drop(view);
+    assert!(probe(true));
+    assert_eq!(s.catalog.photo(s.active().unwrap()).unwrap().rating, 3, "B remains independently usable");
+    s.close_library().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 fn receipt(s: &mut Session, photo: PhotoId) -> RoundIdentity {
     let id = RoundIdentity {

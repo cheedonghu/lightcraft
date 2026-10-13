@@ -9,12 +9,17 @@ mod cancellation_tests;
 #[cfg(test)]
 #[path = "ai_companion/disconnect_tests.rs"]
 mod disconnect_tests;
+mod drafts;
+#[cfg(test)]
+mod history_tests;
 #[cfg(test)]
 #[path = "ai_companion/identity_tests.rs"]
 mod identity_tests;
 #[cfg(test)]
 #[path = "ai_companion/library_tests.rs"]
 mod library_tests;
+#[cfg(test)]
+mod native_history_tests;
 mod network;
 mod paging;
 #[cfg(test)]
@@ -24,6 +29,7 @@ mod paging_tests;
 mod panel_tests;
 #[cfg(test)]
 mod persistence_tests;
+mod projection;
 #[cfg(test)]
 mod recovery_tests;
 
@@ -46,6 +52,9 @@ pub struct State {
     open: bool,
     consent: bool,
     prompt: String,
+    editor_photo: Option<PhotoId>,
+    editors: BTreeMap<PhotoId, drafts::Editor>,
+    dirty_editors: BTreeSet<PhotoId>,
     pub text: String,
     generation: u64,
     serial: u64,
@@ -74,6 +83,9 @@ impl Default for State {
             open: false,
             consent: false,
             prompt: String::new(),
+            editor_photo: None,
+            editors: BTreeMap::new(),
+            dirty_editors: BTreeSet::new(),
             text: String::new(),
             generation: 0,
             serial: 0,
@@ -156,6 +168,7 @@ struct Job {
     round: String,
     state: String,
     prompt: String,
+    draft_revision: u64,
     user_message: usize,
     history: Vec<Value>,
     history_preflight: bool,
@@ -296,11 +309,19 @@ impl State {
     fn start(&mut self, app: &mut LightcraftApp) -> Result<Value, String> {
         self.start_for(app, None)
     }
+    #[cfg(test)]
     fn start_for(&mut self, app: &mut LightcraftApp, explicit: Option<PhotoId>) -> Result<Value, String> {
+        self.start_with_prompt(app, explicit, None)
+    }
+    fn start_with_prompt(&mut self, app: &mut LightcraftApp, explicit: Option<PhotoId>, supplied_prompt: Option<&str>) -> Result<Value, String> {
         if self.connection.as_ref().is_none_or(|c| !c.alive.load(Ordering::Relaxed)) {
             self.retire_disconnected_jobs(app)?;
         }
         let photo = self.admission(app, explicit)?;
+        self.sync_editor(app)?;
+        if let Some(prompt) = supplied_prompt {
+            self.prompt = prompt.into();
+        }
         app.session.end_interaction().map_err(|e| e.to_string())?;
         let original = app.session.develop_of(photo).ok_or("照片不存在。")?;
         let content = app.session.catalog.photo(photo).map(|p| lightcraft_engine::media::content_key(p)).ok_or("照片不存在。")?;
@@ -334,6 +355,9 @@ impl State {
             .map_err(|e| e.to_string())?
             .flatten();
         let history = if reader.is_some() { Vec::new() } else { self.history(app, photo)? };
+        if reader.is_none() {
+            projection::reserve_input(&history, &prompt, &original)?;
+        }
         let history_tail = self.conversations.get(&photo).map(|c| c.messages.clone()).unwrap_or_default();
         if app.session.library.is_some()
             && self
@@ -370,6 +394,7 @@ impl State {
                 round: String::new(),
                 state: "submitting".into(),
                 prompt: prompt.clone(),
+                draft_revision: 0,
                 user_message: self.conversations.get(&photo).map(|c| c.messages.len()).unwrap_or(0),
                 history,
                 history_preflight: reader.is_some(),
@@ -390,6 +415,10 @@ impl State {
                 inflight_plan: None,
             },
         );
+        let draft_revision = self.clear_submitted_draft(app, photo)?;
+        if let Some(job) = self.jobs.get_mut(&photo) {
+            job.draft_revision = draft_revision;
+        }
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
         conversation.records.push(json!({"local_round_id":identity.local_round_id,"photo_id":photo.0,"request_text":prompt,"submission_seq":identity.submission_seq,"connection_generation":identity.connection_generation,"runtime_library_generation":identity.scope.library_generation,"original":self.jobs.get(&photo).map(|j| &j.checkpoint.original),"stages":[],"phase":"submitting"}));
         conversation.messages.push(json!({"role":"user","text":prompt,"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request"}));
@@ -402,12 +431,14 @@ impl State {
             }
             return Err(error);
         }
-        if let Some(reader) = reader
-            && let Err(error) =
-                self.begin_history(reader, identity.clone(), history_tail, self.jobs.get(&photo).ok_or("AI 轮次不存在。")?.cancel.clone())
-        {
-            self.fail_one(app, photo, &error);
-            return Err(error);
+        if let Some(reader) = reader {
+            let job = self.jobs.get(&photo).ok_or("AI 轮次不存在。")?;
+            // This owned envelope belongs to the leased submission, not later drafts.
+            let (prompt, original, cancel) = (job.prompt.clone(), job.checkpoint.original.clone(), job.cancel.clone());
+            if let Err(error) = self.begin_history(reader, identity.clone(), history_tail, prompt, original, cancel) {
+                self.fail_one(app, photo, &error);
+                return Err(error);
+            }
         }
         Ok(json!({"started":true,"photo":photo.0,"localRoundId":identity.local_round_id}))
     }
@@ -483,6 +514,7 @@ impl State {
         if self.jobs.contains_key(&photo) {
             self.request_feedback();
         }
+        let recovery = self.jobs.get(&photo).map(|job| (job.identity.scope, job.draft_revision, job.prompt.clone()));
         if self.jobs.get(&photo).is_some_and(|j| j.history_preflight) {
             if let Some(job) = self.jobs.get_mut(&photo) {
                 job.cancel.store(true, Ordering::Relaxed);
@@ -498,6 +530,9 @@ impl State {
         } else {
             return Ok(Value::Null);
         };
+        if let Some((scope, revision, prompt)) = recovery {
+            self.restore_text(photo, scope, revision, &prompt);
+        }
         if !round.is_empty() {
             if self.send(format!("/v1/rounds/{round}/stop"), json!({"reason":"user_stop"}), 0, round).is_err() {
                 self.close_connection();
@@ -507,7 +542,7 @@ impl State {
             // the round id. A new request cannot overtake its cancellation.
             if let Some(conversation) = self.conversations.get_mut(&photo) {
                 conversation.pending.clear();
-                close_pending_tools(&mut conversation.messages);
+                close_pending_tools(&mut conversation.messages, "cancelled");
                 conversation.notice = tr("Stopped generating. Confirming cancellation of the submission…").into();
             }
             return Ok(Value::Null);
@@ -516,9 +551,11 @@ impl State {
         Ok(Value::Null)
     }
     fn finish(&mut self, photo: PhotoId, notice: &str) {
-        if let Some(job) = self.jobs.remove(&photo)
-            && let Some(conversation) = self.conversations.get_mut(&photo)
-        {
+        let Some(job) = self.jobs.remove(&photo) else { return };
+        let completed = self.conversations.get(&photo).is_some_and(|c| {
+            c.records.iter().any(|r| r["local_round_id"] == job.identity.local_round_id.as_str() && r["local_terminal"] == "completed")
+        });
+        if let Some(conversation) = self.conversations.get_mut(&photo) {
             if !job.plans.is_empty() {
                 conversation.checkpoint = Some(job.checkpoint.clone());
             }
@@ -531,6 +568,7 @@ impl State {
                     for step in stages {
                         if step["execution_outcome"] == "not_executed" {
                             step["execution_outcome"] = json!(if cancelled { "cancelled" } else { "failed" });
+                            conversation.messages.push(json!({"role":"user","display_kind":"execution_feedback","complete_state":"complete","local_round_id":job.identity.local_round_id,"local_message_id":format!("{}-{}-not-executed",job.identity.local_round_id.as_str(),step["plan_id"]),"text":format!("Actual execution feedback: {}",json!({"plan_id":step.get("plan_id"),"outcome":if cancelled {"cancelled"} else {"failed"},"executed":false,"reason_code":"ended_before_plan_publication","photo_revision":job.checkpoint.revision,"actual_state":job.checkpoint.expected}))}));
                         }
                     }
                 }
@@ -550,8 +588,17 @@ impl State {
                 record["backend_round_id"] = if job.round.is_empty() { Value::Null } else { json!(job.round) };
             }
             conversation.pending.clear();
-            close_pending_tools(&mut conversation.messages);
+            let terminal = conversation
+                .records
+                .iter()
+                .find(|r| r["local_round_id"] == job.identity.local_round_id.as_str())
+                .and_then(|r| r["local_terminal"].as_str())
+                .unwrap_or("failed");
+            close_pending_tools(&mut conversation.messages, terminal);
             conversation.notice = notice.into();
+        }
+        if !completed {
+            self.restore_request(photo, &job);
         }
     }
     fn server(&mut self, app: &mut LightcraftApp, ctx: &egui::Context, kind: &str, data: &Value) -> Result<(), String> {
@@ -693,8 +740,6 @@ impl State {
                 {
                     stages.push(json!({"stage":stage,"backend_stage":data.get("stage"),"model_call_id":model_call,"plan_id":plan_id,"tool_call_id":payload.get("tool_call_id"),"reason":payload.get("reason"),"operations":payload.get("operations"),"before_state":before,"proposed_state":candidate.as_ref().ok(),"execution_outcome":if candidate.is_ok() {"not_executed"} else {"validation_failed"}}));
                 }
-                let candidate = candidate?;
-                self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?.inflight_plan = Some(plan_id.into());
                 if let Some(id) = payload.get("tool_call_id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                     self.conversations
                         .get_mut(&photo)
@@ -702,6 +747,14 @@ impl State {
                         .messages
                         .push(json!({"role":"tool","text":"plan_proposed; await actual client execution feedback","tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":payload.get("tool_request_id"),"stage":payload.get("stage"),"model_call_id":payload.get("model_call_id"),"complete_state":"complete"}));
                 }
+                let candidate = match candidate {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?.messages.push(json!({"role":"user","display_kind":"execution_feedback","complete_state":"complete","local_round_id":local_round_id,"local_message_id":format!("{}-{plan_id}-validation-failure",local_round_id.as_str()),"text":format!("Actual execution feedback: {}",json!({"plan_id":plan_id,"outcome":"failed","reason_code":"validation_failed","executed":false,"photo_revision":payload.get("expected_revision"),"actual_state":before}))}));
+                        return Err(error);
+                    }
+                };
+                self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?.inflight_plan = Some(plan_id.into());
                 self.spawn(app, photo, Some(payload.clone()), Arc::new(candidate))?;
             }
             "round.ended" => {
@@ -1010,6 +1063,10 @@ impl State {
             self.pending_confirmations.clear();
             self.confirmation_retry_at = None;
             self.conversations.clear();
+            self.editors.clear();
+            self.dirty_editors.clear();
+            self.editor_photo = None;
+            self.prompt.clear();
             self.completed.clear();
             self.pending_local_saves.clear();
             self.local_save_retry_at = None;
@@ -1026,10 +1083,13 @@ impl State {
             ctx.request_repaint();
             return;
         }
+        if let Err(error) = self.sync_editor(app).and_then(|()| self.stage_editors(app)) {
+            self.text = error;
+        }
         self.workers.retain(|_, alive| alive.load(Ordering::Relaxed));
         self.poll_pages(app);
         for (photo, c) in &mut self.conversations {
-            if c.storage_notice && !app.session.companion_photo_unsaved(*photo) && !self.pending_local_saves.contains(photo) {
+            if c.storage_notice && !app.session.companion_history_unsaved(*photo) && !self.pending_local_saves.contains(photo) {
                 c.notice = tr("AI history saved. Photo changes are kept.").into();
                 c.storage_notice = false;
             }
@@ -1314,10 +1374,11 @@ impl State {
         }
     }
     fn fail_one(&mut self, app: &mut LightcraftApp, photo: PhotoId, error: &str) {
+        let error = tr(error);
         self.mark_failure(photo, error);
         let _ = self.stop(photo);
         if let Some(c) = self.conversations.get_mut(&photo) {
-            c.storage_notice = app.session.companion_photo_unsaved(photo);
+            c.storage_notice = app.session.companion_history_unsaved(photo);
             c.notice = if c.storage_notice {
                 tr("Photo changes are kept. AI history is not saved; saving will retry.").into()
             } else {
@@ -1397,22 +1458,24 @@ fn capabilities(settings: &DevelopSettings) -> Value {
     json!({"capability_version":"lightcraft-v2","controls":lightcraft_engine::companion::control_ranges(settings),"edit_schemas":lightcraft_engine::companion::operation_schemas(settings),"tools":tools})
 }
 
-fn close_pending_tools(messages: &mut Vec<Value>) {
-    let mut pending = BTreeMap::new();
+fn close_pending_tools(messages: &mut Vec<Value>, outcome: &str) {
+    let mut pending: Vec<(String, Value)> = Vec::new();
     for message in messages.iter() {
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    pending.insert(id.to_owned(), message.clone());
+                    // Preserve original call order; malformed legacy associations are
+                    // never repaired by guessing, and fail the projection validator.
+                    pending.push((id.to_owned(), message.clone()));
                 }
             }
         }
         if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
-            pending.remove(id);
+            pending.retain(|(pending_id, _)| pending_id != id);
         }
     }
     for (id, owner) in pending {
-        messages.push(json!({"role":"tool","tool_call_id":id,"text":"cancelled or failed before confirmed tool completion","local_round_id":owner.get("local_round_id"),"stage":owner.get("stage"),"model_call_id":owner.get("model_call_id"),"complete_state":"complete","display_kind":"tool_result"}));
+        messages.push(json!({"role":"tool","tool_call_id":id,"text":json!({"outcome":if outcome=="cancelled" {"cancelled"} else {"failed"},"executed":false,"reason_code":"ended_before_tool_execution"}).to_string(),"local_round_id":owner.get("local_round_id"),"stage":owner.get("stage"),"model_call_id":owner.get("model_call_id"),"complete_state":"complete","display_kind":"tool_result"}));
     }
 }
 
@@ -1420,6 +1483,7 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
     let mut state = std::mem::take(&mut app.ai);
     state.poll_inner(app, ctx);
     if state.open
+        && !state.feedback_needs_paint(ctx)
         && let Some(photo) = app.session.active()
         && let Err(e) = state.load(app, photo)
     {
@@ -1430,6 +1494,7 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
 pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
     let mut state = std::mem::take(&mut app.ai);
     let result = (|| {
+        state.stage_editors(app)?;
         state.flush_local_saves(app)?;
         let photos: Vec<_> = state.jobs.keys().copied().collect();
         for photo in photos {
@@ -1438,7 +1503,9 @@ pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
             state.finish(photo, "图库已关闭，保留最近一次完整结果。");
             state.save(app, photo)?;
         }
+        state.stage_editors(app)?;
         state.flush_local_saves(app)?;
+        app.session.persist().map_err(|e| e.to_string())?;
         let pending = std::mem::take(&mut state.pending_confirmations);
         let mut receipt_failure = None;
         for (identity, plan) in pending {
@@ -1477,6 +1544,10 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         state.pending_confirmations.clear();
         state.confirmation_retry_at = None;
         state.conversations.clear();
+        state.editors.clear();
+        state.dirty_editors.clear();
+        state.editor_photo = None;
+        state.prompt.clear();
         state.completed.clear();
         state.pending_local_saves.clear();
         state.local_save_retry_at = None;
@@ -1496,14 +1567,15 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             })
         }
         "ai.start" => {
-            if let Some(prompt) = params.get("prompt").and_then(Value::as_str) {
-                state.prompt = prompt.into();
+            if let Err(error) = state.sync_editor(app) {
+                app.ai = state;
+                return Some(Err(error));
             }
             let explicit = params
                 .get("photo")
                 .map(|v| v.as_u64().map(PhotoId).ok_or_else(|| tr("The requested photo must match the single selected photo.").to_owned()))
                 .transpose();
-            explicit.and_then(|p| state.start_for(app, p))
+            explicit.and_then(|p| state.start_with_prompt(app, p, params.get("prompt").and_then(Value::as_str)))
         }
         "ai.stop" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
             state.pending_local_saves.insert(p);
@@ -1545,7 +1617,9 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             state.load(app, p)?;
             let record = params.get("record").and_then(Value::as_u64).unwrap_or(0);
             let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
-            state.request_page(app, p, lightcraft_engine::companion::storage::HistoryCursor { record, offset })?;
+            let cursor = lightcraft_engine::companion::storage::HistoryCursor { record, offset };
+            state.navigate_page(app, p, cursor)?;
+            state.request_page(app, p, cursor)?;
             Ok(json!({"requested":true}))
         }),
         "ai.undo" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| undo(&mut state, app, p)),
@@ -1654,6 +1728,12 @@ fn append_visible_message(text: &mut String, message: &Value) {
 
 pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     app.ai.open = true;
+    let mut state = std::mem::take(&mut app.ai);
+    let result = if state.feedback_needs_paint(ui.ctx()) { state.sync_editor_deferred(app) } else { state.sync_editor(app) };
+    if let Err(error) = result {
+        state.text = error;
+    }
+    app.ai = state;
     egui::Frame::NONE.inner_margin(egui::Margin::same(12)).show(ui, |ui| {
         ui.horizontal(|ui| {
             let heading = ui.heading(tr("AI Assistant"));
@@ -1697,7 +1777,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             // Supported short/floating/stacked Tools panes scroll their compact body.
             // Stop and consent precede the draft; full-size panes retain a fixed footer.
             egui::ScrollArea::vertical()
-                .id_salt(("ai-compact-composer", photo.0, app.ai.jobs.contains_key(&photo)))
+                .id_salt(("ai-compact-composer", app.session.library_generation(), photo.0, app.ai.jobs.contains_key(&photo)))
                 .auto_shrink([false, false])
                 .min_scrolled_height(0.0)
                 .max_height(height)
@@ -1722,23 +1802,39 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
     let controls_top = ui.cursor().top();
     history_controls(app, ui, photo);
     let controls_height = (ui.cursor().top() - controls_top).max(0.0);
-    // The caller bounds this region: an allocated rect in the normal host,
-    // or scrollable content in the compact host whose remainder may be zero.
     let height = (height - controls_height).max(0.0);
-    let scroll = egui::ScrollArea::vertical()
-        .id_salt(("ai-messages", photo.0))
+    let expected = app.ai.editors.get(&photo).and_then(|e| e.data.reading_cursor);
+    let ready = app.ai.conversations.get(&photo).is_none_or(|c| {
+        c.prefix.is_none()
+            || c.view
+                .as_ref()
+                .is_some_and(|view| Some(view.cursor) == expected && (view.bytes > 0 || c.prefix.as_ref().is_some_and(|h| h.message_count == 0)))
+    });
+    let final_page = app.ai.conversations.get(&photo).is_none_or(|c| c.view.as_ref().is_none_or(|view| view.next.is_none()));
+    let editor = app.ai.editors.get_mut(&photo);
+    let tail = editor.as_ref().is_none_or(|e| e.data.follow_tail);
+    let restore = editor.and_then(|e| (ready && std::mem::replace(&mut e.restore_scroll, false)).then_some(e.data.scroll_offset));
+    let mut area = egui::ScrollArea::vertical()
+        .id_salt(("ai-messages", app.session.library_generation(), photo.0))
         .auto_shrink([false, false])
-        .stick_to_bottom(true)
+        .stick_to_bottom(tail)
         .max_height(height)
-        .min_scrolled_height(height)
-        .show(ui, |ui| {
-            if let Some(conversation) = app.ai.conversations.get(&photo) {
-                ui.label(display_text(conversation));
-            } else if !app.ai.text.is_empty() {
-                ui.label(&app.ai.text);
-            }
-        });
+        .min_scrolled_height(height);
+    if let Some(offset) = restore {
+        area = area.vertical_scroll_offset(offset);
+    }
+    let scroll = area.show(ui, |ui| {
+        if let Some(conversation) = app.ai.conversations.get(&photo) {
+            ui.label(display_text(conversation));
+        } else if !app.ai.text.is_empty() {
+            ui.label(&app.ai.text);
+        }
+    });
     composer_widget(ui, "ai:messages", scroll.inner_rect);
+    let at_bottom = scroll.state.offset.y + scroll.inner_rect.height() >= scroll.content_size.y - 2.0;
+    if ready {
+        drafts::scroll_position(app, photo, scroll.state.offset.y, at_bottom && final_page);
+    }
 }
 
 fn phase_text(phase: &str) -> &'static str {
@@ -1764,6 +1860,7 @@ fn composer_widget(ui: &egui::Ui, id: &str, rect: egui::Rect) {
 fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact: bool) {
     let sizing = ui.is_sizing_pass();
     let busy = app.ai.jobs.contains_key(&photo);
+    let editor_ready = app.ai.editor_photo == Some(photo) && app.ai.editors.contains_key(&photo);
     let worker = app.ai.worker_busy(photo);
     let stage = ui.horizontal_wrapped(|ui| {
         if busy {
@@ -1786,6 +1883,8 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
             }
         } else if worker {
             ui.label(tr("Finishing processing for this photo…"));
+        } else if !editor_ready {
+            ui.label(tr("Loading draft…"));
         } else {
             ui.label(tr("Ready for your request"));
         }
@@ -1800,19 +1899,25 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
     // The draft viewport is fixed, so measuring needs no copy of user text.
     let mut measured_prompt = String::new();
     let prompt = if sizing { &mut measured_prompt } else { &mut app.ai.prompt };
-    let input = egui::ScrollArea::vertical().id_salt("ai-prompt-scroll").min_scrolled_height(48.0).max_height(48.0).auto_shrink([false, false]).show(
-        ui,
-        |ui| {
+    let input = egui::ScrollArea::vertical()
+        .id_salt(("ai-prompt-scroll", app.session.library_generation(), photo.0))
+        .min_scrolled_height(48.0)
+        .max_height(48.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
             ui.add_enabled(
-                !busy,
+                !busy && editor_ready,
                 egui::TextEdit::multiline(prompt)
+                    .id_salt(("ai-draft", app.session.library_generation(), photo.0))
                     .desired_width(f32::INFINITY)
                     .desired_rows(2)
                     .hint_text(tr("For example: review this photo, then naturally optimize it")),
             )
-        },
-    );
+        });
     composer_widget(ui, "field:aiPrompt", input.inner_rect);
+    if !sizing && input.inner.changed() {
+        drafts::capture(app);
+    }
     if !compact {
         consent_control(app, ui, photo);
     }
@@ -1821,7 +1926,7 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
         if let Err(message) = &admission {
             ui.label(message);
         }
-        let start = ui.add_enabled(admission.is_ok(), egui::Button::new(tr("Analyze and Optimize")));
+        let start = ui.add_enabled(editor_ready && admission.is_ok(), egui::Button::new(tr("Analyze and Optimize")));
         composer_widget(ui, "button:aiStart", start.rect);
         if !sizing
             && start.clicked()

@@ -41,6 +41,8 @@ struct Owner {
     ordinal: u64,
     previous: Option<OwnerRoot>,
     highwater: u64,
+    #[serde(default)]
+    confirmed_manifest: Option<String>,
 }
 fn owner_key(photo: PhotoId, tx: &str) -> String {
     format!("{}/gc/owners/{tx}.json", base(photo))
@@ -84,17 +86,43 @@ pub(super) fn own(store: &mut dyn Store, p: &PendingCommit) -> Result<()> {
             return Err(error("allocation reservation shrank"));
         }
         owner.highwater = p.reserved_files;
+        owner.confirmed_manifest = None;
         // Repeat both bounded writes: visible ownership is not durable proof.
         write_gc(store, &owner_key(p.photo, &p.transaction_id), &owner)?;
         root
     } else {
         let ordinal = current.as_ref().map(|r| r.ordinal).unwrap_or(0).checked_add(1).ok_or_else(|| error("allocation owner sequence exhausted"))?;
         let root = OwnerRoot { transaction: p.transaction_id.clone(), ordinal };
-        let owner = Owner { photo: p.photo, transaction: p.transaction_id.clone(), ordinal, previous: current, highwater: p.reserved_files };
+        let owner = Owner {
+            photo: p.photo,
+            transaction: p.transaction_id.clone(),
+            ordinal,
+            previous: current,
+            highwater: p.reserved_files,
+            confirmed_manifest: None,
+        };
         write_gc(store, &owner_key(p.photo, &p.transaction_id), &owner)?;
         root
     };
     write_gc(store, &key, &root)
+}
+fn publication_owner(store: &mut dyn Store, p: &PendingCommit) -> Result<Owner> {
+    let root: OwnerRoot = read_gc(store, &owner_root_key(p.photo))?.ok_or_else(|| error("publication ownership missing"))?;
+    let owner = load_owner(store, p.photo, &root)?;
+    if owner.transaction != p.transaction_id || owner.highwater != p.reserved_files || p.head.manifest_digest.is_empty() {
+        return Err(error("publication ownership changed; files protected"));
+    }
+    Ok(owner)
+}
+/// Called only after HEAD and revert writes actually succeed. This proof is
+/// cleanup metadata: its failure cannot undo the already durable publication.
+pub(super) fn confirm_publication(store: &mut dyn Store, p: &PendingCommit) -> Result<()> {
+    let mut owner = publication_owner(store, p)?;
+    owner.confirmed_manifest = Some(p.head.manifest_digest.clone());
+    write_gc(store, &owner_key(p.photo, &p.transaction_id), &owner)
+}
+pub(super) fn publication_confirmed(store: &mut dyn Store, p: &PendingCommit) -> Result<bool> {
+    Ok(publication_owner(store, p)?.confirmed_manifest.as_deref() == Some(p.head.manifest_digest.as_str()))
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Root {

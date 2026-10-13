@@ -31,13 +31,19 @@ pub(crate) fn for_store(store: &dyn Store) -> Arc<Pins> {
 pub struct HistoryRetention {
     pins: Arc<Pins>,
     id: u64,
+    _library_lock: Option<Arc<lightcraft_catalog::LibraryLock>>,
 }
 impl Drop for HistoryRetention {
     fn drop(&mut self) {
         self.pins.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).headers.remove(&self.id);
     }
 }
-pub(super) fn capture(pins: &Arc<Pins>, store: &mut dyn Store, header: &PhotoHeader) -> Result<HistoryRetention> {
+pub(super) fn capture(
+    pins: &Arc<Pins>,
+    store: &mut dyn Store,
+    header: &PhotoHeader,
+    library_lock: Option<Arc<lightcraft_catalog::LibraryLock>>,
+) -> Result<HistoryRetention> {
     let mut state = pins.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if state.headers.len() >= 64 || pagination::serialized_length(header)? > SMALL as usize || !valid_transaction(&header.transaction_id) {
         return Err(error("captured reader retention capacity exceeded"));
@@ -49,5 +55,5 @@ pub(super) fn capture(pins: &Arc<Pins>, store: &mut dyn Store, header: &PhotoHea
     let id = state.next.checked_add(1).ok_or_else(|| error("reader retention sequence exhausted"))?;
     state.next = id;
     state.headers.insert(id, header.clone());
-    Ok(HistoryRetention { pins: pins.clone(), id })
+    Ok(HistoryRetention { pins: pins.clone(), id, _library_lock: library_lock })
 }

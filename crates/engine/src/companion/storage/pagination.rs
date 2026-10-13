@@ -578,7 +578,7 @@ impl Session {
         if library.files.retention_namespace().is_none() {
             return Err(error("background history reader requires stable Store retention namespace"));
         }
-        let pin = reader_pins::capture(&self.companion_archive.readers, store.as_mut(), header)?;
+        let pin = reader_pins::capture(&self.companion_archive.readers, store.as_mut(), header, library.retain_read_lock())?;
         Ok(Some(HistoryReader { store, header: header.clone(), _pin: pin }))
     }
     pub fn companion_messages_bounded(&mut self, header: &PhotoHeader, cursor: u64, count: usize, bytes: usize) -> Result<RecordPage> {
@@ -606,9 +606,9 @@ pub(crate) struct TailUpdate {
     pub records: Vec<Value>,
     pub metadata: Value,
 }
-pub(crate) fn persist_tail(store: &mut dyn Store, photo: PhotoId, update: &TailUpdate) -> Result<()> {
+pub(crate) fn persist_tail(store: &mut dyn Store, photo: PhotoId, update: &TailUpdate) -> Result<String> {
     let pending = tail(store, photo, update.prefix.as_ref(), &update.messages, &update.rounds, &update.records, &update.metadata)?;
-    commit(store, &pending)
+    commit(store, &pending).map(|()| pending.transaction_id)
 }
 
 struct BorrowedMessage<'a> {
@@ -742,6 +742,12 @@ impl Session {
         let result = confirm_receipt(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), photo, &receipt);
         match &result {
             Ok(_) => {
+                self.companion_archive.cleanup_photos.insert(photo);
+                if let Ok(Some(p)) = self.companion_pending(photo)
+                    && !p.head.manifest_digest.is_empty()
+                {
+                    self.companion_archive.cleanup_published.insert(photo, p.transaction_id);
+                }
                 if let Some(queued) = self.companion_archive.receipts.get_mut(&photo) {
                     queued.retain(|r| r != &receipt);
                     if queued.is_empty() {
@@ -802,7 +808,9 @@ fn confirm_receipt(store: &mut dyn Store, photo: PhotoId, receipt: &Value) -> Re
             resumed = Some(pending);
         } else {
             commit(store, &pending)?;
-            finish_pending(store, photo);
+            if let Err(e) = finish_pending(store, photo) {
+                log::warn!("archive publication cleanup: {e}");
+            }
         }
     }
     let Some(h) = header(store, photo)? else { return Ok(false) };
@@ -876,7 +884,9 @@ fn confirm_receipt(store: &mut dyn Store, photo: PhotoId, receipt: &Value) -> Re
     writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
     write(writer.store, &format!("{}/pending.json", base(photo)), &writer.pending)?;
     commit(writer.store, &writer.pending)?;
-    finish_pending(writer.store, photo);
+    if let Err(e) = finish_pending(writer.store, photo) {
+        log::warn!("archive publication cleanup: {e}");
+    }
     Ok(true)
 }
 
