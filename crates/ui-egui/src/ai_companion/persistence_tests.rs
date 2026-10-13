@@ -241,3 +241,76 @@ fn failed_render_saves_true_failure_and_late_receipt_cannot_claim_a_successful_p
     reading.load(&mut reopened, photo).unwrap();
     assert!(reading.conversations[&photo].messages.iter().any(|m| m["text"].as_str().is_some_and(|t| t.contains("render_failed"))));
 }
+
+#[test]
+fn invalid_plan_failure_reopens_as_failed_without_claiming_user_cancellation() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut app = app(catalog.clone(), files.clone());
+    let photo = app.session.active().unwrap();
+    let original = app.session.develop_of(photo).unwrap();
+    let (connection, requests, events) = network::test_connection();
+    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    state.start(&mut app).unwrap();
+    requests.try_recv().unwrap();
+    let identity = state.jobs[&photo].identity.clone();
+    phase(&mut state, &mut app, photo, "awaiting_input");
+    render(&mut state, &mut app);
+    requests.try_recv().unwrap();
+    phase(&mut state, &mut app, photo, "awaiting_initial_execution");
+    let revision = app.session.photo_revision(photo);
+    events.try_send(network::Event::Server {kind:"edit.plan".into(),data:json!({"round_id":"round","payload":{"plan_id":"invalid","expected_revision":revision,"capability_version":"lightcraft-v2","operations":[{"type":"set_controls","values":{"not.a.control":1.0}}]}})}).unwrap();
+    state.poll_inner(&mut app, &egui::Context::default());
+    assert!(state.jobs.is_empty());
+    assert!(requests.try_recv().unwrap().path.ends_with("/stop"));
+    app.session.close_library().unwrap();
+    let mut reopened = self::app(catalog, files);
+    let record = reopened.session.companion_round(photo, identity.local_round_id.as_str()).unwrap().unwrap();
+    assert_eq!(record["local_terminal"], "failed");
+    assert_eq!(record["stages"][0]["execution_outcome"], "validation_failed");
+    assert_eq!(*reopened.session.develop_of(photo).unwrap(), *original);
+}
+
+#[test]
+fn post_failure_and_explicit_stop_preserve_published_result_but_have_distinct_terminal_facts() {
+    for user_stop in [false, true] {
+        let (catalog, files) = (MemStore::new(), MemStore::new());
+        let mut app = app(catalog.clone(), files.clone());
+        let photo = app.session.active().unwrap();
+        let (connection, requests, events) = network::test_connection();
+        let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+        state.start(&mut app).unwrap();
+        requests.try_recv().unwrap();
+        let identity = state.jobs[&photo].identity.clone();
+        phase(&mut state, &mut app, photo, "awaiting_input");
+        render(&mut state, &mut app);
+        requests.try_recv().unwrap();
+        phase(&mut state, &mut app, photo, "awaiting_initial_execution");
+        let revision = app.session.photo_revision(photo);
+        state.server(&mut app,&egui::Context::default(),"edit.plan",&json!({"round_id":"round","payload":{"plan_id":"initial","expected_revision":revision,"capability_version":"lightcraft-v2","operations":[{"type":"set_controls","values":{"light.exposure":0.3}}]}})).unwrap();
+        render(&mut state, &mut app);
+        let execution = requests.try_recv().unwrap();
+        if user_stop {
+            state.stop(photo).unwrap();
+            state.save(&mut app, photo).unwrap();
+        } else {
+            events
+                .try_send(network::Event::Response {
+                    submission: 0,
+                    round: "round".into(),
+                    path: execution.path,
+                    identity: execution.identity,
+                    result: Err("fixture POST failed".into()),
+                })
+                .unwrap();
+            state.poll_inner(&mut app, &egui::Context::default());
+        }
+        assert!(state.jobs.is_empty());
+        app.session.close_library().unwrap();
+        let mut reopened = self::app(catalog, files);
+        let record = reopened.session.companion_round(photo, identity.local_round_id.as_str()).unwrap().unwrap();
+        assert_eq!(record["local_terminal"], if user_stop { "cancelled" } else { "failed" });
+        assert_eq!(record["stages"][0]["execution_outcome"], "succeeded");
+        assert_eq!(record["recent_complete_result"]["light"]["exposure"], 0.3);
+        assert_eq!(reopened.session.develop_of(photo).unwrap().light.exposure, 0.3);
+    }
+}

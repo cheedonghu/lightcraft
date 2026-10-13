@@ -322,21 +322,27 @@ impl State {
                 if record.get("local_terminal").is_none() {
                     record["local_terminal"] = json!(if job.stopped { "cancelled" } else { "failed" });
                 }
+                let cancelled = record["local_terminal"] == "cancelled";
                 if let Some(stages) = record.get_mut("stages").and_then(Value::as_array_mut) {
                     for step in stages {
                         if step["execution_outcome"] == "not_executed" {
-                            step["execution_outcome"] = json!(if job.stopped { "cancelled" } else { "failed" });
+                            step["execution_outcome"] = json!(if cancelled { "cancelled" } else { "failed" });
                         }
                     }
                 }
                 if let Some(requests) = record.get_mut("tool_requests").and_then(Value::as_array_mut) {
                     for request in requests {
                         if request["outcome"] == "not_executed" {
-                            request["outcome"] = json!(if job.stopped { "cancelled" } else { "failed" });
+                            request["outcome"] = json!(if cancelled { "cancelled" } else { "failed" });
                         }
                     }
                 }
-                record["terminal_notice"] = json!(notice);
+                let terminal_notice = record
+                    .pointer("/local_failure/message")
+                    .and_then(Value::as_str)
+                    .map(|e| format!("处理未完成：{e}。保留最近完整结果。"))
+                    .unwrap_or_else(|| notice.into());
+                record["terminal_notice"] = json!(terminal_notice);
                 record["backend_round_id"] = if job.round.is_empty() { Value::Null } else { json!(job.round) };
             }
             conversation.pending.clear();
@@ -854,6 +860,7 @@ impl State {
                         continue;
                     }
                     if let Err(error) = result {
+                        self.mark_failure(identity.scope.photo, &error.to_string());
                         if path.ends_with("/stop") || (submission != 0 && !error.rejected) {
                             // A failed creation POST may have been accepted. Disconnect
                             // rather than abandon an unidentifiable server task.
@@ -916,7 +923,22 @@ impl State {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
+    /// Cancelling transport/work is a cleanup action, not the cause of failure.
+    fn mark_failure(&mut self, photo: PhotoId, error: &str) {
+        let Some(job) = self.jobs.get(&photo).filter(|j| !j.stopped) else { return };
+        if let Some(record) = self
+            .conversations
+            .get_mut(&photo)
+            .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == job.identity.local_round_id.as_str()))
+        {
+            if record.get("local_terminal").is_none() {
+                record["local_terminal"] = json!("failed");
+            }
+            record["local_failure"] = json!({"message":error,"reason":"client_failure"});
+        }
+    }
     fn fail_one(&mut self, app: &mut LightcraftApp, photo: PhotoId, error: &str) {
+        self.mark_failure(photo, error);
         let _ = self.stop(photo);
         if let Some(c) = self.conversations.get_mut(&photo) {
             c.notice = format!("处理未完成：{error}。保留最近完整结果。");
