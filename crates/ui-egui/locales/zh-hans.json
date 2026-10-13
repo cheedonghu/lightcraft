@@ -2071,6 +2071,9 @@
   "Stopping generation…": "正在停止生成…",
   "Generation stopped; confirming submission cancellation…": "已停止生成，正在确认取消提交…",
   "Generation stopped; keeping the latest complete result.": "已停止生成，保留最近一次完整结果。",
+  "The AI draft is unavailable.": "AI 草稿不可用。",
+  "The AI draft belongs to a closed library.": "AI 草稿属于已关闭的图库。",
   "The complete AI history exceeds the service limit. Local history is retained.": "AI 完整历史超过服务限制，完整本地历史仍保留，未删减。",
-  "The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.": "AI 历史不完整或无效，完整本地历史仍保留。请修复附件或删除整段对话后重试。"
+  "The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.": "AI 历史不完整或无效，完整本地历史仍保留。请修复附件或删除整段对话后重试。",
+  "Loading draft…": "正在读取草稿…"
 }

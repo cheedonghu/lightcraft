@@ -18,6 +18,7 @@ struct Saved {
 
 #[derive(Default)]
 pub(crate) struct Archive {
+    pub(super) editors: super::editor::Editors,
     pub(super) photos: BTreeMap<PhotoId, Value>,
     pub(super) legacy: bool,
     pub(super) v2: bool,
@@ -88,11 +89,14 @@ impl Archive {
         }
     }
     pub(crate) fn needs_retry(&self) -> bool {
-        (self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty())
+        (self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() || self.editors.dirty())
             && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t)
     }
     pub(crate) fn unsaved(&self) -> Option<&str> {
-        self.error.as_deref().filter(|_| self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty())
+        self.error
+            .as_deref()
+            .filter(|_| self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty())
+            .or_else(|| self.editors.unsaved())
     }
     fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {
         if let Some(e) = &self.blocked {
@@ -216,7 +220,22 @@ impl Session {
     }
     pub(crate) fn flush_companion(&mut self) -> Result<()> {
         match self.library.as_mut() {
-            Some(lib) => self.companion_archive.persist(lib),
+            Some(lib) => {
+                let editor_dirty = self.companion_archive.editors.dirty();
+                if editor_dirty && !self.companion_archive.legacy && self.companion_archive.blocked.is_none() {
+                    self.companion_archive.v2 = true;
+                }
+                let editors = self.companion_archive.editors.persist(
+                    lib.files.as_mut(),
+                    self.companion_archive.legacy,
+                    self.companion_archive.blocked.as_deref(),
+                );
+                let conversation = self.companion_archive.persist(lib);
+                let result = editors.and(conversation);
+                // A successful conversation flush cannot cancel a failed draft's backoff.
+                self.companion_archive.retry_at = result.as_ref().err().map(|_| web_time::Instant::now() + std::time::Duration::from_secs(2));
+                result
+            }
             None => Ok(()),
         }
     }

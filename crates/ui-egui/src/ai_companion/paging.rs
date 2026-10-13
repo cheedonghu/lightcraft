@@ -70,6 +70,7 @@ impl State {
                         fragments: page.fragments,
                         bytes: page.bytes,
                     });
+                    self.accept_page(app, message.scope.photo, message.cursor);
                 }
                 Err(error) => {
                     conversation.notice = error;

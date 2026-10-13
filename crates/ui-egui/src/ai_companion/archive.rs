@@ -3,12 +3,13 @@ use super::*;
 impl State {
     pub(super) fn load(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
         if let Some(conversation) = self.conversations.get(&photo) {
-            if conversation.view.is_none()
-                && let Some(prefix) = conversation.prefix.as_ref()
-                && !self.paging.has_request(photo, &prefix.transaction_id)
-            {
-                let cursor = lightcraft_engine::companion::storage::HistoryCursor { record: prefix.message_count.saturating_sub(32), offset: 0 };
-                self.request_page(app, photo, cursor)?;
+            let prefix = conversation.prefix.clone();
+            let loaded = conversation.view.as_ref().map(|view| view.cursor);
+            if let Some(prefix) = prefix {
+                let cursor = self.initial_page(app, photo, &prefix);
+                if loaded != Some(cursor) && !self.paging.has_request(photo, &prefix.transaction_id) {
+                    self.request_page(app, photo, cursor)?;
+                }
             }
             return Ok(());
         }
@@ -54,13 +55,14 @@ impl State {
         app.session.pin_companion_prefix(photo, conversation.prefix.clone()).map_err(|e| e.to_string())?;
         self.conversations.insert(photo, conversation);
         self.prune_cache(app, photo);
-        if let Some(prefix) = self.conversations.get(&photo).and_then(|c| c.prefix.as_ref()) {
-            let cursor = lightcraft_engine::companion::storage::HistoryCursor { record: prefix.message_count.saturating_sub(32), offset: 0 };
+        if let Some(prefix) = self.conversations.get(&photo).and_then(|c| c.prefix.clone()) {
+            let cursor = self.initial_page(app, photo, &prefix);
             self.request_page(app, photo, cursor)?;
         }
         Ok(())
     }
     pub(super) fn save(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
+        self.stage_editors(app)?;
         let Some(conversation) = self.conversations.get_mut(&photo) else {
             self.pending_local_saves.remove(&photo);
             return Ok(());
@@ -190,6 +192,7 @@ impl State {
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
         conversation.view =
             Some(HistoryView { items: page.items, cursor, next: page.next, messages: page.records, fragments: page.fragments, bytes: page.bytes });
+        self.accept_page(app, photo, cursor);
         self.prune_cache(app, photo);
         Ok(())
     }
