@@ -34,6 +34,8 @@ pub struct State {
     serial: u64,
     connection_generation: u64,
     connection: Option<network::Connection>,
+    #[cfg(test)]
+    next_connection: Option<network::Connection>,
     conversations: BTreeMap<PhotoId, Conversation>,
     jobs: BTreeMap<PhotoId, Job>,
     workers: BTreeMap<PhotoId, Arc<AtomicBool>>,
@@ -52,6 +54,8 @@ impl Default for State {
             serial: 0,
             connection_generation: 0,
             connection: None,
+            #[cfg(test)]
+            next_connection: None,
             conversations: BTreeMap::new(),
             jobs: BTreeMap::new(),
             workers: BTreeMap::new(),
@@ -137,12 +141,47 @@ impl State {
             .try_send(network::Request { path, body, submission, round, identity })
             .map_err(|_| "AI 请求交付积压，请稍候；未自动重试。".into())
     }
+    fn connect(&mut self) -> Result<network::Connection, String> {
+        #[cfg(test)]
+        if let Some(connection) = self.next_connection.take() {
+            return Ok(connection);
+        }
+        network::connect(&std::env::var("PHOTO_COMPANION_ADDR").unwrap_or_else(|_| "127.0.0.1:18080".into()))
+    }
+    fn retire_disconnected_jobs(&mut self, app: &mut LightcraftApp) -> Result<(), String> {
+        let photos: Vec<_> = self
+            .jobs
+            .iter()
+            .filter_map(|(photo, job)| (job.identity.connection_generation == self.connection_generation).then_some(*photo))
+            .collect();
+        // The receiver may still contain Closed. Drop that connection only after
+        // retaining its ownership list; no old route can outlive replacement.
+        self.connection = None;
+        for photo in &photos {
+            self.finish(*photo, "AI 事件连接已断开，保留最近完整结果。");
+        }
+        // Cancel every old job even if one conversation cannot be saved. Never
+        // establish a replacement connection when any of this saving fails.
+        let mut failure = None;
+        for photo in photos {
+            if let Err(error) = self.save(app, photo) {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
     fn start(&mut self, app: &mut LightcraftApp) -> Result<Value, String> {
         if cfg!(target_arch = "wasm32") {
             return Err("AI 助手目前仅支持桌面版。".into());
         }
         if !self.consent {
             return Err("请先同意发送压缩预览。".into());
+        }
+        if self.connection.as_ref().is_none_or(|c| !c.alive.load(Ordering::Relaxed)) {
+            self.retire_disconnected_jobs(app)?;
         }
         let photo = app.session.active().ok_or("请先选择一张照片。")?;
         if self.jobs.contains_key(&photo) || self.worker_busy(photo) {
@@ -159,12 +198,9 @@ impl State {
         if prompt.len() > 4096 {
             return Err("请求过长。".into());
         }
-        if self.connection.as_ref().is_some_and(|c| !c.alive.load(Ordering::Relaxed)) {
-            self.connection = None;
-        }
         if self.connection.is_none() {
             self.connection_generation = self.connection_generation.checked_add(1).ok_or("AI 连接编号耗尽，请重新启动客户端。")?;
-            self.connection = Some(network::connect(&std::env::var("PHOTO_COMPANION_ADDR").unwrap_or_else(|_| "127.0.0.1:18080".into()))?);
+            self.connection = Some(self.connect()?);
         }
         self.serial = self.serial.checked_add(1).ok_or("AI 提交编号耗尽，请重新启动客户端。")?;
         let generation = app.session.library_generation();

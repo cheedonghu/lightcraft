@@ -175,3 +175,85 @@ fn failed_stop_delivery_still_closes_its_connection_after_local_finish() {
     assert!(state.connection.is_none(), "failed stop must retain the existing disconnect fallback");
     assert_eq!(*app.session.develop_of(photo).unwrap(), *original);
 }
+
+#[test]
+fn manual_start_before_closed_poll_retires_admitted_and_unadmitted_jobs() {
+    for admitted in [false, true] {
+        for retry_same_photo in [false, true] {
+            let (mut app, mut state, photo_a, requests, events) = started();
+            let old_identity = state.jobs.get(&photo_a).unwrap().identity.clone();
+            let old_cancel = state.jobs.get(&photo_a).unwrap().cancel.clone();
+            let original = app.session.develop_of(photo_a).unwrap();
+            if admitted {
+                state_event(&mut state, &mut app, photo_a, "awaiting_input");
+                publish_worker(&mut state, &mut app);
+                requests.try_recv().unwrap();
+                state_event(&mut state, &mut app, photo_a, "awaiting_initial_execution");
+                let plan = json!({"round_id":"backend-round","payload":{"plan_id":"initial","capability_version":"lightcraft-v2","expected_revision":app.session.photo_revision(photo_a),"operations":[{"type":"set_controls","values":{"light.exposure":0.4}}]}});
+                state.server(&mut app, &egui::Context::default(), "edit.plan", &plan).unwrap();
+                publish_worker(&mut state, &mut app);
+                requests.try_recv().unwrap();
+            }
+            let photo_c = app.session.catalog.photos().find(|p| p.id != photo_a).unwrap().id;
+            app.session.execute("library.select", &json!({"ids":[photo_c.0],"active":photo_c.0})).unwrap();
+            state.start(&mut app).unwrap();
+            requests.try_recv().unwrap();
+            let other_old_cancel = state.jobs.get(&photo_c).unwrap().cancel.clone();
+            let kept = app.session.develop_of(photo_a).unwrap();
+            let previous_messages = app.session.photo_companion(photo_a).unwrap().unwrap()["messages"].as_array().unwrap().len();
+            events.try_send(network::Event::Closed("connection interrupted".into())).unwrap();
+            state.connection.as_ref().unwrap().alive.store(false, Ordering::Relaxed);
+            let (replacement, next_requests, next_events) = network::test_connection();
+            state.next_connection = Some(replacement);
+            app.ai = state;
+            let target =
+                if retry_same_photo { photo_a } else { app.session.catalog.photos().find(|p| p.id != photo_a && p.id != photo_c).unwrap().id };
+            app.run("library.select", json!({"ids":[target.0],"active":target.0})).unwrap();
+            let started = app.run("ai.start", json!({"prompt":"manual retry"}));
+            assert!(started.is_ok(), "manual start must retire dead-connection jobs before photo admission: {started:?}");
+            assert!(old_cancel.load(Ordering::Relaxed), "all old-generation work is cancelled before replacement");
+            assert!(other_old_cancel.load(Ordering::Relaxed), "replacement retires every old-connection job");
+            assert_eq!(app.ai.jobs.len(), 1, "only the explicit new round survives");
+            assert!(app.run("ai.status", json!({"photo":photo_c.0})).unwrap()["text"].as_str().unwrap().contains("断开"));
+            assert_eq!(app.session.photo_companion(photo_c).unwrap().unwrap()["messages"].as_array().unwrap().len(), 1);
+            let new_request = next_requests.try_recv().unwrap();
+            assert_eq!(new_request.identity.scope.photo, target);
+            assert_ne!(new_request.identity.local_round_id, old_identity.local_round_id);
+            assert_ne!(new_request.identity.connection_generation, old_identity.connection_generation);
+            let saved = app.session.photo_companion(photo_a).unwrap().unwrap();
+            assert_eq!(saved["messages"].as_array().unwrap().len(), previous_messages + usize::from(retry_same_photo));
+            if admitted {
+                assert_eq!(saved["rounds"][0]["local_round_id"], old_identity.local_round_id.as_str());
+                assert_eq!(saved["checkpoint"]["expected"]["light"]["exposure"], 0.4);
+            }
+            if !retry_same_photo {
+                assert!(!app.ai.jobs.contains_key(&photo_a));
+                assert!(app.run("ai.status", json!({"photo":photo_a.0})).unwrap()["text"].as_str().unwrap().contains("断开"));
+            }
+            poll(&mut app, &egui::Context::default());
+            assert!(app.ai.is_busy(target), "old Closed must not terminate the manually submitted new round");
+            app.ai
+                .tx
+                .try_send(WorkerMessage::Prepared {
+                    identity: old_identity.clone(),
+                    plan: None,
+                    settings: original,
+                    result: Err("old worker".into()),
+                })
+                .unwrap();
+            next_events
+                .try_send(network::Event::Response {
+                    submission: old_identity.submission_seq,
+                    round: "backend-round".into(),
+                    path: "/v1/rounds".into(),
+                    identity: old_identity,
+                    result: Err("old HTTP error".into()),
+                })
+                .unwrap();
+            poll(&mut app, &egui::Context::default());
+            assert!(app.ai.is_busy(target));
+            assert_eq!(*app.session.develop_of(photo_a).unwrap(), *kept);
+            assert_eq!(next_requests.try_recv().err(), Some(mpsc::TryRecvError::Empty), "cleanup must not replay old content or submit extra rounds");
+        }
+    }
+}
