@@ -218,7 +218,8 @@ fn post_request(address: SocketAddr, path: &str, token: &str, body: &Value, canc
             ),
         });
     }
-    if path.ends_with("/execution") && (status != 202 || result.get("accepted").and_then(Value::as_bool) != Some(true)) {
+    if (path.ends_with("/execution") || path.ends_with("/input")) && (status != 202 || result.get("accepted").and_then(Value::as_bool) != Some(true))
+    {
         return Err(RequestFailure { rejected: false, message: "后端回复无效。".into() });
     }
     Ok(result)

@@ -185,3 +185,59 @@ fn detailed_preview_reduces_dimensions_at_quality75_and_keeps_full_frame() {
     assert_eq!(decoded.orientation, 1);
     assert_eq!(decoded.format, lightcraft_codecs::Format::Jpeg);
 }
+
+#[test]
+fn failed_render_saves_true_failure_and_late_receipt_cannot_claim_a_successful_plan() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut app = app(catalog.clone(), files.clone());
+    let photo = app.session.active().unwrap();
+    let original = app.session.develop_of(photo).unwrap();
+    let revision = app.session.photo_revision(photo);
+    let (connection, requests, events) = network::test_connection();
+    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    state.start(&mut app).unwrap();
+    requests.try_recv().unwrap();
+    phase(&mut state, &mut app, photo, "awaiting_input");
+    render(&mut state, &mut app);
+    requests.try_recv().unwrap();
+    phase(&mut state, &mut app, photo, "awaiting_initial_execution");
+    let plan = json!({"plan_id":"failed-render","capability_version":"lightcraft-v2","expected_revision":revision,"operations":[{"type":"set_controls","values":{"light.exposure":0.7}}]});
+    state.server(&mut app, &egui::Context::default(), "edit.plan", &json!({"round_id":"round","payload":plan})).unwrap();
+    let identity = state.jobs[&photo].identity.clone();
+    state
+        .prepared(
+            &mut app,
+            &egui::Context::default(),
+            WorkerMessage::Prepared {
+                identity: identity.clone(),
+                plan: Some(plan),
+                settings: original.clone(),
+                result: Err("fixture render failure".into()),
+            },
+        )
+        .unwrap();
+    let request = requests.try_recv().unwrap();
+    assert_eq!(request.body["outcome"], "failed");
+    assert_eq!(app.session.photo_revision(photo), revision);
+    events
+        .try_send(network::Event::Response {
+            submission: 0,
+            round: "round".into(),
+            path: request.path,
+            identity: request.identity,
+            result: Ok(json!({"accepted":true,"_client_execution_plan_id":"failed-render"})),
+        })
+        .unwrap();
+    state.poll_inner(&mut app, &egui::Context::default());
+    app.session.close_library().unwrap();
+    let mut reopened = self::app(catalog, files);
+    let record = reopened.session.companion_round(photo, identity.local_round_id.as_str()).unwrap().unwrap();
+    assert_eq!(record["stages"][0]["execution_outcome"], "failed");
+    assert_eq!(record["stages"][0]["render_outcome"], "failed");
+    assert!(record.get("backend_confirmed_plan").is_none());
+    assert!(record.get("recent_complete_result").is_none());
+    assert_eq!(*reopened.session.develop_of(photo).unwrap(), *original);
+    let mut reading = State::default();
+    reading.load(&mut reopened, photo).unwrap();
+    assert!(reading.conversations[&photo].messages.iter().any(|m| m["text"].as_str().is_some_and(|t| t.contains("render_failed"))));
+}

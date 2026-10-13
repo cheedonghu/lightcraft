@@ -631,12 +631,40 @@ impl State {
             Err(error) => {
                 if let Some(plan) = &plan {
                     let round = job.round.clone();
+                    let revision = job.checkpoint.revision;
+                    let actual = job.checkpoint.expected.clone();
+                    let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+                    if let Some(step) = conversation
+                        .records
+                        .iter_mut()
+                        .find(|r| r["local_round_id"] == identity.local_round_id.as_str())
+                        .and_then(|r| r.get_mut("stages"))
+                        .and_then(Value::as_array_mut)
+                        .and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan["plan_id"]))
+                    {
+                        step["execution_outcome"] = json!("failed");
+                        step["render_outcome"] = json!("failed");
+                        step["error"] = json!(error);
+                        step["delivery_state"] = json!("not_sent");
+                    }
+                    conversation.messages.push(json!({"local_round_id":identity.local_round_id,"local_message_id":format!("{}-{}-failure",identity.local_round_id.as_str(),plan["plan_id"]),"complete_state":"complete","display_kind":"execution_feedback","role":"user","text":format!("Actual execution feedback: {}",json!({"outcome":"failed","reason_code":"render_failed","photo_revision":revision,"actual_state":actual}))}));
+                    self.save(app, photo)?;
                     self.send(
                         format!("/v1/rounds/{round}/execution"),
-                        json!({"plan_id":plan["plan_id"],"outcome":"failed","photo_revision":job.checkpoint.revision,"reason_code":"render_failed"}),
+                        json!({"plan_id":plan["plan_id"],"outcome":"failed","photo_revision":revision,"reason_code":"render_failed"}),
                         0,
                         round,
                     )?;
+                    if let Some(step) = self
+                        .conversations
+                        .get_mut(&photo)
+                        .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()))
+                        .and_then(|r| r.get_mut("stages"))
+                        .and_then(Value::as_array_mut)
+                        .and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan["plan_id"]))
+                    {
+                        step["delivery_state"] = json!("queued");
+                    }
                 }
                 self.finish(photo, &format!("处理未完成：{error}。保留最近完整结果。"));
                 return self.save(app, photo);
@@ -673,7 +701,9 @@ impl State {
                     step["applied_state"] = json!(settings);
                     step["effective_control_values"] = lightcraft_engine::companion::control_list(&settings, &snapshot.context.info);
                     step["execution_outcome"] = json!("succeeded");
-                    step["delivery_state"] = json!("queued");
+                    step["delivery_state"] = json!("not_sent");
+                    step["render_outcome"] = json!("succeeded");
+                    step["locally_published"] = json!(true);
                     step["preview_message_id"] = json!(format!("{}-{stage}", identity.local_round_id.as_str()));
                 }
             }
@@ -684,6 +714,17 @@ impl State {
             // A failed POST retains the actual visible result; never roll back on network failure.
             self.save(app, photo)?;
             self.send(format!("/v1/rounds/{round}/execution"), feedback, 0, round)?;
+            if let Some(step) = self
+                .conversations
+                .get_mut(&photo)
+                .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()))
+                .and_then(|r| r.get_mut("stages"))
+                .and_then(Value::as_array_mut)
+                .and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan_id))
+            {
+                step["delivery_state"] = json!("queued");
+            }
+            self.save(app, photo)?;
         } else {
             let job = self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?;
             job.snapshot = Some(snapshot.clone());
@@ -698,9 +739,19 @@ impl State {
             {
                 record["original"] = json!(settings);
                 record["before_preview_message_id"] = json!(format!("{}-user", identity.local_round_id.as_str()));
+                record["input_delivery_state"] = json!("not_sent");
+                record["input_id"] = json!(format!("input-{seq}"));
             }
             self.save(app, photo)?;
             self.send(format!("/v1/rounds/{round}/input"), input, 0, round)?;
+            if let Some(record) = self
+                .conversations
+                .get_mut(&photo)
+                .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()))
+            {
+                record["input_delivery_state"] = json!("queued");
+            }
+            self.save(app, photo)?;
         }
         Ok(())
     }
@@ -768,7 +819,25 @@ impl State {
                             record.get_mut("stages").and_then(Value::as_array_mut).and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan_id))
                         {
                             step["delivery_state"] = json!("confirmed");
-                            record["backend_confirmed_plan"] = json!(plan_id);
+                            if step["execution_outcome"] == "succeeded" {
+                                record["backend_confirmed_plan"] = json!(plan_id);
+                            }
+                        }
+                        let _ = self.save(app, identity.scope.photo);
+                    }
+                    if path.ends_with("/input")
+                        && let Ok(response) = &result
+                        && response.get("accepted").and_then(Value::as_bool) == Some(true)
+                    {
+                        if let Some(record) = self.conversations.get_mut(&identity.scope.photo).and_then(|c| {
+                            c.records.iter_mut().find(|r| {
+                                r["local_round_id"] == identity.local_round_id.as_str()
+                                    && r["submission_seq"] == identity.submission_seq
+                                    && r["connection_generation"] == identity.connection_generation
+                                    && r["runtime_library_generation"] == identity.scope.library_generation
+                            })
+                        }) {
+                            record["input_delivery_state"] = json!("confirmed");
                         }
                         let _ = self.save(app, identity.scope.photo);
                     }
