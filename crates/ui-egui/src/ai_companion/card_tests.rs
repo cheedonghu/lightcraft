@@ -21,7 +21,18 @@ fn headless(records: Vec<Value>) -> (Headless, lightcraft_catalog::PhotoId) {
     session.persist().unwrap();
     let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1400.0, 1000.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
+    ready(&mut h);
     (h, photo)
+}
+fn ready(h: &mut Headless) -> Value {
+    for _ in 0..200 {
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["historyLoading"] == false {
+            return status;
+        }
+        h.step();
+    }
+    panic!("historical card projection did not finish");
 }
 fn stage(name: &str, before: f64, after: f64) -> Value {
     let mut a = lightcraft_develop::DevelopSettings::default();
@@ -187,7 +198,8 @@ fn actual_wb(relative: bool) {
         .unwrap();
     let mut app = LightcraftApp::new(session, Services::default());
     app.run("library.select", json!({"ids":[photo.0],"active":photo.0})).unwrap();
-    let after = app.run("ai.status", json!({})).unwrap();
+    let mut reopened = Headless::new(app, [1400.0, 1000.0], 1.0);
+    let after = ready(&mut reopened);
     assert_eq!(after["resultCards"][0]["stages"][0]["changes"], values["resultCards"][0]["stages"][0]["changes"]);
     if let Some(path) = native {
         std::fs::remove_file(path).unwrap();
@@ -493,9 +505,119 @@ fn fallback_fragment_card_lookup_keeps_its_owner_across_bounded_scan_frames() {
     let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1400.0, 1000.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     h.app.run("ai.history", json!({"record":0})).unwrap();
-    for _ in 0..8 {
+    for _ in 0..200 {
         h.step();
+        if h.app.run("ai.status", json!({})).unwrap()["historyLoading"] == false {
+            break;
+        }
     }
     let status = h.app.run("ai.status", json!({})).unwrap();
     assert_eq!(status["resultCards"][0]["localRoundId"], "fallback-90");
+}
+
+#[test]
+fn fallback_giant_ignored_fields_keep_each_frame_bounded_and_eventually_show_the_bound_card() {
+    use lightcraft_catalog::Store;
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    struct Meter {
+        files: MemStore,
+        bytes: Arc<AtomicUsize>,
+    }
+    impl Store for Meter {
+        fn read(&mut self, n: &str) -> io::Result<Option<Vec<u8>>> {
+            let b = self.files.read(n)?;
+            self.bytes.fetch_add(b.as_ref().map_or(0, Vec::len), Ordering::Relaxed);
+            Ok(b)
+        }
+        fn read_limited(&mut self, n: &str, max: u64) -> io::Result<Option<Vec<u8>>> {
+            let b = self.files.read_limited(n, max)?;
+            self.bytes.fetch_add(b.as_ref().map_or(0, Vec::len), Ordering::Relaxed);
+            Ok(b)
+        }
+        fn read_range(&mut self, n: &str, o: u64, l: usize) -> io::Result<Vec<u8>> {
+            let b = self.files.read_range(n, o, l)?;
+            self.bytes.fetch_add(b.len(), Ordering::Relaxed);
+            Ok(b)
+        }
+        fn write_atomic(&mut self, n: &str, b: &[u8]) -> io::Result<()> {
+            self.files.write_atomic(n, b)
+        }
+        fn append(&mut self, n: &str, b: &[u8]) -> io::Result<()> {
+            self.files.append(n, b)
+        }
+        fn truncate(&mut self, n: &str, l: u64) -> io::Result<()> {
+            self.files.truncate(n, l)
+        }
+        fn describe(&self) -> String {
+            self.files.describe()
+        }
+    }
+    let bytes = Arc::new(AtomicUsize::new(0));
+    let mut session = Session::new();
+    session
+        .open_library_in(
+            LibraryStores {
+                catalog: Box::new(MemStore::new()),
+                files: Box::new(Meter { files: MemStore::new(), bytes: bytes.clone() }),
+                dir: "memory".into(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let photo = session.active().unwrap();
+    session.save_companion_conversation(photo,json!({"schema_version":2,"messages":[{"role":"assistant","text":"A".repeat(6*1024*1024),"local_round_id":"giant-bound"}],"round_records":[{"local_round_id":"giant-bound","request":"x".repeat(24*1024*1024),"stages":[stage("initial",0.0,0.35)],"local_terminal":"completed"}],"rounds":[]})).unwrap();
+    let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1400.0, 1000.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    bytes.store(0, Ordering::Relaxed);
+    h.app.run("ai.history", json!({"record":0})).unwrap();
+    assert!(bytes.swap(0, Ordering::Relaxed) <= 16 * 1024 * 1024, "history command parsed the complete giant ignored field");
+    for _ in 0..200 {
+        h.step();
+        let read = bytes.swap(0, Ordering::Relaxed);
+        assert!(read <= 16 * 1024 * 1024, "one frame read {read} bytes");
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["historyLoading"] == false {
+            assert_eq!(status["resultCards"][0]["localRoundId"], "giant-bound");
+            assert_eq!(status["resultCards"][0]["stages"][0]["changes"][0]["actual"], "+0.35");
+            return;
+        }
+    }
+    panic!("bounded scan lost continuation");
+}
+#[test]
+fn native_card_projection_failure_preserves_the_already_readable_message_page() {
+    let mut files = MemStore::new();
+    files.background = true;
+    let mut session = Session::new();
+    session
+        .open_library_in(LibraryStores { catalog: Box::new(MemStore::new()), files: Box::new(files), dir: "memory".into(), on_disk: false }, true)
+        .unwrap();
+    let photo = session.active().unwrap();
+    let mut oversized = stage("initial", 0.0, 0.35);
+    oversized["reason"] = json!("R".repeat(2 * 1024 * 1024));
+    session.save_companion_conversation(photo,json!({"schema_version":2,"messages":[{"role":"assistant","text":"KEEP_VALID_HISTORY_LITERAL","local_round_id":"oversized-card"}],"round_records":[{"local_round_id":"oversized-card","stages":[oversized],"local_terminal":"completed"}],"rounds":[]})).unwrap();
+    let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1400.0, 1000.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    h.app.run("ai.history", json!({"record":0})).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        h.step();
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["historyLoading"] == false {
+            let text = status["text"].as_str().unwrap();
+            assert!(text.contains("KEEP_VALID_HISTORY_LITERAL"), "valid messages disappeared: {text}");
+            assert!(text.contains("display"), "card projection failure must remain explicit: {text}");
+            assert_eq!(status["resultCards"], json!([]));
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "reader failed to retire");
+        std::thread::yield_now();
+    }
 }

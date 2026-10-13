@@ -1,6 +1,6 @@
 # Lightroom parity checklist
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** patch (UX-04: priority cancellation and full-app feedback guard; UX-06: AI Assistant shares Tools with fixed composer, independent message scrolling and explicit menu reveal; statuses and summary counts unchanged) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** patch (UX-11: complete legal model history and pre-create service budget validation; UX-06: AI Assistant shares Tools with a fixed composer, independent message scrolling and explicit menu reveal; UX-04: priority cancellation and full-app feedback guard; UX-05: source Reset baseline and consistent modified filters / badges; statuses and summary counts unchanged) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
 
 The measured, row-by-row checklist: one row per Lightroom feature, menu item and shortcut, what we
 have and what is missing. It answers *does the feature exist?* (feature breadth). Whether it is good
@@ -450,7 +450,7 @@ This extension is tracked separately from Lightroom parity and does not close th
 
 | Id | Feature | Status | Evidence | Remaining scope |
 |---|---|---|---|---|
-| PC-01 | AI critique and complete edit plans | 🟡 | `cmd:ai.open`, `cmd:ai.start`, `cmd:ai.stop`, `cmd:ai.undo`, `cmd:ai.clear`, `cmd:ai.status`, `crates/ui-egui/src/ai_companion.rs`, `docs/control-protocol.md` | Native desktop and local Eino backend: one SSE per client, photo-local histories, six read tools, complete controls/WB/curve/Point Color/crop/manual-mask candidates, one review/correction, protected round undo, and round-scoped cancellation from the real consent checkbox or Stop: queued and partially written content is cancelled, Stop has reserved priority, heartbeat remains independent, and uncertain creation retains its identity until the connection workers close. Conversations and preview attachments use independent versioned storage in the library companion folder, without changing the upstream catalog format. Accounts/budgets, automatic segmentation and browser support remain open. |
+| PC-01 | AI critique and complete edit plans | 🟡 | `cmd:ai.open`, `cmd:ai.start`, `cmd:ai.stop`, `cmd:ai.undo`, `cmd:ai.clear`, `cmd:ai.status`, `crates/ui-egui/src/ai_companion.rs`, `docs/control-protocol.md` | Native desktop and local Eino backend: one SSE per client, photo-local histories, six read tools, complete controls/WB/curve/Point Color/crop/manual-mask candidates, one review/correction, protected round undo, and round-scoped cancellation from the real consent checkbox or Stop: queued and partially written content is cancelled, Stop has reserved priority, heartbeat remains independent, and uncertain creation retains its identity until the connection workers close. Historical editing cards show one initial/correction result per actual local round, distinguish proposals from publication and failed receipts, freeze effective before/target/actual parameter and white-balance values, and keep ordinary History navigation separate from editing. Complete model history validates unique tool calls and ordered results, preserves true cancellation/failure and actual execution separately from proposed plans, reserves current-photo input limits before round creation, and never trims local history. Conversations and preview attachments use independent versioned storage in the library companion folder, without changing the upstream catalog format. Accounts/budgets, automatic segmentation and browser support remain open. |
 
 ## X. Cross-cutting behaviours (BEHAV)
 
@@ -805,3 +805,7 @@ Latin stays upright. Advanced Japanese composition remains open. Regression cove
 | 2026-10-10 | patch | LR-BEHAV-UNDO: file/XMP repair retries and merged rename Undo/Redo evidence; status and summary counts unchanged. |
 | 2026-10-10 | minor | Renamed from `parity.md` (progress-docs standard); Top gaps moved to gaps.md (its duplicated items 1–2 from a bad merge resolved there), shortcut notes moved to ui-parity.md. Rows unchanged; a recount of the rows gives 81.1% of 517 in-scope rows (P0 98.0%, P1 95.1%, P2 46.9%), so the generated summary above is due a `cargo xtask parity --write` |
 | 2026-09-30 – 2026-10-11 | — | Rows added and updated with each feature (see `git log -- docs/parity.md docs/parity-checklist.md`) |
+
+| 2026-10-13 | patch | UX-11: PC-01 records complete legal history projection and pre-create service budget checks; status and summary counts unchanged. |
+
+| 2026-10-13 | patch | UX-16: PC-01 records historical round result cards and immutable effective parameter display; status and summary counts unchanged. |

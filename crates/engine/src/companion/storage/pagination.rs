@@ -874,6 +874,8 @@ fn complete_escape_prefix(bytes: &[u8]) -> usize {
 }
 
 mod projection;
+mod scan;
+pub use scan::{DisplayRecord, DisplayScan};
 fn display_record(store: &mut dyn Store, photo: PhotoId, entry: &Entry) -> Result<Value> {
     if entry.length <= 256 * 1024 {
         let bytes = range(store, photo, entry, 0, entry.length)?;

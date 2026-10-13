@@ -1,6 +1,6 @@
 //! Bounded native history I/O runs outside the frame and owns a captured graph.
 use super::*;
-use lightcraft_engine::companion::storage::{HistoryCursor, HistoryReader, HistorySlice};
+use lightcraft_engine::companion::storage::{DisplayRecord, DisplayScan, HistoryCursor, HistoryReader, HistorySlice};
 #[derive(Clone)]
 struct PageRequest {
     id: u64,
@@ -13,7 +13,7 @@ struct ReadMessage {
     scope: PhotoScope,
     transaction: String,
     cursor: HistoryCursor,
-    result: Result<(HistorySlice, Vec<card::Card>), String>,
+    result: Result<(HistorySlice, Vec<card::Card>, Option<String>), String>,
 }
 pub(super) struct Paging {
     tx: mpsc::SyncSender<ReadMessage>,
@@ -61,7 +61,10 @@ impl State {
                 continue;
             }
             match message.result {
-                Ok((page, cards)) => {
+                Ok((page, cards, notice)) => {
+                    if let Some(notice) = notice {
+                        conversation.notice = notice;
+                    }
                     conversation.view = Some(HistoryView {
                         items: page.items,
                         cursor: message.cursor,
@@ -69,9 +72,15 @@ impl State {
                         messages: page.records,
                         fragments: page.fragments,
                         bytes: page.bytes,
+                        cards_bytes: cards
+                            .iter()
+                            .map(|c| serde_json::to_vec(c).map_or(usize::MAX, |bytes| bytes.len()))
+                            .fold(0, usize::saturating_add),
                         cards,
                         card_cursor: None,
                         card_pending: BTreeSet::new(),
+                        card_owners: VecDeque::new(),
+                        card_scan: None,
                     });
                 }
                 Err(error) => {
@@ -84,45 +93,65 @@ impl State {
                         fragments: Vec::new(),
                         bytes: 0,
                         cards: Vec::new(),
+                        cards_bytes: 0,
                         card_cursor: None,
                         card_pending: BTreeSet::new(),
+                        card_owners: VecDeque::new(),
+                        card_scan: None,
                     });
                 }
             }
         }
-        // Adapters without a background handle advance one bounded scan page
-        // per frame; they never synchronously hydrate a whole conversation.
-        let step = app.session.active().and_then(|photo| {
-            self.conversations
-                .get(&photo)
-                .and_then(|c| c.view.as_ref().and_then(|v| v.card_cursor.map(|cursor| (photo, c.prefix.clone(), cursor, v.card_pending.clone()))))
-        });
-        if let Some((photo, Some(header), cursor, _wanted)) = step {
-            let result = app.session.companion_rounds_display_at(&header, cursor, 32);
-            if let Some(conversation) = self.conversations.get_mut(&photo)
-                && let Some(view) = conversation.view.as_mut()
-            {
-                match result {
-                    Ok(page) => {
-                        view.card_cursor = page.next_cursor;
-                        for record in page.records {
-                            if record["local_round_id"].as_str().is_some_and(|id| view.card_pending.remove(id))
-                                && let Some(card) = card::from_record(&record, None)
-                                && !view.cards.iter().any(|c| c.local_round_id == card.local_round_id)
-                            {
-                                view.cards.push(card);
+        // One resumable record step per frame, retaining verified graph identity.
+        if let Some(photo) = app.session.active()
+            && let Some(conversation) = self.conversations.get_mut(&photo)
+            && let Some(header) = conversation.prefix.as_ref()
+            && let Some(view) = conversation.view.as_mut()
+            && let Some(cursor) = view.card_cursor
+        {
+            if view.card_scan.is_none() {
+                let target = view.card_owners.front().copied().map(DisplayRecord::Message).unwrap_or(DisplayRecord::Round(cursor));
+                view.card_scan = Some(DisplayScan::new(header.clone(), target));
+            }
+            if let Some(scan) = view.card_scan.as_mut() {
+                match app.session.companion_display_step(scan) {
+                    Ok(Some(record)) => {
+                        match scan.target() {
+                            DisplayRecord::Message(_) => {
+                                view.card_owners.pop_front();
+                                if let Some(id) = record["local_round_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 128) {
+                                    view.card_pending.insert(id.to_owned());
+                                }
+                            }
+                            DisplayRecord::Round(index) => {
+                                let total = if header.record_count > 0 { header.record_count } else { header.round_count };
+                                view.card_cursor = (index + 1 < total).then_some(index + 1);
+                                if record["local_round_id"].as_str().is_some_and(|id| view.card_pending.remove(id))
+                                    && let Some(card) = card::from_record(&record, None)
+                                    && !view.cards.iter().any(|c| c.local_round_id == card.local_round_id)
+                                {
+                                    view.cards_bytes =
+                                        view.cards_bytes.saturating_add(serde_json::to_vec(&card).map_or(usize::MAX, |bytes| bytes.len()));
+                                    view.cards.push(card);
+                                }
                             }
                         }
-                        if view.card_pending.is_empty() {
+                        view.card_scan = None;
+                        if view.card_owners.is_empty() && view.card_pending.is_empty() {
                             view.card_cursor = None;
                         }
                     }
+                    Ok(None) => {}
                     Err(error) => {
                         conversation.notice = error.to_string();
                         view.card_cursor = None;
+                        view.card_scan = None;
                     }
                 }
             }
+        }
+        if let Some(photo) = app.session.active() {
+            self.prune_cache(app, photo);
         }
         if !self.paging.busy()
             && let Some(request) = self.paging.pending.take()
@@ -177,23 +206,34 @@ impl State {
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
-                    let result = reader.slice(request.cursor, 256 * 1024).map_err(|e| e.to_string()).and_then(|page| {
+                    let result = reader.slice(request.cursor, 256 * 1024).map_err(|e| e.to_string()).map(|page| {
                         let mut cursor = 0;
                         let mut cards = Vec::new();
+                        let mut notice = None;
                         // Exact recorded ids, never inferred from neighbouring rounds.
                         let mut wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
                         for item in &page.items {
                             if cancel.load(Ordering::Relaxed) {
                                 break;
                             }
-                            if let lightcraft_engine::companion::storage::HistoryItem::Fragment { record, .. } = item
-                                && let Some(id) = reader.message_round_id(*record).map_err(|e| e.to_string())?
-                            {
-                                wanted.insert(id);
+                            if let lightcraft_engine::companion::storage::HistoryItem::Fragment { record, .. } = item {
+                                match reader.message_round_id(*record) {
+                                    Ok(Some(id)) => {
+                                        wanted.insert(id);
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => notice = Some(error.to_string()),
+                                }
                             }
                         }
                         while !wanted.is_empty() && !cancel.load(Ordering::Relaxed) {
-                            let rounds = reader.rounds_display(cursor, 32).map_err(|e| e.to_string())?;
+                            let rounds = match reader.rounds_display(cursor, 32) {
+                                Ok(rounds) => rounds,
+                                Err(error) => {
+                                    notice = Some(error.to_string());
+                                    break;
+                                }
+                            };
                             for record in rounds.records {
                                 if record["local_round_id"].as_str().is_some_and(|id| wanted.remove(id))
                                     && let Some(card) = card::from_record(&record, None)
@@ -207,7 +247,7 @@ impl State {
                             let Some(next) = rounds.next_cursor else { break };
                             cursor = next;
                         }
-                        Ok((page, cards))
+                        (page, cards, notice)
                     });
                     if !cancel.load(Ordering::Relaxed) {
                         let _ = tx.try_send(ReadMessage {
@@ -230,6 +270,8 @@ impl State {
         mut reader: HistoryReader,
         identity: RoundIdentity,
         tail: Vec<Value>,
+        prompt: String,
+        settings: Arc<DevelopSettings>,
         cancel: Arc<AtomicBool>,
     ) -> Result<(), String> {
         let tx = self.tx.clone();
@@ -240,7 +282,7 @@ impl State {
             .name("companion-model-history".into())
             .spawn(move || {
                 let _guard = guard;
-                let result = assemble(&mut reader, tail, &cancel);
+                let result = assemble(&mut reader, tail, &cancel, &prompt, &settings);
                 if !cancel.load(Ordering::Relaxed) && tx.try_send(WorkerMessage::HistoryPrepared { identity, result }).is_err() {
                     cancel.store(true, Ordering::Relaxed);
                 }
@@ -250,88 +292,35 @@ impl State {
         Ok(())
     }
 }
-fn assemble(reader: &mut HistoryReader, tail: Vec<Value>, cancel: &AtomicBool) -> Result<Vec<Value>, String> {
-    if reader.header().message_count.saturating_add(tail.len() as u64) > 1024 {
-        return Err(tr("The complete AI history exceeds the service limit. Local history is retained.").into());
-    }
-    let mut messages = Vec::new();
-    let mut text = 0usize;
-    let mut bytes = 0usize;
-    let mut images = 0usize;
+fn assemble(
+    reader: &mut HistoryReader,
+    tail: Vec<Value>,
+    cancel: &AtomicBool,
+    prompt: &str,
+    settings: &DevelopSettings,
+) -> Result<Vec<Value>, String> {
+    let mut projection = projection::HistoryProjection::new(reader.header().photo_id);
     let mut cursor = 0;
     while cursor < reader.header().message_count {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        let page = reader.messages(cursor, 1, (32 * 1024 * 1024usize).saturating_sub(bytes)).map_err(|e| e.to_string())?;
-        for message in page.records {
-            append(reader, message, &mut messages, &mut text, &mut bytes, &mut images, cancel)?;
+        let page = reader.messages(cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
+        for message in &page.records {
+            projection.push_cancellable(message, |picture| reader.preview(picture).map_err(|e| e.to_string()), || cancel.load(Ordering::Relaxed))?;
         }
         cursor = page.next_cursor.unwrap_or(reader.header().message_count);
     }
-    for message in tail {
-        append(reader, message, &mut messages, &mut text, &mut bytes, &mut images, cancel)?;
+    for message in &tail {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        projection.push_cancellable(message, |picture| reader.preview(picture).map_err(|e| e.to_string()), || cancel.load(Ordering::Relaxed))?;
     }
-    Ok(messages)
-}
-fn append(
-    reader: &mut HistoryReader,
-    mut message: Value,
-    messages: &mut Vec<Value>,
-    text: &mut usize,
-    bytes: &mut usize,
-    images: &mut usize,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
-    if let Some(object) = message.as_object_mut() {
-        for key in ["local_round_id", "local_message_id", "stage", "model_call_id", "tool_request_id", "complete_state", "display_kind"] {
-            object.remove(key);
-        }
-    }
-    *text = text.saturating_add(message.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0));
-    if let Some(calls) = message.get("tool_calls") {
-        *text = text.saturating_add(lightcraft_engine::companion::storage::record_size(calls).map_err(|e| e.to_string())?);
-    }
-    if *text > 256 * 1024 {
-        return Err(tr("The complete AI history exceeds the service limit. Local history is retained.").into());
-    }
-    let mut projected_size = lightcraft_engine::companion::storage::record_size(&message).map_err(|e| e.to_string())?;
-    if let Some(pictures) = message.get_mut("images").and_then(Value::as_array_mut) {
-        *images = images.saturating_add(pictures.len());
-        if *images > 256 {
-            return Err(tr("The complete AI history exceeds the service limit. Local history is retained.").into());
-        }
-        for picture in pictures {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("cancelled".into());
-            }
-            if picture.get("attachment").is_some() {
-                let stored_size = lightcraft_engine::companion::storage::record_size(picture).map_err(|e| e.to_string())?;
-                let length = picture.get("length").and_then(Value::as_u64).ok_or("missing preview length")?;
-                if length > 128 * 1024 {
-                    return Err("invalid preview length".into());
-                }
-                let encoded = usize::try_from(length.div_ceil(3).saturating_mul(4)).map_err(|e| e.to_string())?;
-                projected_size = projected_size.saturating_sub(stored_size).saturating_add(encoded).saturating_add(128);
-                if bytes.saturating_add(projected_size) > 32 * 1024 * 1024 {
-                    return Err(tr("The complete AI history exceeds the service limit. Local history is retained.").into());
-                }
-                let data = reader.preview(picture).map_err(|e| e.to_string())?;
-                let object = picture.as_object_mut().ok_or("invalid image")?;
-                for key in ["attachment", "digest", "length", "width", "height"] {
-                    object.remove(key);
-                }
-                picture["data"] = json!(Base64::encode_string(&data));
-            }
-        }
-    }
-    *bytes = bytes.saturating_add(lightcraft_engine::companion::storage::record_size(&message).map_err(|e| e.to_string())?);
-    if *bytes > 32 * 1024 * 1024 {
-        return Err(tr("The complete AI history exceeds the service limit. Local history is retained.").into());
-    }
-    messages.push(message);
-    Ok(())
+    let history = projection.finish()?;
+    projection::reserve_input(&history, prompt, settings)?;
+    Ok(history)
 }

@@ -14,11 +14,15 @@ mod card_tests;
 #[path = "ai_companion/disconnect_tests.rs"]
 mod disconnect_tests;
 #[cfg(test)]
+mod history_tests;
+#[cfg(test)]
 #[path = "ai_companion/identity_tests.rs"]
 mod identity_tests;
 #[cfg(test)]
 #[path = "ai_companion/library_tests.rs"]
 mod library_tests;
+#[cfg(test)]
+mod native_history_tests;
 mod network;
 mod paging;
 #[cfg(test)]
@@ -28,6 +32,7 @@ mod paging_tests;
 mod panel_tests;
 #[cfg(test)]
 mod persistence_tests;
+mod projection;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,8 +112,11 @@ struct HistoryView {
     fragments: Vec<String>,
     bytes: usize,
     cards: Vec<card::Card>,
+    cards_bytes: usize,
     card_cursor: Option<u64>,
     card_pending: BTreeSet<String>,
+    card_owners: VecDeque<u64>,
+    card_scan: Option<lightcraft_engine::companion::storage::DisplayScan>,
 }
 struct Conversation {
     scope: Option<PhotoScope>,
@@ -337,6 +345,9 @@ impl State {
             .map_err(|e| e.to_string())?
             .flatten();
         let history = if reader.is_some() { Vec::new() } else { self.history(app, photo)? };
+        if reader.is_none() {
+            projection::reserve_input(&history, &prompt, &original)?;
+        }
         let history_tail = self.conversations.get(&photo).map(|c| c.messages.clone()).unwrap_or_default();
         if app.session.library.is_some()
             && self
@@ -404,12 +415,14 @@ impl State {
             }
             return Err(error);
         }
-        if let Some(reader) = reader
-            && let Err(error) =
-                self.begin_history(reader, identity.clone(), history_tail, self.jobs.get(&photo).ok_or("AI 轮次不存在。")?.cancel.clone())
-        {
-            self.fail_one(app, photo, &error);
-            return Err(error);
+        if let Some(reader) = reader {
+            let job = self.jobs.get(&photo).ok_or("AI 轮次不存在。")?;
+            // This owned envelope belongs to the leased submission, not later drafts.
+            let (prompt, original, cancel) = (job.prompt.clone(), job.checkpoint.original.clone(), job.cancel.clone());
+            if let Err(error) = self.begin_history(reader, identity.clone(), history_tail, prompt, original, cancel) {
+                self.fail_one(app, photo, &error);
+                return Err(error);
+            }
         }
         Ok(json!({"started":true,"photo":photo.0,"localRoundId":identity.local_round_id}))
     }
@@ -509,7 +522,7 @@ impl State {
             // the round id. A new request cannot overtake its cancellation.
             if let Some(conversation) = self.conversations.get_mut(&photo) {
                 conversation.pending.clear();
-                close_pending_tools(&mut conversation.messages);
+                close_pending_tools(&mut conversation.messages, "cancelled");
                 conversation.notice = tr("Stopped generating. Confirming cancellation of the submission…").into();
             }
             return Ok(Value::Null);
@@ -533,6 +546,7 @@ impl State {
                     for step in stages {
                         if step["execution_outcome"] == "not_executed" {
                             step["execution_outcome"] = json!(if cancelled { "cancelled" } else { "failed" });
+                            conversation.messages.push(json!({"role":"user","display_kind":"execution_feedback","complete_state":"complete","local_round_id":job.identity.local_round_id,"local_message_id":format!("{}-{}-not-executed",job.identity.local_round_id.as_str(),step["plan_id"]),"text":format!("Actual execution feedback: {}",json!({"plan_id":step.get("plan_id"),"outcome":if cancelled {"cancelled"} else {"failed"},"executed":false,"reason_code":"ended_before_plan_publication","photo_revision":job.checkpoint.revision,"actual_state":job.checkpoint.expected}))}));
                         }
                     }
                 }
@@ -552,7 +566,13 @@ impl State {
                 record["backend_round_id"] = if job.round.is_empty() { Value::Null } else { json!(job.round) };
             }
             conversation.pending.clear();
-            close_pending_tools(&mut conversation.messages);
+            let terminal = conversation
+                .records
+                .iter()
+                .find(|r| r["local_round_id"] == job.identity.local_round_id.as_str())
+                .and_then(|r| r["local_terminal"].as_str())
+                .unwrap_or("failed");
+            close_pending_tools(&mut conversation.messages, terminal);
             conversation.notice = notice.into();
         }
     }
@@ -697,8 +717,6 @@ impl State {
                 {
                     stages.push(json!({"stage":stage,"backend_stage":data.get("stage"),"model_call_id":model_call,"plan_id":plan_id,"tool_call_id":payload.get("tool_call_id"),"reason":payload.get("reason"),"operations":payload.get("operations"),"before_state":before,"display_before":display_before,"display_target":display_target,"proposed_state":candidate.as_ref().ok(),"execution_outcome":if candidate.is_ok() {"not_executed"} else {"validation_failed"}}));
                 }
-                let candidate = candidate?;
-                self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?.inflight_plan = Some(plan_id.into());
                 if let Some(id) = payload.get("tool_call_id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                     self.conversations
                         .get_mut(&photo)
@@ -706,6 +724,14 @@ impl State {
                         .messages
                         .push(json!({"role":"tool","text":"plan_proposed; await actual client execution feedback","tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":payload.get("tool_request_id"),"stage":payload.get("stage"),"model_call_id":payload.get("model_call_id"),"complete_state":"complete"}));
                 }
+                let candidate = match candidate {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?.messages.push(json!({"role":"user","display_kind":"execution_feedback","complete_state":"complete","local_round_id":local_round_id,"local_message_id":format!("{}-{plan_id}-validation-failure",local_round_id.as_str()),"text":format!("Actual execution feedback: {}",json!({"plan_id":plan_id,"outcome":"failed","reason_code":"validation_failed","executed":false,"photo_revision":payload.get("expected_revision"),"actual_state":before}))}));
+                        return Err(error);
+                    }
+                };
+                self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?.inflight_plan = Some(plan_id.into());
                 self.spawn(app, photo, Some(payload.clone()), Arc::new(candidate))?;
             }
             "round.ended" => {
@@ -1317,6 +1343,7 @@ impl State {
         }
     }
     fn fail_one(&mut self, app: &mut LightcraftApp, photo: PhotoId, error: &str) {
+        let error = tr(error);
         self.mark_failure(photo, error);
         let _ = self.stop(photo);
         if let Some(c) = self.conversations.get_mut(&photo) {
@@ -1395,22 +1422,24 @@ fn capabilities(settings: &DevelopSettings) -> Value {
     json!({"capability_version":"lightcraft-v2","controls":lightcraft_engine::companion::control_ranges(settings),"edit_schemas":lightcraft_engine::companion::operation_schemas(settings),"tools":tools})
 }
 
-fn close_pending_tools(messages: &mut Vec<Value>) {
-    let mut pending = BTreeMap::new();
+fn close_pending_tools(messages: &mut Vec<Value>, outcome: &str) {
+    let mut pending: Vec<(String, Value)> = Vec::new();
     for message in messages.iter() {
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    pending.insert(id.to_owned(), message.clone());
+                    // Preserve original call order; malformed legacy associations are
+                    // never repaired by guessing, and fail the projection validator.
+                    pending.push((id.to_owned(), message.clone()));
                 }
             }
         }
         if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
-            pending.remove(id);
+            pending.retain(|(pending_id, _)| pending_id != id);
         }
     }
     for (id, owner) in pending {
-        messages.push(json!({"role":"tool","tool_call_id":id,"text":"cancelled or failed before confirmed tool completion","local_round_id":owner.get("local_round_id"),"stage":owner.get("stage"),"model_call_id":owner.get("model_call_id"),"complete_state":"complete","display_kind":"tool_result"}));
+        messages.push(json!({"role":"tool","tool_call_id":id,"text":json!({"outcome":if outcome=="cancelled" {"cancelled"} else {"failed"},"executed":false,"reason_code":"ended_before_tool_execution"}).to_string(),"local_round_id":owner.get("local_round_id"),"stage":owner.get("stage"),"model_call_id":owner.get("model_call_id"),"complete_state":"complete","display_kind":"tool_result"}));
     }
 }
 
@@ -1904,4 +1933,7 @@ fn history_controls(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) 
             let _ = app.run("ai.history", json!({"photo":photo.0,"record":next.record,"offset":next.offset}));
         }
     });
+    if app.ai.paging.busy() || app.ai.conversations.get(&photo).and_then(|c| c.view.as_ref()).is_some_and(|v| v.card_cursor.is_some()) {
+        ui.label(tr("Loading AI history…"));
+    }
 }
