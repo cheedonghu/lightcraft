@@ -495,10 +495,22 @@ impl Session {
         Ok(())
     }
 
+    /// Defer automatic companion retries while the frontend completes one
+    /// cancellation-feedback frame. Explicit persist/close and core journal
+    /// durability remain unchanged; the frontend clears this next frame.
+    pub fn defer_companion_retry(&mut self, deferred: bool) {
+        self.companion_retry_deferred = deferred;
+    }
     /// Write pending ops to the log (fsynced), compact when due, and save changed presets.
     /// Called after every top-level command; cheap when nothing changed. Fails (with
     /// [`EngineError::NotSaved`]) only when the queued ops couldn't be written; they stay queued.
     pub fn persist(&mut self) -> Result<()> {
+        self.persist_inner(false)
+    }
+    pub(crate) fn persist_automatic(&mut self) -> Result<()> {
+        self.persist_inner(self.companion_retry_deferred)
+    }
+    fn persist_inner(&mut self, defer_companion: bool) -> Result<()> {
         let Some(lib) = self.library.as_mut() else { return Ok(()) };
         if !self.pending_log.is_empty() {
             if let Err(e) = lib.journal.append(&self.pending_log) {
@@ -538,7 +550,7 @@ impl Session {
                 lib.presets_written = presets;
             }
         }
-        self.flush_companion()
+        if defer_companion { Ok(()) } else { self.flush_companion() }
     }
 
     /// Persist if commands left ops pending (cheap; frontends call it once per frame for state
@@ -546,7 +558,7 @@ impl Session {
     pub fn persist_if_dirty(&mut self) {
         let backing_off = self.library.as_ref().and_then(|l| l.retry_at).is_some_and(|t| web_time::Instant::now() < t);
         if self.library.is_some() && (!self.pending_log.is_empty() || self.companion_archive.needs_retry()) && !backing_off {
-            let _ = self.persist();
+            let _ = self.persist_automatic();
         } else if let Some(lib) = self.library.as_mut() {
             poll_compaction(lib);
         }

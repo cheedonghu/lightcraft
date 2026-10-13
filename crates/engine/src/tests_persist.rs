@@ -40,6 +40,15 @@ impl Store for Flaky {
     fn read(&mut self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
         self.files.read(name)
     }
+    fn read_limited(&mut self, name: &str, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+        self.files.read_limited(name, max)
+    }
+    fn read_range(&mut self, name: &str, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        self.files.read_range(name, offset, length)
+    }
+    fn remove(&mut self, name: &str) -> std::io::Result<()> {
+        self.files.remove(name)
+    }
     fn write_atomic(&mut self, name: &str, data: &[u8]) -> std::io::Result<()> {
         if self.failing() && !self.appends_only {
             return Err(std::io::Error::other("disk full"));
@@ -190,4 +199,56 @@ fn close_fails_when_nothing_can_be_saved() {
     store.set_failing(false);
     s.close_library().unwrap();
     assert_eq!(s.unsaved(), None);
+}
+
+#[test]
+fn feedback_defers_companion_automatic_retry_without_deferring_core_or_explicit_flush() {
+    let core = Flaky::default();
+    let files = Flaky::default();
+    let mut s = Session::new();
+    s.open_library_in(
+        LibraryStores { catalog: Box::new(core.clone()), files: Box::new(files.clone()), dir: "feedback".into(), on_disk: false },
+        true,
+    )
+    .unwrap();
+    let photo = s.active().unwrap();
+    let head = format!("companion/v2/photos/{}/HEAD.json", photo.0);
+    let saved = json!({"schema_version":2,"messages":[{"role":"user","text":"saved"}],"rounds":[]});
+    let pending = json!({"schema_version":2,"messages":[{"role":"user","text":"pending terminal"}],"rounds":[]});
+    s.save_companion_conversation(photo, saved.clone()).unwrap();
+    let before = files.files.get(&head).unwrap();
+    files.set_failing(true);
+    assert!(s.save_companion_conversation(photo, pending.clone()).is_err());
+    s.defer_companion_retry(true);
+    // A metadata command still writes its own core journal, without retrying
+    // the unrelated failed companion record before cancellation feedback.
+    s.execute("photo.rate", &json!({"rating":3})).unwrap();
+    assert_eq!(open(&core.crash_copy(), false).catalog.photo(photo).unwrap().rating, 3);
+    s.execute("library.info", &json!({})).unwrap();
+    assert!(s.unsaved().is_some());
+    files.set_failing(false);
+    s.persist_if_dirty();
+    assert_eq!(files.files.get(&head).unwrap(), before);
+    assert!(s.unsaved().is_some(), "deferred records must remain visibly unsaved");
+    s.defer_companion_retry(false);
+    s.persist_if_dirty();
+    assert!(s.unsaved().is_none());
+    assert_ne!(files.files.get(&head).unwrap(), before);
+    assert_eq!(s.load_companion_conversation(photo).unwrap(), Some(pending));
+    // Explicit Save and final Close always flush, even while a frontend is
+    // still inside its cancellation-feedback frame.
+    for closing in [false, true] {
+        files.set_failing(true);
+        assert!(s.save_companion_conversation(photo, saved.clone()).is_err());
+        s.defer_companion_retry(true);
+        files.set_failing(false);
+        if closing {
+            s.close_library().unwrap();
+        } else {
+            s.persist().unwrap();
+        }
+        assert!(s.unsaved().is_none());
+        assert_eq!(s.load_companion_conversation(photo).unwrap(), Some(saved.clone()));
+        s.defer_companion_retry(false);
+    }
 }

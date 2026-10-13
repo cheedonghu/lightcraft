@@ -1,6 +1,6 @@
 # Lightroom parity checklist
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** patch (UX-06: AI Assistant shares Tools with fixed composer, independent message scrolling and explicit menu reveal; statuses and summary counts unchanged) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** patch (UX-04: priority cancellation and full-app feedback guard; UX-06: AI Assistant shares Tools with fixed composer, independent message scrolling and explicit menu reveal; statuses and summary counts unchanged) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
 
 The measured, row-by-row checklist: one row per Lightroom feature, menu item and shortcut, what we
 have and what is missing. It answers *does the feature exist?* (feature breadth). Whether it is good
@@ -450,7 +450,7 @@ This extension is tracked separately from Lightroom parity and does not close th
 
 | Id | Feature | Status | Evidence | Remaining scope |
 |---|---|---|---|---|
-| PC-01 | AI critique and complete edit plans | 🟡 | `cmd:ai.open`, `cmd:ai.start`, `cmd:ai.stop`, `cmd:ai.undo`, `cmd:ai.clear`, `cmd:ai.status`, `crates/ui-egui/src/ai_companion.rs`, `docs/control-protocol.md` | Native desktop and local Eino backend: one SSE per client, photo-local histories, six read tools, complete controls/WB/curve/Point Color/crop/manual-mask candidates, one review/correction, stop and protected round undo. Conversations and preview attachments use independent versioned storage in the library companion folder, without changing the upstream catalog format. Accounts/budgets, automatic segmentation and browser support remain open. |
+| PC-01 | AI critique and complete edit plans | 🟡 | `cmd:ai.open`, `cmd:ai.start`, `cmd:ai.stop`, `cmd:ai.undo`, `cmd:ai.clear`, `cmd:ai.status`, `crates/ui-egui/src/ai_companion.rs`, `docs/control-protocol.md` | Native desktop and local Eino backend: one SSE per client, photo-local histories, six read tools, complete controls/WB/curve/Point Color/crop/manual-mask candidates, one review/correction, protected round undo, and round-scoped cancellation from the real consent checkbox or Stop: queued and partially written content is cancelled, Stop has reserved priority, heartbeat remains independent, and uncertain creation retains its identity until the connection workers close. Conversations and preview attachments use independent versioned storage in the library companion folder, without changing the upstream catalog format. Accounts/budgets, automatic segmentation and browser support remain open. |
 
 ## X. Cross-cutting behaviours (BEHAV)
 
@@ -796,6 +796,7 @@ Latin stays upright. Advanced Japanese composition remains open. Regression cove
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-13 | patch | UX-06: MENU-WINDOW-PANELS documents the shared AI Assistant, idempotent explicit menu reveal, and fixed composer. Statuses and summary counts unchanged. |
+| 2026-10-13 | patch | UX-04: PC-01 records irreversible request cancellation, reserved Stop delivery and safe uncertain-creation retirement; status and summary counts unchanged. |
 | 2026-10-13 | patch | UX-05: LR-IMP-RAWDEFAULT and LR-FILT-TYPE document source Reset / logical WB comparison; LR-VIEW-PHOTOGRID and LR-VIEW-FILMSTRIP document consistent modified badges and explicit visibility settings. Statuses and summary counts unchanged. |
 | 2026-10-11 | minor | KEY-SLIDER-TYPE: honor immediate Return/Escape and keep typed keys in the value editor; add regression references |
 | 2026-10-11 | minor | LR-PROF-CAMERACOLOR: raws with a black-and-white camera JPEG take its tone curve (issue #577) |
