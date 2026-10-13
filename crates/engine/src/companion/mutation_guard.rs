@@ -38,6 +38,7 @@ struct RuntimeRevert {
     content: String,
     eligible: bool,
     reverted: bool,
+    later_after_revert: bool,
 }
 /// Opaque permission bound to this exact runtime proof and photo version.
 /// Callers cannot create or serialize it; commit rechecks it before restoring.
@@ -53,6 +54,7 @@ pub enum RoundRevertState {
     Eligible,
     LaterEdits,
     Reverted,
+    RevertedWithLaterEdits,
 }
 
 impl Session {
@@ -125,17 +127,17 @@ impl Session {
                         changed.push(*id);
                     }
                 }
-                Op::SetFile { id, source, .. } | Op::Relink { id, source, .. } => {
-                    if self.catalog.photo(*id).is_none_or(|p| p.source != *source) {
-                        changed.push(*id);
-                    }
+                Op::SetFile { id, source, .. } | Op::Relink { id, source, .. } if self.catalog.photo(*id).is_none_or(|p| p.source != *source) => {
+                    changed.push(*id);
                 }
                 _ => {}
             }
         }
         for photo in changed {
             if let Some(proof) = self.mutation_guard.reverts.get_mut(&photo) {
-                Arc::make_mut(proof).eligible = false;
+                let proof = Arc::make_mut(proof);
+                proof.eligible = false;
+                proof.later_after_revert |= proof.reverted;
             }
         }
         Ok(())
@@ -178,6 +180,7 @@ impl Session {
                 content: crate::media::content_key(p),
                 eligible: true,
                 reverted: false,
+                later_after_revert: false,
             }),
         );
         Ok(())
@@ -190,7 +193,9 @@ impl Session {
         if &proof.round != round {
             return RoundRevertState::LaterEdits;
         }
-        if proof.reverted {
+        if proof.reverted && proof.later_after_revert {
+            RoundRevertState::RevertedWithLaterEdits
+        } else if proof.reverted {
             RoundRevertState::Reverted
         } else if self.runtime_revert_current(proof) {
             RoundRevertState::Eligible

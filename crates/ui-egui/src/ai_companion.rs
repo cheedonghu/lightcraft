@@ -1650,8 +1650,16 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             .get("local_round_id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-            .ok_or_else(|| tr("Choose the round to revert.").into())
-            .and_then(|round| photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| undo(&mut state, app, p, round))),
+            .ok_or_else(|| tr("Choose the round to revert.").to_owned())
+            .and_then(|round| {
+                let target = params
+                    .get("photo")
+                    .map(|value| value.as_u64().map(PhotoId).ok_or_else(|| tr("Choose a valid photo to revert.").to_owned()))
+                    .transpose()?
+                    .or_else(|| app.session.active())
+                    .ok_or_else(|| "请先选择照片。".to_owned())?;
+                undo(&mut state, app, target, round)
+            }),
         "ai.clear" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| clear(&mut state, app, p)),
         _ => {
             app.ai = state;
@@ -1665,8 +1673,14 @@ fn present_card(app: &LightcraftApp, state: &State, photo: PhotoId, card: card::
     use lightcraft_engine::companion::RoundRevertState;
     let local: Option<LocalRoundId> = serde_json::from_value(json!(card.local_round_id)).ok();
     let outcome = local.as_ref().map(|round| app.session.companion_round_revert_state(photo, round)).unwrap_or(RoundRevertState::Unverified);
-    let mut card = card.for_current(app.session.develop_of(photo).as_deref(), outcome == RoundRevertState::LaterEdits);
-    card.reverted |= outcome == RoundRevertState::Reverted;
+    let mut card = card.for_current(
+        app.session.develop_of(photo).as_deref(),
+        matches!(outcome, RoundRevertState::LaterEdits | RoundRevertState::RevertedWithLaterEdits),
+    );
+    card.reverted |= matches!(outcome, RoundRevertState::Reverted | RoundRevertState::RevertedWithLaterEdits);
+    if outcome == RoundRevertState::Reverted || (card.reverted && outcome == RoundRevertState::Unverified) {
+        card.current_photo_has_later_edits = false;
+    }
     card.can_undo = card.photo == Some(photo)
         && !state.jobs.contains_key(&photo)
         && !state.worker_busy(photo)
@@ -2005,15 +2019,13 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
             app.ai.conversations.entry(photo).or_default().notice = error;
         }
         ui.horizontal_wrapped(|ui| {
-            for (label, widget, command) in [(tr("Delete Conversation"), "button:aiClear", "ai.clear")] {
-                let button = ui.add_enabled(!worker, egui::Button::new(label));
-                composer_widget(ui, widget, button.rect);
-                if !sizing
-                    && button.clicked()
-                    && let Err(error) = app.run(command, json!({}))
-                {
-                    app.ai.conversations.entry(photo).or_default().notice = error;
-                }
+            let button = ui.add_enabled(!worker, egui::Button::new(tr("Delete Conversation")));
+            composer_widget(ui, "button:aiClear", button.rect);
+            if !sizing
+                && button.clicked()
+                && let Err(error) = app.run("ai.clear", json!({}))
+            {
+                app.ai.conversations.entry(photo).or_default().notice = error;
             }
         });
     }

@@ -2123,5 +2123,6 @@
   "This round was reverted.": "已撤回本轮。",
   "This round was reverted. The conversation was kept.": "已撤回本轮，保留对话。",
   "This round's edits were reverted. The photo was restored to its round starting state.": "本轮修改已撤回，照片已恢复到本轮起点。",
-  "Revert unavailable; use ordinary History.": "无法撤回本轮，请使用普通历史恢复。"
+  "Revert unavailable; use ordinary History.": "无法撤回本轮，请使用普通历史恢复。",
+  "Choose a valid photo to revert.": "请选择有效照片以撤回本轮。"
 }

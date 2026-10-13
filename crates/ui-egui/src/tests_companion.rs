@@ -171,3 +171,66 @@ fn file_source_away_and_back_never_renews_runtime_round_permission() {
     assert!(app.run("ai.undo", json!({"local_round_id":round})).is_err());
     assert_eq!(*app.session.develop_of(photo).unwrap(), *before);
 }
+
+#[test]
+fn partial_correction_undo_and_redo_never_restore_round_permission() {
+    let (mut app, photo, _, round, _) = published_round();
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(app.session.develop_of(photo).unwrap().light.exposure, 0.4);
+    assert!(app.run("ai.undo", json!({"local_round_id":round})).is_err());
+    app.run("edit.redo", json!({})).unwrap();
+    let current = app.session.develop_of(photo).unwrap();
+    assert_eq!(current.light.exposure, 0.2);
+    assert!(app.run("ai.undo", json!({"local_round_id":round})).is_err());
+    assert_eq!(*app.session.develop_of(photo).unwrap(), *current);
+}
+#[test]
+fn other_photo_task_does_not_block_local_round_restore() {
+    let (mut app, photo, other, round, start) = published_round();
+    let other_before = app.session.develop_of(other).unwrap();
+    let _lease = app.session.acquire_companion_lease(other, lightcraft_engine::companion::LocalRoundId::new().unwrap()).unwrap();
+    app.run("ai.undo", json!({"photo":photo.0,"local_round_id":round})).unwrap();
+    assert_eq!(*app.session.develop_of(photo).unwrap(), start);
+    assert_eq!(*app.session.develop_of(other).unwrap(), *other_before);
+}
+
+fn visit_twenty_new_photo_conversations(app: &mut LightcraftApp, photo: lightcraft_catalog::PhotoId) {
+    app.run("ai.status", json!({"photo":photo.0})).unwrap();
+    let template = app.session.catalog.photo(photo).unwrap().as_ref().clone();
+    for index in 0..20 {
+        let id = app.session.catalog.alloc_photo_id();
+        let mut p = template.clone();
+        p.id = id;
+        app.session.commit("Procedural photo", lightcraft_catalog::Op::AddPhoto { photo: Box::new(p) }).unwrap();
+        app.session.set_photo_companion(id,Some(json!({"schema_version":2,"messages":[{"role":"user","text":format!("Photo conversation {index}")}],"rounds":[],"round_records":[]}))).unwrap();
+        app.run("library.select", json!({"ids":[id.0],"active":id.0})).unwrap();
+        app.run("ai.status", json!({})).unwrap();
+    }
+    app.run("library.select", json!({"ids":[photo.0],"active":photo.0})).unwrap();
+    app.run("ai.status", json!({})).unwrap();
+}
+#[test]
+fn photo_read_cache_retirement_does_not_lose_trusted_runtime_permission() {
+    let (mut app, photo, _, round, start) = published_round();
+    visit_twenty_new_photo_conversations(&mut app, photo);
+    app.run("ai.undo", json!({"local_round_id":round})).unwrap();
+    assert_eq!(*app.session.develop_of(photo).unwrap(), start);
+}
+#[test]
+fn photo_read_cache_retirement_never_rehydrates_permission_after_later_edits() {
+    let (mut app, photo, _, round, _) = published_round();
+    app.run("develop.set", json!({"values":{"light.exposure":0.5}})).unwrap();
+    app.run("develop.set", json!({"values":{"light.exposure":0.2}})).unwrap();
+    visit_twenty_new_photo_conversations(&mut app, photo);
+    let current = app.session.develop_of(photo).unwrap();
+    assert!(app.run("ai.undo", json!({"local_round_id":round})).is_err());
+    assert_eq!(*app.session.develop_of(photo).unwrap(), *current);
+}
+
+#[test]
+fn malformed_explicit_round_photo_cannot_fall_back_to_the_active_photo() {
+    let (mut app, photo, _, round, _) = published_round();
+    let current = app.session.develop_of(photo).unwrap();
+    assert!(app.run("ai.undo", json!({"photo":"invalid-photo","local_round_id":round})).is_err());
+    assert_eq!(*app.session.develop_of(photo).unwrap(), *current);
+}

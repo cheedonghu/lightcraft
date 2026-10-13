@@ -179,9 +179,10 @@ fn narrow_shared_panel_keeps_all_composer_controls_inside_tools() {
         h.app.run("ai.open", json!({})).unwrap();
         frames(&mut h);
         let tools = rect(&h, "panel:right_panel");
-        for id in ["ai:stage", "field:aiPrompt", "checkbox:aiConsent", "button:aiStart", "button:aiUndo", "button:aiClear"] {
+        for id in ["ai:stage", "field:aiPrompt", "checkbox:aiConsent", "button:aiStart", "button:aiClear"] {
             assert!(tools.contains_rect(rect(&h, id)), "{id} in {language:?}: {:?} within {tools:?}", rect(&h, id));
         }
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiUndo"), "Undo belongs to an explicit result card, not the composer");
         if let Ok(dir) = std::env::var("UX06_SCREENSHOT_DIR") {
             let shot =
                 h.request("ui.screenshot", json!({"path":format!("{dir}/narrow-{}.png",language.code()),"headless":true}), Duration::from_secs(20));
@@ -266,10 +267,11 @@ fn multiline_draft_scrolls_inside_a_fixed_composer_without_sizing_consuming_inpu
     assert_eq!(rect(&h, "field:aiPrompt"), input);
     assert_eq!(rect(&h, "ai:stage"), stage);
     let tools = rect(&h, "panel:right_panel");
-    for id in ["field:aiPrompt", "checkbox:aiConsent", "button:aiStart", "button:aiUndo", "button:aiClear"] {
+    for id in ["field:aiPrompt", "checkbox:aiConsent", "button:aiStart", "button:aiClear"] {
         assert_eq!(h.app.widgets.iter().filter(|(key, _)| key == id).count(), 1, "only the visible pass registers {id}");
         assert!(tools.contains_rect(rect(&h, id)));
     }
+    assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiUndo"), "a draft alone never supplies an implicit round target");
 }
 
 pub(super) fn short_tools(h: &mut Headless, stacked: bool, height: f32) {
