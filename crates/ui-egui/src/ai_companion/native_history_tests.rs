@@ -261,6 +261,12 @@ impl Store for GatedFiles {
     fn describe(&self) -> String {
         self.inner.describe()
     }
+    fn retention_namespace(&self) -> Option<String> {
+        self.inner.retention_namespace()
+    }
+    fn conservative_retention(&self) -> bool {
+        self.inner.conservative_retention()
+    }
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         Some(Box::new(Self { inner: FsStore::open(self.inner.dir()).unwrap(), gate: self.gate.clone(), background: true }))
     }

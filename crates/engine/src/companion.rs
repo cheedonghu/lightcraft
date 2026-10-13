@@ -6,6 +6,8 @@ mod identity;
 mod mutation_guard;
 #[cfg(test)]
 mod pagination_tests;
+#[cfg(test)]
+mod recovery_tests;
 pub mod storage;
 pub use identity::{LocalRoundId, PhotoScope, RoundIdentity};
 pub(crate) use mutation_guard::MutationGuard;

@@ -796,6 +796,12 @@ fn native_pending_older_intent_survives_switching_away_before_the_reader_retires
         fn describe(&self) -> String {
             "native page read barrier".into()
         }
+        fn retention_namespace(&self) -> Option<String> {
+            self.inner.retention_namespace()
+        }
+        fn conservative_retention(&self) -> bool {
+            self.inner.conservative_retention()
+        }
         fn background_writer(&self) -> Option<Box<dyn Store>> {
             Some(Box::new(Self { inner: FsStore::open(&self.dir).unwrap(), dir: self.dir.clone(), gate: self.gate.clone(), reader: true }))
         }
