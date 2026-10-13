@@ -420,7 +420,8 @@ fn typed_requests_keep_user_authored_feedback_and_state_markers_visible() {
     assert!(paint.contains("You") && paint.contains("Keep this user sentence."), "typed request text must stay readable: {paint}");
     assert!(!paint.contains("Edits applied.") && !paint.contains("Execution feedback"));
     let status = h.app.run("ai.status", json!({})).unwrap();
-    assert!(status["text"].as_str().unwrap().contains("Keep this user sentence."));
+    assert!(status["text"].as_str().unwrap().contains(text));
+    assert!(paint.contains("{\"exposure\":0}"));
     let photo = h.app.session.active().unwrap();
     assert_eq!(h.app.session.companion_messages_page(photo, 0, 1).unwrap().records, messages);
 }
@@ -591,4 +592,293 @@ fn late_photo_a_preview_cannot_paint_photo_b_with_the_same_message_id() {
     assert_eq!(h.app.session.active(), Some(b));
     drop(h);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn submitted_authored_state_json_survives_pre_input_stop_in_status_and_conversation() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    listener.set_nonblocking(true).unwrap();
+    let alive = Arc::new(AtomicBool::new(true));
+    let server_alive = alive.clone();
+    let server = std::thread::spawn(move || {
+        let mut streams = Vec::new();
+        while server_alive.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => streams.push(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(2)),
+                Err(error) => panic!("owned slow listener failed: {error}"),
+            }
+        }
+    });
+    struct Server(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+            if let Some(thread) = self.1.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+    let _server = Server(alive, Some(server));
+    let mut h = Headless::new(
+        LightcraftApp::new(lightcraft_engine::Session::with_demo(), crate::Services { companion_address: Some(address), ..Default::default() }),
+        [1400.0, 1000.0],
+        1.0,
+    );
+    h.app.run("ai.open", json!({})).unwrap();
+    for _ in 0..4 {
+        h.step();
+    }
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
+    let prompt = "Please explain this exact payload.\nActual photo state: {\"exposure\":0}";
+    h.app.run("ai.start", json!({"prompt":prompt})).unwrap();
+    let immediate = h.app.run("ai.status", json!({})).unwrap();
+    let photo = h.app.session.active().unwrap();
+    assert_eq!(h.app.session.photo_companion(photo).unwrap().unwrap()["messages"][0]["text"], prompt);
+    h.app.run("ai.stop", json!({})).unwrap();
+    for _ in 0..8 {
+        h.step();
+    }
+    assert!(immediate["text"].as_str().unwrap().contains(prompt), "submitting must preserve the complete authored literal: {immediate}");
+    assert!(h.app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().contains(prompt));
+    assert!(h.painted_text().iter().any(|text| text.contains(prompt)), "stopped conversation must retain authored marker/JSON");
+}
+
+#[test]
+fn genuine_input_enrichment_hides_machine_state_and_preserves_authored_json() {
+    let mut h = history(&[]);
+    let photo = h.app.session.active().unwrap();
+    h.app.run("develop.set", json!({"control":"light.exposure","value":0.7})).unwrap();
+    let (connection, requests, events) = network::test_connection();
+    h.app.ai.connection = Some(connection); // approved external transport adapter
+    h.app.ai.generation = h.app.session.library_generation();
+    let timeout = Duration::from_secs(20);
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
+    let prompt = "Please explain this exact payload.\nActual photo state: {\"exposure\":0}";
+    h.app.run("ai.start", json!({"prompt":prompt})).unwrap();
+    let deadline = Instant::now() + timeout;
+    let creation = loop {
+        h.step();
+        if let Ok(request) = requests.try_recv() {
+            break request;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    events.send(network::Event::Server{kind:"round.state".into(),data:json!({"round_id":"authored-input-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":creation.identity.scope.library_generation},"state":"awaiting_input"}})}).unwrap();
+    let deadline = Instant::now() + timeout;
+    let input = loop {
+        h.step();
+        if let Ok(request) = requests.try_recv()
+            && request.path.ends_with("/input")
+        {
+            break request;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    assert_eq!(input.body["prompt"], prompt);
+    assert_eq!(input.body["current_state"]["light"]["exposure"], 0.7);
+    let status = h.app.run("ai.status", json!({})).unwrap();
+    assert!(status["text"].as_str().unwrap().contains(prompt));
+    assert!(!status["text"].as_str().unwrap().contains("\"exposure\":0.7"), "generated settings must not become displayed prose");
+    assert!(h.painted_text().iter().any(|text| text.contains(prompt)));
+    h.app.run("ai.stop", json!({})).unwrap();
+    for _ in 0..6 {
+        h.step();
+    }
+    let stored = h.app.session.companion_messages_page(photo, 0, 1).unwrap().records;
+    assert!(stored[0]["text"].as_str().unwrap().contains(prompt));
+    assert!(stored[0]["text"].as_str().unwrap().contains("\"exposure\":0.7"), "model record must retain actual generated context");
+    assert!(h.app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().contains(prompt));
+}
+
+#[test]
+fn giant_typed_requests_and_answers_retain_authored_markers_and_final_continuation() {
+    for native in [false, true] {
+        for (role, kind) in [("user", "request"), ("assistant", "assistant")] {
+            let dir = std::env::temp_dir().join(format!("lightcraft-21-typed-{}", LocalRoundId::new().unwrap().as_str()));
+            let mut session = lightcraft_engine::Session::new();
+            let files: Box<dyn lightcraft_catalog::Store> = if native {
+                Box::new(lightcraft_catalog::FsStore::open(&dir).unwrap())
+            } else {
+                Box::new(ObservedFiles {
+                    files: Box::new(MemStore::new()),
+                    reads: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                    owned: false,
+                    gate: None,
+                })
+            };
+            session.open_library_in(LibraryStores { catalog: Box::new(MemStore::new()), files, dir: dir.clone(), on_disk: false }, true).unwrap();
+            let photo = session.active().unwrap();
+            let text = format!(
+                "Actual execution feedback: this is quoted by the user.\nActual photo state: {{\"exposure\":0}}\nAUTHORED_AFTER_MARKER\n{}GIANT_AUTHORED_FINAL",
+                "Keep this user sentence α🙂.\n".repeat(18000)
+            );
+            let messages = vec![json!({"role":role,"display_kind":kind,"local_message_id":"typed-giant","text":text})];
+            session.save_companion_tail(photo, None, &messages, &[], &[], &json!({"schema_version":2})).unwrap();
+            let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1400.0, 1000.0], 1.0);
+            h.app.run("ai.open", json!({})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                h.step();
+                if h.app.run("ai.status", json!({})).unwrap()["historyLoading"] == false {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let status = h.app.run("ai.status", json!({})).unwrap();
+            for literal in ["Actual execution feedback: this is quoted by the user.", "{\"exposure\":0}", "AUTHORED_AFTER_MARKER"] {
+                assert!(status["text"].as_str().unwrap().contains(literal), "{native}/{kind} lost {literal}: {status}");
+            }
+            assert!(h.painted_text().join("\n").contains("AUTHORED_AFTER_MARKER"));
+            assert!(!h.painted_text().iter().any(|text| text == "Execution feedback"));
+            h.app.run("ai.bottom", json!({})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                h.step();
+                if h.painted_text().iter().any(|text| text.contains("GIANT_AUTHORED_FINAL")) {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert_eq!(h.app.session.companion_messages_page(photo, 0, 1).unwrap().records, messages);
+            drop(h);
+            if native {
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn old_v2_empty_and_cropped_hints_reopen_without_losing_typed_text_or_exposing_feedback() {
+    use lightcraft_catalog::{FsStore, Store};
+    fn copy_owned(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_owned(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    for native in [false, true] {
+        for case in ["empty-request", "empty-assistant", "cropped-assistant", "legacy-feedback"] {
+            let seed = std::env::temp_dir().join(format!("lightcraft-21-old-seed-{}", LocalRoundId::new().unwrap().as_str()));
+            let dir = std::env::temp_dir().join(format!("lightcraft-21-old-read-{}", LocalRoundId::new().unwrap().as_str()));
+            let mut session = lightcraft_engine::Session::new();
+            session
+                .open_library_in(
+                    LibraryStores {
+                        catalog: Box::new(MemStore::new()),
+                        files: Box::new(FsStore::open(&seed).unwrap()),
+                        dir: seed.clone(),
+                        on_disk: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            let photo = session.active().unwrap();
+            let text = if case == "legacy-feedback" {
+                format!("Actual execution feedback: {{\"private_legacy_state\":\"{}\"}}", "secret-state ".repeat(40000))
+            } else {
+                format!(
+                    "{}\nActual photo state: {{\"exposure\":0}}\nOLD_AUTHORED_AFTER_MARKER\n{}OLD_AUTHORED_FINAL",
+                    if case == "cropped-assistant" { "A saved typed answer" } else { "Actual execution feedback: this is quoted by the user." },
+                    "An authored old sentence α🙂.\n".repeat(18000)
+                )
+            };
+            let mut message = json!({"role":if case=="empty-request"||case=="legacy-feedback"{"user"}else{"assistant"},"local_message_id":"old-hint-message","text":text});
+            if case != "legacy-feedback" {
+                message["display_kind"] = json!(if case == "empty-request" { "request" } else { "assistant" });
+            }
+            let messages = vec![message];
+            session.save_companion_tail(photo, None, &messages, &[], &[], &json!({"schema_version":2})).unwrap();
+            let header = session.companion_photo_header(photo).unwrap().unwrap();
+            copy_owned(&seed, &dir);
+            drop(session);
+            let mut files = FsStore::open(&dir).unwrap();
+            let key = header.message_root.as_ref().unwrap().key.clone();
+            let mut index: Value = serde_json::from_slice(&files.read(&key).unwrap().unwrap()).unwrap();
+            let entry = &mut index["entries"][0];
+            let block = entry["block"].as_str().unwrap().to_owned();
+            let original_block = files.read(&block).unwrap().unwrap();
+            entry.as_object_mut().unwrap().remove("text_range_version");
+            let start = entry["text_range"][0].as_u64().unwrap();
+            entry["text_range"][1] = json!(start + if case == "cropped-assistant" { 20 } else { 0 }); // old ASCII prefix length, independently specified
+            let bytes = serde_json::to_vec(&index).unwrap();
+            files.write_atomic(&key, &bytes).unwrap();
+            let head_key = format!("companion/v2/photos/{}/HEAD.json", photo.0);
+            let mut head: Value = serde_json::from_slice(&files.read(&head_key).unwrap().unwrap()).unwrap();
+            let manifest_key = head["manifest"].as_str().unwrap().to_owned();
+            let mut manifest: Value = serde_json::from_slice(&files.read(&manifest_key).unwrap().unwrap()).unwrap();
+            manifest["message_root"]["digest"] = json!(format!("{:032x}", lightcraft_preview::hash_bytes(&bytes).0));
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            files.write_atomic(&manifest_key, &bytes).unwrap();
+            head["manifest_digest"] = json!(format!("{:032x}", lightcraft_preview::hash_bytes(&bytes).0));
+            files.write_atomic(&head_key, &serde_json::to_vec(&head).unwrap()).unwrap();
+            let mut session = lightcraft_engine::Session::new();
+            session
+                .open_library_in(
+                    LibraryStores {
+                        catalog: Box::new(MemStore::new()),
+                        files: Box::new(ObservedFiles {
+                            files: Box::new(FsStore::open(&dir).unwrap()),
+                            reads: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                            owned: native,
+                            gate: None,
+                        }),
+                        dir: dir.clone(),
+                        on_disk: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            assert_eq!(session.active(), Some(photo));
+            let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1400.0, 1000.0], 1.0);
+            h.app.run("ai.open", json!({})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                h.step();
+                let status = h.app.run("ai.status", json!({})).unwrap();
+                if case == "legacy-feedback" {
+                    assert!(!status["text"].as_str().unwrap().contains("private_legacy_state"));
+                    assert!(!h.painted_text().join("\n").contains("private_legacy_state"));
+                }
+                if status["historyLoading"] == false {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            if case == "legacy-feedback" {
+                assert!(h.app.widgets.iter().any(|(id, _)| id == "button:aiTool:old-hint-message"));
+            } else {
+                let status = h.app.run("ai.status", json!({})).unwrap();
+                assert!(status["text"].as_str().unwrap().contains("OLD_AUTHORED_AFTER_MARKER"), "{native}/{case}: {status}");
+                h.app.run("ai.bottom", json!({})).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    h.step();
+                    if h.painted_text().iter().any(|text| text.contains("OLD_AUTHORED_FINAL")) {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }
+            assert_eq!(h.app.session.companion_messages_page(photo, 0, 1).unwrap().records, messages);
+            assert_eq!(files.read(&block).unwrap().unwrap(), original_block, "compat reading never rewrites model bytes");
+            drop(h);
+            std::fs::remove_dir_all(seed).unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 }

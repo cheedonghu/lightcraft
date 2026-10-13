@@ -151,7 +151,16 @@ impl State {
                                     let mut presentation = record.clone();
                                     if let Some(object) = presentation.as_object_mut() {
                                         object.retain(|key, _| {
-                                            matches!(key.as_str(), "role" | "display_kind" | "local_message_id" | "local_round_id" | "images")
+                                            matches!(
+                                                key.as_str(),
+                                                "role"
+                                                    | "display_kind"
+                                                    | "authored_text_bytes"
+                                                    | "legacy_hidden_text"
+                                                    | "local_message_id"
+                                                    | "local_round_id"
+                                                    | "images"
+                                            )
                                         });
                                     }
                                     view.cards_bytes = view

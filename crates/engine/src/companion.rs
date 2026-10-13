@@ -394,3 +394,19 @@ pub fn validate_history_image(mime: &str, data: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Authored prose is separate from the state suffix associated by actual input preparation.
+/// Marker spelling alone is never proof that user text is machine context.
+pub fn authored_message_text(message: &serde_json::Value) -> &str {
+    let text = message["text"].as_str().unwrap_or_default();
+    if message["role"] == "user"
+        && message["display_kind"] == "request"
+        && let Some(length) = message["authored_text_bytes"].as_u64().and_then(|n| usize::try_from(n).ok())
+        && let Some(prompt) = text.get(..length)
+        && text.get(length..).is_some_and(|suffix| suffix.starts_with("\nActual photo state: "))
+    {
+        prompt
+    } else {
+        text
+    }
+}

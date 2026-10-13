@@ -135,7 +135,7 @@ fn markdown(ui: &mut egui::Ui, text: &str) {
 
 fn fragment_row(ui: &mut egui::Ui, metadata: &Value, text: &str, fallback: &str, attachments: &mut attachments::Attachments) {
     let id = metadata["local_message_id"].as_str().unwrap_or(fallback);
-    if metadata["role"] == "tool" || metadata["display_kind"] == "execution_feedback" {
+    if metadata["role"] == "tool" || execution_feedback(metadata) {
         let label = if metadata["role"] == "tool" { "Tool process" } else { "Execution feedback" };
         let header = egui::CollapsingHeader::new(tr(label)).id_salt(("fragment-tool", id)).default_open(false).show(ui, |ui| {
             markdown(ui, text);
@@ -162,16 +162,9 @@ fn fragment_row(ui: &mut egui::Ui, metadata: &Value, text: &str, fallback: &str,
 // Explicit saved kinds take precedence over legacy text markers.
 pub(super) fn execution_feedback(message: &Value) -> bool {
     message["display_kind"] == "execution_feedback"
-        || (message.get("display_kind").is_none() && message["text"].as_str().is_some_and(|text| text.starts_with("Actual execution feedback:")))
+        || (message.get("display_kind").is_none()
+            && (message["legacy_hidden_text"] == true || message["text"].as_str().is_some_and(|text| text.starts_with("Actual execution feedback:"))))
 }
 pub(super) fn user_text(message: &Value) -> &str {
-    let text = message["text"].as_str().unwrap_or_default();
-    if message["role"] == "user"
-        && let Some((prompt, state)) = text.rsplit_once("\nActual photo state:")
-        && serde_json::from_str::<Value>(state).is_ok()
-    {
-        prompt
-    } else {
-        text
-    }
+    lightcraft_engine::companion::authored_message_text(message)
 }

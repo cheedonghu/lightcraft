@@ -1130,7 +1130,7 @@ impl State {
             let input = json!({"input_id":format!("input-{seq}"),"photo_revision":revision,"prompt":job.prompt,"current_state":settings,"preview":snapshot.preview,"history":job.history,"capabilities":capabilities(&settings)});
             let message =
                 self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?.messages.get_mut(job.user_message).ok_or("AI 用户请求缺失。")?;
-            *message = json!({"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request","role":"user","text":format!("{}\nActual photo state: {}",job.prompt,settings.to_json()),"images":[{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]});
+            *message = json!({"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request","role":"user","authored_text_bytes":job.prompt.len(),"text":format!("{}\nActual photo state: {}",job.prompt,settings.to_json()),"images":[{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]});
             if let Some(record) = self
                 .conversations
                 .get_mut(&photo)
@@ -1924,8 +1924,7 @@ fn display_text(conversation: &Conversation) -> String {
                 lightcraft_engine::companion::storage::HistoryItem::Fragment { record, index, .. } => {
                     if let Some(fragment) = view.fragments.get(index)
                         && view.fragment_messages.get(&record).is_some_and(|message| {
-                            matches!(message["role"].as_str(), Some("user" | "assistant" | "system"))
-                                && message["display_kind"] != "execution_feedback"
+                            matches!(message["role"].as_str(), Some("user" | "assistant" | "system")) && !reading::execution_feedback(message)
                         })
                     {
                         text.push_str(fragment);
