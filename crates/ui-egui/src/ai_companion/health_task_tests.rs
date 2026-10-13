@@ -967,3 +967,137 @@ fn invalid_client_plan_explains_untouched_start_and_manual_recovery() {
     assert_eq!(*h.app.session.develop_of(photo).unwrap(), *original);
     assert_eq!(status["task"]["terminal"], "failed");
 }
+
+#[test]
+fn omitted_history_navigation_follows_readonly_task_without_changing_selected_photo_reading() {
+    use lightcraft_catalog::MemStore;
+    use lightcraft_engine::{
+        companion::{EditorState, storage::HistoryCursor},
+        library::LibraryStores,
+    };
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        let mut session = Session::new();
+        session
+            .open_library_in(
+                LibraryStores {
+                    catalog: Box::new(MemStore::new()),
+                    files: Box::new(MemStore::new()),
+                    dir: "readonly-history".into(),
+                    on_disk: false,
+                },
+                true,
+            )
+            .unwrap();
+        let photo = session.active().unwrap();
+        let other = session.catalog.photos().find(|p| p.id != photo).unwrap().id;
+        for (owner, prefix, count) in [(photo, "ORIGINAL_A_HISTORY", 40), (other, "SELECTED_B_HISTORY", 60)] {
+            let messages = (0..count).map(|n| json!({"role":"assistant","text":format!("{prefix}_{n}\nSaved reading line {n}")})).collect::<Vec<_>>();
+            session.save_companion_conversation(owner, json!({"schema_version":2,"messages":messages,"round_records":[],"rounds":[]})).unwrap();
+        }
+        let header = session.companion_photo_header(other).unwrap().unwrap();
+        session
+            .set_companion_editor(
+                other,
+                EditorState {
+                    draft: "B_HISTORY_DRAFT".into(),
+                    scroll_offset: 30.0,
+                    follow_tail: false,
+                    reading_cursor: Some(HistoryCursor { record: 32, offset: 0 }),
+                    reading_epoch: Some(header.conversation_epoch),
+                    reading_count: Some(header.message_count),
+                },
+            )
+            .unwrap();
+        session.execute("develop.set", &json!({"ids":[other.0],"values":{"light.exposure":0.7}})).unwrap();
+        session.persist().unwrap();
+        let mut app = LightcraftApp::new(session, Services::default());
+        let (connection, requests, events) = network::test_connection();
+        app.ai.connection = Some(connection);
+        app.ai.generation = app.session.library_generation();
+        let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
+        h.app.run(if language == crate::i18n::Locale::En { "app.language.english" } else { "app.language.simplifiedChinese" }, json!({})).unwrap();
+        h.app.run("ai.open", json!({})).unwrap();
+        frames(&mut h);
+        request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
+        h.app.run("ai.start", json!({"prompt":"Explain original A"})).unwrap();
+        let creation = outgoing(&mut h, &requests, "/v1/rounds");
+        events.send(network::Event::Server {kind:"round.state".into(),data:json!({"round_id":"readonly-history-round","payload":{"submission_seq":creation.submission,"photo_ref":creation.body["photo_ref"],"state":"analyzing_initial"}})}).unwrap();
+        events
+            .send(network::Event::Server {
+                kind: "text.delta".into(),
+                data: json!({"round_id":"readonly-history-round","payload":{"message_id":"answer","delta":"Original A complete answer"}}),
+            })
+            .unwrap();
+        events
+            .send(network::Event::Server {
+                kind: "message.completed".into(),
+                data: json!({"round_id":"readonly-history-round","payload":{"message_id":"answer","tool_calls":[]}}),
+            })
+            .unwrap();
+        events
+            .send(network::Event::Server {
+                kind: "round.ended".into(),
+                data: json!({"round_id":"readonly-history-round","payload":{"terminal_state":"completed"}}),
+            })
+            .unwrap();
+        frames(&mut h);
+        h.app.session.execute("photo.delete", &json!({"ids":[photo.0]})).unwrap();
+        h.app.run("library.select", json!({"ids":[other.0],"active":other.0})).unwrap();
+        frames(&mut h);
+        let before = h.app.session.companion_editor(other).unwrap();
+        assert_eq!(before.reading_cursor, Some(HistoryCursor { record: 32, offset: 0 }));
+        assert_eq!(before.draft, "B_HISTORY_DRAFT");
+        let selection = h.app.session.selection.clone();
+        let develop = h.app.session.develop_of(other).unwrap();
+        h.app.run("ai.task", json!({})).unwrap();
+        frames(&mut h);
+        assert!(h.app.widgets.iter().any(|(id, _)| id == "indicator:aiTaskReadOnly"));
+        assert_eq!(h.app.run("ai.status", json!({})).unwrap()["viewedPhoto"], photo.0);
+        h.app.run("ai.history", json!({"record":0,"offset":0})).unwrap();
+        assert_eq!(
+            h.app.session.companion_editor(other).unwrap(),
+            before,
+            "omitted history must not mutate selected B while readonly A is presented"
+        );
+        frames(&mut h);
+        assert_eq!(h.app.session.companion_editor(photo).unwrap().reading_cursor, Some(HistoryCursor { record: 0, offset: 0 }));
+        let viewport = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").unwrap().1;
+        request(&mut h, "ui.move", json!({"x":viewport.center().x,"y":viewport.center().y}));
+        request(&mut h, "ui.scroll", json!({"dy":10000}));
+        frames(&mut h);
+        assert!(
+            h.view.painted_shapes().iter().any(|shape| match shape {
+                egui::epaint::Shape::Text(text) if text.opacity_factor > 0.0 => text
+                    .galley
+                    .rows
+                    .iter()
+                    .any(|row| row.text() == "ORIGINAL_A_HISTORY_0" && viewport.contains_rect(row.rect().translate(text.pos.to_vec2()))),
+                _ => false,
+            }),
+            "the complete original A row is visibly inside its message viewport"
+        );
+        assert!(!h.painted_text().iter().any(|text| text.contains("SELECTED_B_HISTORY_0")));
+        assert_eq!(h.app.session.selection, selection);
+        assert_eq!(*h.app.session.develop_of(other).unwrap(), *develop);
+        assert_eq!(h.app.session.companion_editor(other).unwrap(), before);
+        h.app.run("ai.returnCurrent", json!({})).unwrap();
+        frames(&mut h);
+        assert_eq!(h.app.session.companion_editor(other).unwrap(), before, "Return restores the saved B position");
+        assert!(h.painted_text().iter().any(|text| text.contains("B_HISTORY_DRAFT")));
+        assert_eq!(h.app.session.selection, selection);
+        assert_eq!(*h.app.session.develop_of(other).unwrap(), *develop);
+        h.app.run("ai.task", json!({})).unwrap();
+        frames(&mut h);
+        h.app.run("ai.history", json!({"photo":other.0,"record":0,"offset":0})).unwrap();
+        assert_eq!(
+            h.app.session.companion_editor(other).unwrap().reading_cursor,
+            Some(HistoryCursor { record: 0, offset: 0 }),
+            "explicit B history remains an intentional B navigation"
+        );
+        assert_eq!(h.app.run("ai.status", json!({})).unwrap()["viewedPhoto"], photo.0);
+        assert_eq!(h.app.session.companion_editor(other).unwrap().draft, before.draft);
+        assert_eq!(h.app.session.selection, selection);
+        assert_eq!(*h.app.session.develop_of(other).unwrap(), *develop);
+        assert!(requests.try_recv().is_err(), "history navigation and Return do not submit");
+    }
+}

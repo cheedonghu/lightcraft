@@ -1775,15 +1775,18 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 "cleanupError": photo.and_then(|p| app.session.companion_cleanup_error(p)),
             }))
         }
-        "ai.history" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
-            state.load(app, p)?;
-            let record = params.get("record").and_then(Value::as_u64).unwrap_or(0);
-            let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
-            let cursor = lightcraft_engine::companion::storage::HistoryCursor { record, offset };
-            state.navigate_page(app, p, cursor)?;
-            state.request_page(app, p, cursor)?;
-            Ok(json!({"requested":true}))
-        }),
+        "ai.history" => {
+            let viewed_photo = if params.get("photo").is_some() { photo } else { state.displayed_photo(app) };
+            viewed_photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
+                state.load(app, p)?;
+                let record = params.get("record").and_then(Value::as_u64).unwrap_or(0);
+                let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                let cursor = lightcraft_engine::companion::storage::HistoryCursor { record, offset };
+                state.navigate_page(app, p, cursor)?;
+                state.request_page(app, p, cursor)?;
+                Ok(json!({"requested":true}))
+            })
+        }
         "ai.undo" => params
             .get("local_round_id")
             .and_then(Value::as_str)
