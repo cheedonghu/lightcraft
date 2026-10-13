@@ -278,6 +278,7 @@ impl Fields {
                                         | "before_preview_message_id"
                                         | "recent_complete_hash"
                                         | "recent_complete_result"
+                                        | "revert_state"
                                 )
                             };
                         }

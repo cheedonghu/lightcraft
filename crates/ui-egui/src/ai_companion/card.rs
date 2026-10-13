@@ -11,6 +11,10 @@ use serde_json::Value;
 #[serde(rename_all = "camelCase")]
 pub(super) struct Card {
     pub local_round_id: String,
+    #[serde(skip)]
+    pub photo: Option<PhotoId>,
+    pub can_undo: bool,
+    pub reverted: bool,
     pub stages: Vec<Stage>,
     pub current_photo_has_later_edits: bool,
     #[serde(skip)]
@@ -66,6 +70,9 @@ pub(super) fn from_record(record: &Value, current: Option<&DevelopSettings>) -> 
         .and_then(|v| serde_json::from_value::<DevelopSettings>(v).ok());
     Some(Card {
         local_round_id: id.into(),
+        photo: record.get("photo_id").and_then(Value::as_u64).map(PhotoId),
+        can_undo: false,
+        reverted: record["revert_state"] == "reverted",
         retained_result: if matches!(record["local_terminal"].as_str(), Some("failed" | "cancelled")) {
             Some(
                 if stages.iter().any(|s| s["locally_published"] == true && s["stage"] == "correction") {
@@ -163,13 +170,20 @@ pub(super) fn from_record(record: &Value, current: Option<&DevelopSettings>) -> 
             .collect(),
     })
 }
-pub(super) fn show(ui: &mut egui::Ui, card: &Card) -> bool {
-    let mut history = false;
+pub(super) enum Action {
+    History,
+    Undo,
+}
+pub(super) fn show(ui: &mut egui::Ui, card: &Card) -> Option<Action> {
+    let mut action = None;
     let frame = egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.strong(tr("Round result"));
         ui.small(tr("This card records the round; the editor shows the current photo."));
         if let Some(retained) = &card.retained_result {
             ui.label(tr(retained));
+        }
+        if card.reverted {
+            ui.strong(tr("This round was reverted."));
         }
         if card.current_photo_has_later_edits {
             ui.label(tr("The current photo has later edits."));
@@ -224,10 +238,20 @@ pub(super) fn show(ui: &mut egui::Ui, card: &Card) -> bool {
         super::composer_widget(ui, &format!("button:aiParameters:{}", card.local_round_id), details.header_response.rect);
         let locate = ui.button(tr("Open ordinary History"));
         super::composer_widget(ui, &format!("button:aiHistory:{}", card.local_round_id), locate.rect);
-        history = locate.clicked();
+        if locate.clicked() {
+            action = Some(Action::History);
+        }
+        let undo = ui.add_enabled(card.can_undo, egui::Button::new(tr("Undo AI Round")));
+        super::composer_widget(ui, &format!("button:aiUndo:{}", card.local_round_id), undo.rect);
+        if undo.clicked() {
+            action = Some(Action::Undo);
+        }
+        if !card.can_undo && !card.reverted {
+            ui.small(tr("Revert unavailable; use ordinary History."));
+        }
     });
     super::composer_widget(ui, &format!("ai:card:{}", card.local_round_id), frame.response.rect);
-    history
+    action
 }
 /// Freeze the same effective WB scale used by the editor, before the source can change.
 pub(super) fn capture(settings: &DevelopSettings, info: &lightcraft_engine::pipeline::SourceInfo, compare: &DevelopSettings) -> Value {

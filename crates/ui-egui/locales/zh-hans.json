@@ -2111,10 +2111,18 @@
   "The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.": "AI 历史不完整或无效，完整本地历史仍保留。请修复附件或删除整段对话后重试。",
   "The AI draft is unavailable.": "AI 草稿不可用。",
   "The AI draft belongs to a closed library.": "AI 草稿属于已关闭的图库。",
-  "The complete AI history exceeds the service limit. Local history is retained.": "AI 完整历史超过服务限制，完整本地历史仍保留，未删减。",
   "Loading draft…": "正在读取草稿…",
   "Samples": "采样颜色",
   "Combination": "组合方式",
   "On": "开启",
-  "Historical parameter details are unavailable.": "历史参数详情不可用。"
+  "Historical parameter details are unavailable.": "历史参数详情不可用。",
+  "Choose the round to revert.": "请选择要撤回的轮次。",
+  "This round has no verified revert permission; use ordinary History.": "无法验证本轮撤回资格，请使用普通历史恢复。",
+  "The photo has later edits; use ordinary History. The current photo was kept.": "照片已有后续编辑，请使用历史恢复，未覆盖当前照片。",
+  "The round revert permission is stale; the photo was kept.": "本轮撤回资格已失效，未覆盖当前照片。",
+  "This round was reverted.": "已撤回本轮。",
+  "This round was reverted. The conversation was kept.": "已撤回本轮，保留对话。",
+  "This round's edits were reverted. The photo was restored to its round starting state.": "本轮修改已撤回，照片已恢复到本轮起点。",
+  "Revert unavailable; use ordinary History.": "无法撤回本轮，请使用普通历史恢复。",
+  "Choose a valid photo to revert.": "请选择有效照片以撤回本轮。"
 }

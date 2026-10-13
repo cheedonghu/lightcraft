@@ -36,6 +36,9 @@ mod persistence_tests;
 mod projection;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+#[path = "ai_companion/revert_tests.rs"]
+mod revert_tests;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1626,7 +1629,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 })).collect::<Vec<_>>(),
                 "round": photo.and_then(|p| state.jobs.get(&p)).map(|j| j.round.clone()),
                 "text": conversation.map(display_text).unwrap_or_else(|| state.text.clone()),
-                "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().map(|card| { let invalidated=c.checkpoint.as_ref().is_some_and(|p|p.local_round_id.as_deref()==Some(card.local_round_id.as_str()) && !p.eligible); card.for_current(photo.and_then(|p|app.session.develop_of(p)).as_deref(),invalidated) }).chain(c.records.iter().filter_map(|r|card::from_record(r,photo.and_then(|p|app.session.develop_of(p)).as_deref()))).collect::<Vec<_>>()).unwrap_or_default(),
+                "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().chain(c.records.iter().filter_map(|r|card::from_record(r,None))).map(|card| present_card(app,&state,photo.unwrap_or(PhotoId(0)),card)).collect::<Vec<_>>()).unwrap_or_default(),
                 "historyLoading": state.paging.busy() || photo.is_some_and(|photo| state.paging.awaiting_page(photo)) || conversation.and_then(|c| c.view.as_ref()).is_some_and(|v|v.card_cursor.is_some()),
                 "activePhotos": state.jobs.keys().map(|p| p.0).collect::<Vec<_>>(),
                 "saveState": photo.map(|p| if app.session.companion_photo_unsaved(p) || state.pending_local_saves.contains(&p) { "unsaved" } else { "saved" }),
@@ -1643,7 +1646,20 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             state.request_page(app, p, cursor)?;
             Ok(json!({"requested":true}))
         }),
-        "ai.undo" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| undo(&mut state, app, p)),
+        "ai.undo" => params
+            .get("local_round_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| tr("Choose the round to revert.").to_owned())
+            .and_then(|round| {
+                let target = params
+                    .get("photo")
+                    .map(|value| value.as_u64().map(PhotoId).ok_or_else(|| tr("Choose a valid photo to revert.").to_owned()))
+                    .transpose()?
+                    .or_else(|| app.session.active())
+                    .ok_or_else(|| "请先选择照片。".to_owned())?;
+                undo(&mut state, app, target, round)
+            }),
         "ai.clear" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| clear(&mut state, app, p)),
         _ => {
             app.ai = state;
@@ -1653,23 +1669,42 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
     app.ai = state;
     Some(result)
 }
-fn undo(state: &mut State, app: &mut LightcraftApp, photo: PhotoId) -> Result<Value, String> {
+fn present_card(app: &LightcraftApp, state: &State, photo: PhotoId, card: card::Card) -> card::Card {
+    use lightcraft_engine::companion::RoundRevertState;
+    let local: Option<LocalRoundId> = serde_json::from_value(json!(card.local_round_id)).ok();
+    let outcome = local.as_ref().map(|round| app.session.companion_round_revert_state(photo, round)).unwrap_or(RoundRevertState::Unverified);
+    let mut card = card.for_current(
+        app.session.develop_of(photo).as_deref(),
+        matches!(outcome, RoundRevertState::LaterEdits | RoundRevertState::RevertedWithLaterEdits),
+    );
+    card.reverted |= matches!(outcome, RoundRevertState::Reverted | RoundRevertState::RevertedWithLaterEdits);
+    if outcome == RoundRevertState::Reverted || (card.reverted && outcome == RoundRevertState::Unverified) {
+        card.current_photo_has_later_edits = false;
+    }
+    card.can_undo = card.photo == Some(photo)
+        && !state.jobs.contains_key(&photo)
+        && !state.worker_busy(photo)
+        && local.as_ref().is_some_and(|round| app.session.verify_round_revert(photo, round).is_ok());
+    card
+}
+
+fn undo(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, round: &str) -> Result<Value, String> {
     if state.jobs.contains_key(&photo) || state.worker_busy(photo) {
         return Err("请先停止并等待此照片处理结束。".into());
     }
     state.load(app, photo)?;
-    let checkpoint = state.conversations.get(&photo).and_then(|c| c.checkpoint.clone()).ok_or("此照片没有可撤回的 AI 轮次。")?;
-    if !checkpoint.eligible || !current(app, &checkpoint) {
-        return Err("照片已有后续编辑，请使用历史恢复，未覆盖当前照片。".into());
-    }
-    let op = app.session.develop_op(photo, (*checkpoint.original).clone(), "Undo AI round").ok_or("照片不存在。")?;
-    app.session.commit("Undo AI round", op).map_err(|e| e.to_string())?;
+    let local: LocalRoundId = serde_json::from_value(json!(round)).map_err(|_| "Choose the round to revert.".to_owned())?;
+    let verified = app.session.verify_round_revert(photo, &local).map_err(|e| tr(&e.to_string()).to_owned())?;
+    app.session.commit_verified_round_revert(verified).map_err(|e| tr(&e.to_string()).to_owned())?;
     let conversation = state.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
     if let Some(c) = conversation.checkpoint.as_mut() {
         c.eligible = false;
     }
-    conversation.messages.push(json!({"role":"user","text":"用户撤回了本轮全部 AI 修改，照片恢复到本轮起点。"}));
-    conversation.notice = "已撤回本轮，保留对话。".into();
+    conversation.messages.push(json!({"role":"user","display_kind":"round_reverted","complete_state":"complete","local_round_id":round,"local_message_id":format!("{round}-reverted"),"text":"This round's edits were reverted. The photo was restored to its round starting state."}));
+    conversation.notice = tr("This round was reverted. The conversation was kept.").into();
+    if let Some(record) = conversation.records.iter_mut().find(|r| r["local_round_id"] == round) {
+        record["revert_state"] = json!("reverted");
+    }
     state.save(app, photo)?;
     Ok(json!({"undone":true}))
 }
@@ -1740,7 +1775,7 @@ fn append_visible_message(text: &mut String, message: &Value) {
         if !value.starts_with("Actual execution feedback:") {
             let visible = value.split("\nActual photo state:").next().unwrap_or(value);
             if !visible.is_empty() {
-                text.push_str(visible);
+                text.push_str(if message["display_kind"] == "round_reverted" { tr(visible) } else { visible });
                 text.push_str("\n\n");
             }
         }
@@ -1821,6 +1856,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
 }
 fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
     let mut locate = false;
+    let mut revert = None;
     let controls_top = ui.cursor().top();
     history_controls(app, ui, photo);
     let controls_height = (ui.cursor().top() - controls_top).max(0.0);
@@ -1851,16 +1887,18 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
     let scroll = area.show(ui, |ui| {
         if let Some(conversation) = app.ai.conversations.get(&photo) {
             ui.label(display_text(conversation));
-            for card in conversation.view.iter().flat_map(|v| v.cards.iter()) {
-                let invalidated = conversation
-                    .checkpoint
-                    .as_ref()
-                    .is_some_and(|p| p.local_round_id.as_deref() == Some(card.local_round_id.as_str()) && !p.eligible);
-                locate |= card::show(ui, &card.clone().for_current(app.session.develop_of(photo).as_deref(), invalidated));
-            }
-            for record in &conversation.records {
-                if let Some(card) = card::from_record(record, app.session.develop_of(photo).as_deref()) {
-                    locate |= card::show(ui, &card);
+            for card in conversation
+                .view
+                .iter()
+                .flat_map(|v| v.cards.iter())
+                .cloned()
+                .chain(conversation.records.iter().filter_map(|record| card::from_record(record, None)))
+            {
+                let card = present_card(app, &app.ai, photo, card);
+                match card::show(ui, &card) {
+                    Some(card::Action::History) => locate = true,
+                    Some(card::Action::Undo) => revert = Some(card.local_round_id),
+                    None => {}
                 }
             }
         } else if !app.ai.text.is_empty() {
@@ -1874,6 +1912,11 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
     }
     if locate {
         let _ = app.run("panel.activity", json!({}));
+    }
+    if let Some(round) = revert
+        && let Err(error) = app.run("ai.undo", json!({"photo":photo.0,"local_round_id":round}))
+    {
+        app.ai.conversations.entry(photo).or_default().notice = error;
     }
 }
 
@@ -1976,17 +2019,13 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
             app.ai.conversations.entry(photo).or_default().notice = error;
         }
         ui.horizontal_wrapped(|ui| {
-            for (label, widget, command) in
-                [(tr("Undo AI Round"), "button:aiUndo", "ai.undo"), (tr("Delete Conversation"), "button:aiClear", "ai.clear")]
+            let button = ui.add_enabled(!worker, egui::Button::new(tr("Delete Conversation")));
+            composer_widget(ui, "button:aiClear", button.rect);
+            if !sizing
+                && button.clicked()
+                && let Err(error) = app.run("ai.clear", json!({}))
             {
-                let button = ui.add_enabled(!worker, egui::Button::new(label));
-                composer_widget(ui, widget, button.rect);
-                if !sizing
-                    && button.clicked()
-                    && let Err(error) = app.run(command, json!({}))
-                {
-                    app.ai.conversations.entry(photo).or_default().notice = error;
-                }
+                app.ai.conversations.entry(photo).or_default().notice = error;
             }
         });
     }
