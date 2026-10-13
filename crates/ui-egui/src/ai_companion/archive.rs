@@ -37,6 +37,7 @@ impl State {
     }
     pub(super) fn save(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
         let Some(conversation) = self.conversations.get_mut(&photo) else {
+            self.pending_local_saves.remove(&photo);
             return Ok(());
         };
         if conversation.scope.is_some_and(|scope| scope != PhotoScope { library_generation: app.session.library_generation(), photo }) {
@@ -91,6 +92,7 @@ impl State {
         }
         // Normal journal persistence, independent of the already visible execution result.
         app.session.persist_if_dirty();
+        self.pending_local_saves.remove(&photo);
         Ok(())
     }
     pub(super) fn history(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<Vec<Value>, String> {

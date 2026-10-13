@@ -172,6 +172,8 @@ pub struct Session {
     /// Process-local edit epochs; unlike equality they detect changes away and back.
     photo_revisions: std::collections::BTreeMap<PhotoId, u64>,
     companion_archive: companion::archive::Archive,
+    /// Frontend feedback frame: defer older companion retries, never core writes.
+    companion_retry_deferred: bool,
     /// Auto Sync: edits to the active photo also change the other selected photos (the settings
     /// that changed, nothing else).
     pub auto_sync: bool,
@@ -367,6 +369,7 @@ impl Session {
             mutation_guard: Default::default(),
             photo_revisions: Default::default(),
             companion_archive: Default::default(),
+            companion_retry_deferred: false,
             auto_sync: false,
             catalog: Catalog::new(),
             source: LibrarySource::All,
@@ -502,7 +505,7 @@ impl Session {
             // persistence trouble (a failed compaction, an older queued change still unwritten by
             // a command that changed nothing) doesn't fail the command; `library.info` reports it.
             let produced = self.pending_log.len() > log_start;
-            if let Err(e @ EngineError::NotSaved(_)) = self.persist()
+            if let Err(e @ EngineError::NotSaved(_)) = self.persist_automatic()
                 && produced
                 && r.is_ok()
             {
