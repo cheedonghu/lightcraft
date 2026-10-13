@@ -18,24 +18,32 @@ struct Saved {
 
 #[derive(Default)]
 pub(crate) struct Archive {
-    photos: BTreeMap<PhotoId, Value>,
+    pub(super) photos: BTreeMap<PhotoId, Value>,
+    pub(super) legacy: bool,
+    pub(super) v2: bool,
+    pub(super) dirty_photos: BTreeSet<PhotoId>,
+    revert_dirty: BTreeSet<PhotoId>,
     dirty: bool,
-    blocked: Option<String>,
-    error: Option<String>,
+    pub(super) blocked: Option<String>,
+    pub(super) error: Option<String>,
     retry_at: Option<web_time::Instant>,
 }
-fn error(e: impl std::fmt::Display) -> EngineError {
+pub(super) fn error(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("AI archive: {e}"))
 }
 impl Archive {
     pub(crate) fn load(store: &mut dyn Store, _dir: &Path, _on_disk: bool) -> Self {
         let mut read = || -> Result<Self> {
             let Some(bytes) = store.read_limited(STATE_FILE, MAX_ARCHIVE).map_err(error)? else { return Ok(Self::default()) };
+            let root: Value = serde_json::from_slice(&bytes).map_err(error)?;
+            if root["format"] == "lightcraft-companion" && root["version"] == 2 && root["layout"] == "photo-head-v2" {
+                return Ok(Self { v2: true, ..Default::default() });
+            }
             let saved: Saved = serde_json::from_slice(&bytes).map_err(error)?;
             if saved.format != "lightcraft-companion" || saved.version != 1 {
                 return Err(error("unsupported format; the file was left unchanged"));
             }
-            Ok(Self { photos: saved.photos, ..Default::default() })
+            Ok(Self { photos: saved.photos, legacy: true, ..Default::default() })
         };
         match read() {
             Ok(a) => a,
@@ -52,16 +60,75 @@ impl Archive {
             {
                 a["checkpoint"]["eligible"] = json!(false);
                 self.dirty = true;
+                if self.v2 {
+                    self.dirty_photos.insert(*id);
+                }
+            }
+        }
+    }
+    pub(crate) fn invalidate_storage(&mut self, library: &mut crate::library::Library, ids: &BTreeSet<PhotoId>) {
+        if !self.v2 {
+            return;
+        }
+        self.revert_dirty.extend(ids.iter().copied());
+        match super::storage::invalidate_revert(library.files.as_mut(), &self.revert_dirty) {
+            Ok(()) => {
+                self.revert_dirty.clear();
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
             }
         }
     }
     pub(crate) fn needs_retry(&self) -> bool {
-        self.dirty && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t)
+        (self.dirty || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty()) && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t)
     }
     pub(crate) fn unsaved(&self) -> Option<&str> {
-        self.error.as_deref().filter(|_| self.dirty)
+        self.error.as_deref().filter(|_| self.dirty || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty())
     }
     fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {
+        if let Some(e) = &self.blocked {
+            return Err(error(e));
+        }
+        if self.v2 || !self.dirty_photos.is_empty() {
+            if !self.revert_dirty.is_empty() {
+                if let Err(e) = super::storage::invalidate_revert(library.files.as_mut(), &self.revert_dirty) {
+                    self.error = Some(e.to_string());
+                    return Err(EngineError::NotSaved(e.to_string()));
+                }
+                self.revert_dirty.clear();
+            }
+            let mut failed = None;
+            for photo in self.dirty_photos.clone() {
+                if let Some(value) = self.photos.get(&photo) {
+                    match super::storage::stored_epoch(library.files.as_mut(), photo)
+                        .and_then(|epoch| super::storage::stage(library.files.as_mut(), photo, epoch, value))
+                        .and_then(|p| super::storage::commit(library.files.as_mut(), &p))
+                    {
+                        Ok(()) => {
+                            self.dirty_photos.remove(&photo);
+                        }
+                        Err(e) => {
+                            failed = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+            if failed.is_none() && !self.v2 {
+                match super::storage::activate(library.files.as_mut()) {
+                    Ok(()) => {
+                        self.v2 = true;
+                    }
+                    Err(e) => {
+                        failed = Some(e.to_string());
+                        self.dirty_photos.extend(self.photos.keys().copied());
+                    }
+                }
+            }
+            self.dirty = !self.dirty_photos.is_empty();
+            self.error = failed.clone();
+            return failed.map_or(Ok(()), |e| Err(EngineError::NotSaved(e)));
+        }
         if !self.dirty {
             return Ok(());
         }
@@ -105,6 +172,10 @@ impl Session {
         if let Some(e) = &self.companion_archive.blocked {
             return Err(error(e));
         }
+        if self.companion_archive.v2 {
+            return self.save_companion_conversation(photo, conversation.unwrap_or_else(|| json!({"schema_version":2,"messages":[],"rounds":[]})));
+        }
+        self.companion_archive.legacy = true;
         match conversation {
             Some(value) => {
                 self.companion_archive.photos.insert(photo, value);
@@ -134,6 +205,9 @@ impl crate::library::Library {
         Ok(name)
     }
     pub fn read_companion_attachment(&mut self, name: &str) -> Result<Vec<u8>> {
+        if name.starts_with("companion/v2/") {
+            return super::storage::read_preview(self.files.as_mut(), name);
+        }
         validate_attachment(name)?;
         let bytes = self.files.read_limited(name, 128 * 1024).map_err(error)?.ok_or_else(|| error("preview is missing"))?;
         if bytes.is_empty() || bytes.len() > 128 * 1024 {

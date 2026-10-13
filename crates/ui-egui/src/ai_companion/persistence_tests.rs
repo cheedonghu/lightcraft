@@ -1,0 +1,185 @@
+use super::*;
+use lightcraft_catalog::MemStore;
+use lightcraft_engine::library::LibraryStores;
+
+fn app(catalog: MemStore, files: MemStore) -> LightcraftApp {
+    let mut session = lightcraft_engine::Session::new();
+    session
+        .open_library_in(LibraryStores { catalog: Box::new(catalog), files: Box::new(files), dir: "memory".into(), on_disk: false }, true)
+        .unwrap();
+    LightcraftApp::new(session, crate::Services::default())
+}
+fn phase(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, phase: &str) {
+    let job = &state.jobs[&photo];
+    state.server(app, &egui::Context::default(), "round.state", &json!({"round_id":"round","payload":{"submission_seq":job.identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":job.identity.scope.library_generation},"state":phase}})).unwrap();
+}
+fn render(state: &mut State, app: &mut LightcraftApp) {
+    let msg = state.rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    state.prepared(app, &egui::Context::default(), msg).unwrap();
+}
+#[test]
+fn real_initial_correction_save_reopen_retains_associations_previews_and_actual_results() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut app = app(catalog.clone(), files.clone());
+    let photo = app.session.active().unwrap();
+    let (connection, requests, events) = network::test_connection();
+    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    state.start(&mut app).unwrap();
+    requests.try_recv().unwrap();
+    let local = state.jobs[&photo].identity.local_round_id.clone();
+    phase(&mut state, &mut app, photo, "awaiting_input");
+    render(&mut state, &mut app);
+    requests.try_recv().unwrap();
+    let mut late_request = None;
+    for (id, phase_name, exposure) in [("i", "awaiting_initial_execution", 0.4), ("c", "awaiting_correction_execution", 0.2)] {
+        phase(&mut state, &mut app, photo, phase_name);
+        let revision = app.session.photo_revision(photo);
+        let stage = if id == "i" { "initial" } else { "review" };
+        let tool = format!("round/{stage}/plan");
+        state.server(&mut app, &egui::Context::default(), "message.completed", &json!({"round_id":"round","stage":stage,"payload":{"message_id":"round/1","model_call_id":1,"tool_calls":[{"id":tool,"name":"apply_edit_plan","arguments":{"operations":[]}}]}})).unwrap();
+        state.server(&mut app, &egui::Context::default(), "edit.plan", &json!({"round_id":"round","payload":{"plan_id":id,"tool_call_id":tool,"capability_version":"lightcraft-v2","expected_revision":revision,"reason":"light","operations":[{"type":"set_controls","values":{"light.exposure":exposure}}]}})).unwrap();
+        render(&mut state, &mut app);
+        let request = requests.try_recv().unwrap();
+        if id == "c" {
+            late_request = Some(request);
+        } else {
+            events
+                .try_send(network::Event::Response {
+                    submission: 0,
+                    round: "round".into(),
+                    path: request.path,
+                    identity: request.identity,
+                    result: Ok(json!({"accepted":true,"_client_execution_plan_id":id})),
+                })
+                .unwrap();
+            state.poll_inner(&mut app, &egui::Context::default());
+        }
+    }
+    state
+        .server(
+            &mut app,
+            &egui::Context::default(),
+            "round.ended",
+            &json!({"round_id":"round","trace_id":"trace","payload":{"terminal_state":"completed"}}),
+        )
+        .unwrap();
+    let late = late_request.unwrap();
+    assert!(state.jobs.is_empty());
+    for response in [json!({"accepted":false,"_client_execution_plan_id":"c"}), json!({"_client_execution_plan_id":"c"})] {
+        events
+            .try_send(network::Event::Response {
+                submission: 0,
+                round: "round".into(),
+                path: late.path.clone(),
+                identity: late.identity.clone(),
+                result: Ok(response),
+            })
+            .unwrap();
+        state.poll_inner(&mut app, &egui::Context::default());
+        assert_eq!(state.conversations[&photo].records[0]["backend_confirmed_plan"], "i");
+    }
+    let revision = app.session.photo_revision(photo);
+    events
+        .try_send(network::Event::Response {
+            submission: 0,
+            round: "round".into(),
+            path: late.path,
+            identity: late.identity,
+            result: Ok(json!({"accepted":true,"_client_execution_plan_id":"c"})),
+        })
+        .unwrap();
+    state.poll_inner(&mut app, &egui::Context::default());
+    assert_eq!(state.conversations[&photo].records[0]["backend_confirmed_plan"], "c");
+    assert_eq!(app.session.photo_revision(photo), revision, "late receipt records facts only");
+    app.session.close_library().unwrap();
+    let mut reopened = self::app(catalog, files.clone());
+    let mut state = State::default();
+    state.load(&mut reopened, photo).unwrap();
+    assert!(state.jobs.is_empty());
+    assert!(state.connection.is_none());
+    let record = reopened.session.companion_round(photo, local.as_str()).unwrap().unwrap();
+    assert_eq!(record["local_terminal"], "completed");
+    assert_eq!(record["trace_id"], "trace");
+    assert_eq!(record["stages"][0]["applied_state"]["light"]["exposure"], 0.4);
+    assert_eq!(record["stages"][1]["before_state"]["light"]["exposure"], 0.4);
+    assert_eq!(record["recent_complete_result"]["light"]["exposure"], 0.2);
+    assert_eq!(record["backend_confirmed_plan"], "c");
+    assert_eq!(record["stages"][0]["model_call_id"], 1);
+    assert_eq!(record["stages"][1]["model_call_id"], 1);
+    let assistant_ids: Vec<_> =
+        state.conversations[&photo].messages.iter().filter(|m| m["role"] == "assistant").map(|m| m["local_message_id"].clone()).collect();
+    assert_eq!(assistant_ids.len(), 2);
+    assert_ne!(assistant_ids[0], assistant_ids[1]);
+    let history = state.history(&mut reopened, photo).unwrap();
+    assert_eq!(history.iter().flat_map(|m| m["images"].as_array().into_iter().flatten()).count(), 3);
+    assert!(history.iter().all(|m| m.get("local_message_id").is_none()));
+    let root: Value = serde_json::from_slice(&files.get("companion/state.json").unwrap()).unwrap();
+    assert_eq!(root["version"], 2);
+    // A single damaged attachment retains readable messages, but blocks full model input.
+    let image = &state.conversations[&photo].messages[0]["images"][0];
+    let key = image["attachment"].as_str().unwrap();
+    files.set(key, b"damaged JPEG".to_vec());
+    let mut reading = State::default();
+    reading.load(&mut reopened, photo).unwrap();
+    assert_eq!(reading.conversations[&photo].messages.len(), state.conversations[&photo].messages.len());
+    assert!(reading.history(&mut reopened, photo).is_err());
+}
+#[test]
+fn pure_explanation_round_is_saved_and_reopens_without_a_result_or_resumed_job() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut app = app(catalog.clone(), files.clone());
+    let photo = app.session.active().unwrap();
+    let (connection, requests, _) = network::test_connection();
+    let mut state = State { consent: true, connection: Some(connection), ..Default::default() };
+    state.start(&mut app).unwrap();
+    requests.try_recv().unwrap();
+    phase(&mut state, &mut app, photo, "awaiting_input");
+    render(&mut state, &mut app);
+    requests.try_recv().unwrap();
+    phase(&mut state, &mut app, photo, "analyzing_initial");
+    state
+        .server(
+            &mut app,
+            &egui::Context::default(),
+            "text.delta",
+            &json!({"round_id":"round","payload":{"message_id":"m","delta":"Explanation only."}}),
+        )
+        .unwrap();
+    state
+        .server(
+            &mut app,
+            &egui::Context::default(),
+            "message.completed",
+            &json!({"round_id":"round","payload":{"message_id":"m","model_call_id":"call-1","stage":"initial"}}),
+        )
+        .unwrap();
+    state.server(&mut app, &egui::Context::default(), "round.ended", &json!({"round_id":"round","payload":{"terminal_state":"completed"}})).unwrap();
+    app.session.close_library().unwrap();
+    let mut app = self::app(catalog, files);
+    let mut state = State::default();
+    state.load(&mut app, photo).unwrap();
+    assert_eq!(state.conversations[&photo].messages[1]["text"], "Explanation only.");
+    assert_eq!(state.conversations[&photo].messages[1]["model_call_id"], "call-1");
+    assert!(state.conversations[&photo].checkpoint.is_none());
+    assert!(state.jobs.is_empty());
+}
+
+#[test]
+fn detailed_preview_reduces_dimensions_at_quality75_and_keeps_full_frame() {
+    let image = lightcraft_raster::Rgba8::from_fn(640, 640, |x, y| {
+        let n = ((x as u32).wrapping_mul(747796405) ^ (y as u32).wrapping_mul(2891336453)).wrapping_mul(277803737);
+        [(n & 255) as u8, ((n >> 8) & 255) as u8, ((n >> 16) & 255) as u8, 255]
+    });
+    let options =
+        lightcraft_engine::export::ExportOptions { quality: 75, metadata: lightcraft_engine::export::MetadataPolicy::None, ..Default::default() };
+    let original = lightcraft_engine::export::encode_image(&image, &options).unwrap();
+    assert!(original.len() > 128 * 1024, "fixture must exercise dimension reduction");
+    let (data, width, height) = encode_preview(&image).unwrap();
+    assert!(data.len() <= 128 * 1024);
+    assert!(width < 640);
+    assert_eq!(width, height);
+    let decoded = lightcraft_codecs::decode(&data, lightcraft_codecs::DecodeOptions::default()).unwrap();
+    assert_eq!((decoded.width, decoded.height), (width as u32, height as u32));
+    assert_eq!(decoded.orientation, 1);
+    assert_eq!(decoded.format, lightcraft_codecs::Format::Jpeg);
+}

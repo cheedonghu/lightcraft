@@ -218,6 +218,9 @@ fn post_request(address: SocketAddr, path: &str, token: &str, body: &Value, canc
             ),
         });
     }
+    if path.ends_with("/execution") && (status != 202 || result.get("accepted").and_then(Value::as_bool) != Some(true)) {
+        return Err(RequestFailure { rejected: false, message: "后端回复无效。".into() });
+    }
     Ok(result)
 }
 fn receive(address: SocketAddr, requests: mpsc::Receiver<Request>, tx: &mpsc::SyncSender<Event>, cancel: &Arc<AtomicBool>) -> Result<(), String> {
@@ -286,7 +289,14 @@ fn receive(address: SocketAddr, requests: mpsc::Receiver<Request>, tx: &mpsc::Sy
                                     request.body["client_id"] = json!(client);
                                     request.body["connection_id"] = json!(connection);
                                 }
-                                let result = post_request(address, &request.path, &token, &request.body, &cancel);
+                                let mut result = post_request(address, &request.path, &token, &request.body, &cancel);
+                                // Local receipt correlation is never part of the backend request/model history.
+                                if request.path.ends_with("/execution")
+                                    && let Ok(response) = &mut result
+                                    && let Some(object) = response.as_object_mut()
+                                {
+                                    object.insert("_client_execution_plan_id".into(), request.body.get("plan_id").cloned().unwrap_or(Value::Null));
+                                }
                                 if emit(
                                     &tx,
                                     Event::Response {
