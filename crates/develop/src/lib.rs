@@ -10,6 +10,7 @@ pub mod controls;
 pub mod presets;
 pub mod segmask;
 pub mod settings;
+pub mod white_balance;
 
 pub use controls::{CONTROLS, ControlSpec, Section, Track};
 pub use presets::{Preset, SettingsGroup, apply_partial, extract_groups};

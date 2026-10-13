@@ -256,31 +256,13 @@ pub fn specs() -> Vec<CommandSpec> {
                 .iter()
                 .filter_map(|id| s.develop_of(*id).map(|d| (*id, d)))
                 .filter_map(|(id, _d)| {
-                    // back to the photo's import defaults when a default preset gave it its look
-                    let look = s.catalog.photo(id).and_then(|p| p.import_look.clone());
-                    let fresh = match look {
-                        Some(l) => (*l).clone(),
-                        None => {
-                            // the photo's built-in defaults (raws: capture sharpening and colour noise
-                            // reduction, embedded lens corrections), as at import, with the white balance
-                            // of its current as-shot reference
-                            let info = s.source_info(id);
-                            let defaults = s.catalog.photo(id).map(|p| p.camera_defaults()).unwrap_or_default();
-                            let mut fresh = DevelopSettings {
-                                wb: lightcraft_develop::WhiteBalance {
-                                    mode: WbMode::AsShot,
-                                    temp: info.as_shot_temp,
-                                    tint: info.as_shot_tint,
-                                    ..Default::default()
-                                },
-                                ..defaults
-                            };
-                            lightcraft_pipeline::local::normalize_wb(&mut fresh, &info);
-                            fresh
-                        }
-                    };
-                    // a fresh start renders with the current process (a section or slider reset doesn't change it)
-                    s.develop_op(id, DevelopSettings { process: ProcessVersion::LATEST, ..fresh }, "Reset")
+                    let photo = s.catalog.photo(id)?;
+                    let info = s.source_info(id);
+                    let mut fresh = photo.reset_defaults(Some((info.as_shot_temp, info.as_shot_tint)));
+                    if photo.import_look.is_none() {
+                        lightcraft_pipeline::local::normalize_wb(&mut fresh, &info);
+                    }
+                    s.develop_op(id, fresh, "Reset")
                 })
                 .collect();
             s.commit("Reset", Op::Batch { ops })?;

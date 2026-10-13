@@ -98,7 +98,7 @@ pub enum StartupView {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GridBadges {
-    /// On hover, on the selection, and on rated or flagged photos.
+    /// Metadata badges on hover, selection, rated or flagged photos; modified icons stay visible.
     #[default]
     Auto,
     Always,
