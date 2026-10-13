@@ -59,6 +59,14 @@ pub(crate) fn write_dng_with(file_bytes: Option<&crate::merge::ByteReader>, path
 fn convert(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "photo.convertToDng";
     let ids = s.targets(p);
+    // Include virtual copies before writing any DNG in a mixed batch.
+    let checks = s
+        .catalog
+        .photos()
+        .filter(|ph| ids.contains(&ph.id) || ph.copy_of.is_some_and(|id| ids.contains(&id)))
+        .map(|ph| Op::Relink { id: ph.id, file_name: ph.file_name.clone(), source: ph.source.clone(), format: None })
+        .collect();
+    s.authorize_mutation(&Op::Batch { ops: checks })?;
     let mut ops = Vec::new();
     let mut converted = Vec::new();
     let mut skipped = Vec::new();
@@ -306,6 +314,7 @@ fn reload(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
     }
+    s.authorize_mutation(&Op::Batch { ops: ops.clone() })?;
     for id in &reloaded {
         s.media.forget(*id);
     }

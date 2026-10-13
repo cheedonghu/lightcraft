@@ -174,6 +174,7 @@ pub(crate) fn shown_value(spec: &ControlSpec, v: f64) -> String {
 /// Double-click the label or thumb to reset. Shift-drag = fine adjustment. Click the value to
 /// type one: Return or clicking away applies it, Esc keeps the old one.
 pub fn slider(ui: &mut Ui, spec: &ControlSpec, value: f64, enabled: bool, label_override: Option<&str>) -> SliderOut {
+    let enabled = enabled && ui.is_enabled();
     let t = Tokens::get(ui.ctx());
     let w = ui.available_width();
     let (row, _) = ui.allocate_exact_size(vec2(w, t.slider_row_h), Sense::hover());
@@ -460,10 +461,11 @@ pub fn text_button(ui: &mut Ui, id: &str, label: &str, active: bool) -> Response
     let label = if id.starts_with("labelSet-") { label } else { crate::i18n::tr(label) };
     let t = Tokens::get(ui.ctx());
     let font = t.semibold(11.5);
-    let galley = ui.painter().layout_no_wrap(label.to_string(), font, t.text);
+    let text = if ui.is_enabled() { t.text } else { t.text_disabled };
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, text);
     let size = vec2((galley.size().x + 18.0).max(37.0), 24.0);
     let (r, resp) = ui.allocate_exact_size(size, Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, label));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), active, label));
     register(ui.ctx(), format!("button:{id}"), r);
     let fill = if active {
         t.pressed
@@ -516,6 +518,7 @@ pub fn segmented(ui: &mut Ui, id: &str, items: &[(&str, &str)], active: Option<u
 
 /// An icon-only button. `active` draws the selected background (tool strip).
 pub fn icon_button(ui: &mut Ui, id: &str, icon: Icon, size: egui::Vec2, active: bool, enabled: bool, tooltip: &str) -> Response {
+    let enabled = enabled && ui.is_enabled();
     let tooltip = crate::i18n::tr(tooltip);
     let t = Tokens::get(ui.ctx());
     let (r, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });

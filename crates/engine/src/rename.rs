@@ -947,7 +947,32 @@ impl Session {
     }
 
     /// Complete retained repairs before a file or folder change can stale their exact paths.
+    pub(crate) fn preflight_repair_packets(&self, fs: &dyn MoveFs, repairs: impl Iterator<Item = SidecarMove>) -> Result<()> {
+        let Some(id) = self.companion_task_photo() else { return Ok(()) };
+        let Some(photo) = self.catalog.photo(id) else { return Ok(()) };
+        let Source::File { path } = &photo.source else { return Ok(()) };
+        let paths = [Path::new(path).with_extension("xmp"), PathBuf::from(format!("{path}.xmp"))];
+        if repairs.into_iter().any(|repair| paths.iter().any(|p| repair.touches(fs, p))) {
+            self.preflight_mutation(&Op::RemovePhoto { id })?;
+        }
+        Ok(())
+    }
+
+    fn preflight_file_paths(&self, fs: &dyn MoveFs, paths: impl Iterator<Item = PathBuf>) -> Result<()> {
+        let Some(id) = self.companion_task_photo() else { return Ok(()) };
+        let Some(photo) = self.catalog.photo(id) else { return Ok(()) };
+        let Source::File { path } = &photo.source else { return Ok(()) };
+        if paths.into_iter().any(|p| p == Path::new(path) || fs.same_file(&p, Path::new(path))) {
+            self.preflight_mutation(&Op::RemovePhoto { id })?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn repair_sidecars_with(&mut self, fs: &dyn MoveFs) -> Result<()> {
+        self.preflight_repair_packets(
+            fs,
+            self.pending_sidecar_repairs.iter().chain(self.undo.iter().chain(&self.redo).flat_map(|e| &e.retry_sidecars)).cloned(),
+        )?;
         for repair in self.pending_sidecar_repairs.iter().chain(self.undo.iter().chain(&self.redo).flat_map(|e| &e.retry_sidecars)) {
             repair.validate_repair(fs).map_err(EngineError::Other)?;
         }
@@ -959,6 +984,14 @@ impl Session {
     }
 
     pub(crate) fn repair_sidecars_for_paths(&mut self, paths: &[PathBuf], fs: &dyn MoveFs) -> Result<()> {
+        self.preflight_repair_packets(
+            fs,
+            self.pending_sidecar_repairs
+                .iter()
+                .chain(self.undo.iter().chain(&self.redo).flat_map(|e| &e.retry_sidecars))
+                .filter(|repair| paths.iter().any(|path| repair.touches(fs, path)))
+                .cloned(),
+        )?;
         self.validate_sidecar_packets_for_paths(paths, fs)?;
         retry_sidecars_for_paths(fs, &mut self.pending_sidecar_repairs, paths).map_err(EngineError::Other)?;
         for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
@@ -1008,7 +1041,6 @@ impl Session {
     pub(crate) fn apply_file_plans(&mut self, fs: &dyn MoveFs, plans: &[RenamePlan], label: &dyn Fn(usize) -> String) -> Result<usize> {
         // A partly completed rename can already have the requested photo name. Repair
         // its sidecars before treating that empty move list as a successful retry.
-        self.repair_sidecars_with(fs)?;
         let mut ops = Vec::new();
         let by_path: HashMap<&str, &RenamePlan> = plans.iter().filter_map(|p| p.from_path.as_deref().map(|f| (f, p))).collect();
         for p in self.catalog.photos() {
@@ -1028,6 +1060,9 @@ impl Session {
         }
         let n = ops.len();
         let op = Op::Batch { ops };
+        self.authorize_mutation(&op)?;
+        self.preflight_file_paths(fs, plans.iter().filter_map(|p| p.from_path.as_deref().map(PathBuf::from)))?;
+        self.repair_sidecars_with(fs)?;
         let moves: Vec<(String, String)> = plans
             .iter()
             .filter_map(|pl| match (&pl.from_path, &pl.to_path) {

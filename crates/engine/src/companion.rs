@@ -1,7 +1,10 @@
 //! Pure, photo-bound candidate transformations used by the companion bridge.
 pub(crate) mod archive;
 mod identity;
+mod mutation_guard;
 pub use identity::{LocalRoundId, PhotoScope, RoundIdentity};
+pub use mutation_guard::LeaseToken;
+pub(crate) use mutation_guard::MutationGuard;
 mod ranges;
 use ranges::LOCAL_RANGES;
 mod sampling;

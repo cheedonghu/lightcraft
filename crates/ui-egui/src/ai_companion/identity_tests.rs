@@ -1,7 +1,7 @@
 //! Exercise the existing bridge with real candidate rendering and photo commits.
 use super::*;
 
-fn started() -> (LightcraftApp, State, PhotoId, mpsc::Receiver<network::Request>, mpsc::SyncSender<network::Event>) {
+pub(super) fn started() -> (LightcraftApp, State, PhotoId, mpsc::Receiver<network::Request>, mpsc::SyncSender<network::Event>) {
     let mut app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), crate::Services::default());
     let photo = app.session.active().unwrap();
     let (connection, requests, events) = network::test_connection();
@@ -196,9 +196,8 @@ fn manual_start_before_closed_poll_retires_admitted_and_unadmitted_jobs() {
             }
             let photo_c = app.session.catalog.photos().find(|p| p.id != photo_a).unwrap().id;
             app.session.execute("library.select", &json!({"ids":[photo_c.0],"active":photo_c.0})).unwrap();
-            state.start(&mut app).unwrap();
-            requests.try_recv().unwrap();
-            let other_old_cancel = state.jobs.get(&photo_c).unwrap().cancel.clone();
+            assert!(state.start(&mut app).is_err(), "a live instance task prevents another photo submission");
+            assert!(requests.try_recv().is_err());
             let kept = app.session.develop_of(photo_a).unwrap();
             let previous_messages = app.session.photo_companion(photo_a).unwrap().unwrap()["messages"].as_array().unwrap().len();
             events.try_send(network::Event::Closed("connection interrupted".into())).unwrap();
@@ -212,10 +211,9 @@ fn manual_start_before_closed_poll_retires_admitted_and_unadmitted_jobs() {
             let started = app.run("ai.start", json!({"prompt":"manual retry"}));
             assert!(started.is_ok(), "manual start must retire dead-connection jobs before photo admission: {started:?}");
             assert!(old_cancel.load(Ordering::Relaxed), "all old-generation work is cancelled before replacement");
-            assert!(other_old_cancel.load(Ordering::Relaxed), "replacement retires every old-connection job");
+
             assert_eq!(app.ai.jobs.len(), 1, "only the explicit new round survives");
-            assert!(app.run("ai.status", json!({"photo":photo_c.0})).unwrap()["text"].as_str().unwrap().contains("断开"));
-            assert_eq!(app.session.photo_companion(photo_c).unwrap().unwrap()["messages"].as_array().unwrap().len(), 1);
+            assert!(app.session.photo_companion(photo_c).unwrap().is_none(), "rejected submission leaves no conversation");
             let new_request = next_requests.try_recv().unwrap();
             assert_eq!(new_request.identity.scope.photo, target);
             assert_ne!(new_request.identity.local_round_id, old_identity.local_round_id);

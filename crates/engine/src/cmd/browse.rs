@@ -88,6 +88,7 @@ fn in_use(s: &mut Session) -> std::collections::HashSet<PhotoId> {
     keep.extend(s.previous_active);
     keep.extend(s.interaction.as_ref().map(|i| i.photo));
     keep.extend(s.before.keys().copied());
+    keep.extend(s.companion_task_photo());
     for e in s.undo.iter().chain(s.redo.iter()) {
         e.op.photo_ids(&mut |id| {
             keep.insert(id);
@@ -112,7 +113,7 @@ impl Session {
             return plan;
         }
         for op in plan.ops() {
-            match self.catalog.apply(op.clone()) {
+            match self.apply_catalog(op.clone()) {
                 Ok(_) => self.pending_log.push(op),
                 Err(e) => log::warn!("forget Local records: {e}"),
             }
@@ -426,10 +427,15 @@ pub(crate) fn move_folder(s: &mut Session, from: &str, to: &str) -> std::result:
     if s.library.as_ref().is_some_and(|l| l.dir.starts_with(src) || src.starts_with(&l.dir)) {
         return Err("the library's own folders can't be moved here".into());
     }
+    if let Some(id) = s.companion_task_photo()
+        && let Some(photo) = s.catalog.photo(id)
+        && let lightcraft_catalog::Source::File { path } = &photo.source
+        && std::fs::canonicalize(path).ok().zip(std::fs::canonicalize(src).ok()).is_some_and(|(path, folder)| path.starts_with(folder))
+    {
+        s.preflight_mutation(&Op::RemovePhoto { id }).map_err(|e| e.to_string())?;
+    }
     // Repairs retain their exact old paths, including those on surviving history entries.
     // Complete them before the directory moves; an unavailable repair leaves it in place.
-    s.repair_sidecars_with(&crate::rename::RealFs).map_err(|e| e.to_string())?;
-    rename_folder_on_disk(from, to)?;
     let mut ops: Vec<Op> = s
         .catalog
         .photos()
@@ -445,6 +451,9 @@ pub(crate) fn move_folder(s: &mut Session, from: &str, to: &str) -> std::result:
         })
         .collect();
     let n = ops.len();
+    s.authorize_mutation(&Op::Batch { ops: ops.clone() }).map_err(|e| e.to_string())?;
+    s.repair_sidecars_with(&crate::rename::RealFs).map_err(|e| e.to_string())?;
+    rename_folder_on_disk(from, to)?;
     // what the library knows about the folder (and those inside it) goes along, in the same step
     ops.extend(s.catalog.folder_records_follow(from, to));
     let name = Path::new(to).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();

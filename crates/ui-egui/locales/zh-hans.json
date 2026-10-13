@@ -2026,5 +2026,22 @@
   "Add a model file…": "添加模型文件…",
   "Set up name suggestions…": "设置名称推荐…",
   "Model installation failed": "模型安装失败",
-  "Face recognition is off. Turn it on to get name suggestions and see look-alike faces together.": "人脸识别已关闭。开启后可获得名称推荐，并将相似的人脸归到一起。"
+  "Face recognition is off. Turn it on to get name suggestions and see look-alike faces together.": "人脸识别已关闭。开启后可获得名称推荐，并将相似的人脸归到一起。",
+  "Select exactly one photo to start an AI task.": "请选择一张照片。",
+  "Understand and naturally optimize your photo. Originals stay on this computer.": "理解照片并自然优化。原始照片留在本机。",
+  "For example: review this photo, then naturally optimize it": "例如：先评价照片，再自然优化",
+  "Allow compressed previews to be sent to the cloud model": "同意将压缩预览发送给云端模型",
+  "Analyze and Optimize": "点评并优化",
+  "Finishing processing for this photo…": "正在结束此照片的处理…",
+  "Undo AI Round": "撤回本轮",
+  "Delete Conversation": "删除对话",
+  "Processing this photo…": "正在处理此照片…",
+  "Stop Generating": "停止生成",
+  "AI Companion is currently available on desktop only.": "AI 助手目前仅支持桌面版。",
+  "Please consent to sending compressed previews first.": "请先同意发送压缩预览。",
+  "Another AI task is active; stop it or wait for completion.": "已有 AI 任务正在进行，请停止或等待完成。",
+  "The requested photo must match the single selected photo.": "请求照片必须与当前单选照片一致。",
+  "This photo is unavailable for AI processing.": "此照片不可用于 AI 处理。",
+  "Manual editing is paused while AI processes this photo; stop it or wait for completion.": "AI 处理期间暂停手动编辑，停止或完成后恢复。",
+  "Checking photo availability. Please try again.": "正在检查照片是否可用，请稍后重试。"
 }

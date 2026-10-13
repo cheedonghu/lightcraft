@@ -168,6 +168,7 @@ static LIBRARY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 
 pub struct Session {
     library_generation: u64,
+    mutation_guard: companion::MutationGuard,
     /// Process-local edit epochs; unlike equality they detect changes away and back.
     photo_revisions: std::collections::BTreeMap<PhotoId, u64>,
     companion_archive: companion::archive::Archive,
@@ -360,6 +361,7 @@ impl Session {
     pub fn new() -> Session {
         Session {
             library_generation: LIBRARY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            mutation_guard: Default::default(),
             photo_revisions: Default::default(),
             companion_archive: Default::default(),
             auto_sync: false,
@@ -515,8 +517,13 @@ impl Session {
 
     /// Apply an op as one undoable step.
     pub fn commit(&mut self, label: &str, op: Op) -> Result<()> {
+        self.authorize_mutation(&op)?;
+        self.commit_preflighted(label, op)
+    }
+
+    fn commit_preflighted(&mut self, label: &str, op: Op) -> Result<()> {
         let fwd = op.clone();
-        let inv = self.apply_catalog(op)?;
+        let inv = self.apply_catalog_preflighted(op)?;
         self.pending_log.push(fwd.clone());
         self.note_photo_edits(&fwd)?;
         self.undo.push(UndoEntry { label: label.to_string(), op: inv, folder: None, retry_inverse: Vec::new(), retry_sidecars: Vec::new() });
@@ -532,6 +539,11 @@ impl Session {
     }
 
     fn apply_catalog(&mut self, op: Op) -> Result<Op> {
+        self.authorize_mutation(&op)?;
+        self.apply_catalog_preflighted(op)
+    }
+
+    fn apply_catalog_preflighted(&mut self, op: Op) -> Result<Op> {
         let inv = self.catalog.apply(op.clone())?;
         let mut pending = vec![&op];
         while let Some(op) = pending.pop() {
@@ -570,6 +582,11 @@ impl Session {
     /// scan, a raw's as-shot white read by a decode): journaled like any op, but not an undo step, and it leaves the
     /// redo stack alone.
     pub(crate) fn apply_system(&mut self, op: Op) -> Result<()> {
+        // SetAsShotWb only updates the readout, never develop settings or source content.
+        // No general system-origin exemption exists.
+        if !matches!(&op, Op::SetAsShotWb { wb: Some((t, tint)), .. } if t.is_finite() && tint.is_finite()) {
+            self.authorize_mutation(&op)?;
+        }
         let fwd = op.clone();
         self.catalog.apply(op)?;
         self.pending_log.push(fwd);
@@ -595,7 +612,7 @@ impl Session {
             versions.remove(i);
         }
         let op = Op::SetVersions { id, versions };
-        if self.catalog.apply(op.clone()).is_ok() {
+        if self.authorize_mutation(&op).is_ok() && self.catalog.apply(op.clone()).is_ok() {
             self.pending_log.push(op);
         }
     }
@@ -630,6 +647,7 @@ impl Session {
 
     /// Apply without recording undo (interactive previews).
     fn apply_silent(&mut self, op: Op) -> Result<()> {
+        self.authorize_mutation(&op)?;
         self.catalog.apply(op.clone())?;
         self.note_photo_edits(&op)?;
         Ok(())
@@ -640,6 +658,9 @@ impl Session {
     }
 
     pub(crate) fn undo_step_with(&mut self, fs: &dyn rename::MoveFs) -> Result<String> {
+        if let Some(op) = self.undo.last().map(|entry| entry.op.clone()) {
+            self.authorize_mutation(&op)?;
+        }
         let mut e = self.undo.pop().ok_or_else(|| EngineError::Other("nothing to undo".into()))?;
         let redo = match self.apply_with_files(&mut e, fs) {
             Ok(r) => r,
@@ -665,6 +686,9 @@ impl Session {
     }
 
     pub(crate) fn redo_step_with(&mut self, fs: &dyn rename::MoveFs) -> Result<String> {
+        if let Some(op) = self.redo.last().map(|entry| entry.op.clone()) {
+            self.authorize_mutation(&op)?;
+        }
         let mut e = self.redo.pop().ok_or_else(|| EngineError::Other("nothing to redo".into()))?;
         let undo = match self.apply_with_files(&mut e, fs) {
             Ok(r) => r,
@@ -708,6 +732,8 @@ impl Session {
     /// library follows them (a logged change outside the undo history), so none goes missing; the
     /// folder is only moved back when no file was left behind at its new path.
     fn apply_with_files(&mut self, entry: &mut UndoEntry, fs: &dyn rename::MoveFs) -> Result<Op> {
+        self.authorize_mutation(&entry.op)?;
+        self.preflight_repair_packets(fs, entry.retry_sidecars.iter().cloned())?;
         // The entry is detached from self.undo/self.redo: include it before any global
         // repair can retire, then retry revalidates it before moving its own packets.
         rename::validate_sidecars(fs, &entry.retry_sidecars).map_err(|e| EngineError::Other(format!("can't move the files back: {e}")))?;
@@ -790,6 +816,12 @@ impl Session {
     pub fn set_develop(&mut self, id: PhotoId, settings: DevelopSettings, label: &str) -> Result<()> {
         let now = (self.clock)();
         let settings = Arc::new(settings);
+        let mut checks = match self.interaction.as_ref().filter(|i| i.photo == id) {
+            Some(i) => self.auto_sync_ops_from(id, &i.original, &settings, label),
+            None => self.auto_sync_ops(id, &settings, label),
+        };
+        checks.push(Op::SetDevelop { id, settings: settings.clone(), label: label.into(), edited: Some(now.clone()) });
+        self.authorize_mutation(&Op::Batch { ops: checks })?;
         if let Some(i) = &self.interaction
             && i.photo == id
         {
@@ -806,6 +838,13 @@ impl Session {
     /// belong to one photo's pixels), nor the rendering process (Sync doesn't carry it either), nor
     /// history / snapshot restores.
     fn auto_sync_ops(&self, id: PhotoId, new: &DevelopSettings, label: &str) -> Vec<Op> {
+        let Some(old) = self.develop_of(id) else { return Vec::new() };
+        self.auto_sync_ops_from(id, &old, new, label)
+    }
+
+    /// Interaction publication must compare its original state with its final preview,
+    /// rather than compare a preview with itself and lose the real derived targets.
+    fn auto_sync_ops_from(&self, id: PhotoId, old: &DevelopSettings, new: &DevelopSettings, label: &str) -> Vec<Op> {
         if !self.auto_sync
             || self.active() != Some(id)
             || self.selection.ids.len() < 2
@@ -814,7 +853,6 @@ impl Session {
         {
             return Vec::new();
         }
-        let Some(old) = self.develop_of(id) else { return Vec::new() };
         let Some(mut delta) = json_delta(&old.to_json(), &new.to_json()) else { return Vec::new() };
         if let Some(o) = delta.as_object_mut() {
             for k in ["spots", "red_eye", "version", "process"] {
@@ -847,6 +885,10 @@ impl Session {
     }
 
     pub fn begin_interaction(&mut self, label: &str) -> Result<()> {
+        if let Some(id) = self.active() {
+            let op = Op::SetDevelop { id, settings: self.develop_of(id).unwrap_or_default(), label: label.into(), edited: None };
+            self.authorize_mutation(&op)?;
+        }
         if self.interaction.is_some() {
             self.end_interaction()?;
         }
@@ -858,17 +900,32 @@ impl Session {
 
     /// Commit the interaction as one undo step (no-op if nothing changed).
     pub fn end_interaction(&mut self) -> Result<()> {
-        let Some(i) = self.interaction.take() else { return Ok(()) };
-        let Some(cur) = self.develop_of(i.photo) else { return Ok(()) };
+        let Some(i) = self.interaction.as_ref() else { return Ok(()) };
+        let Some(cur) = self.develop_of(i.photo) else {
+            self.interaction = None;
+            return Ok(());
+        };
         if *cur == *i.original {
+            self.interaction = None;
             return Ok(());
         }
-        // Restore the original silently, then commit the final value as one step.
-        self.apply_silent(Op::SetDevelop { id: i.photo, settings: i.original.clone(), label: i.label.clone(), edited: None })?;
-        self.set_develop(i.photo, (*cur).clone(), &i.label)
+        let mut ops = vec![self.develop_op(i.photo, (*cur).clone(), &i.label).ok_or(lightcraft_catalog::CatalogError::NoPhoto(i.photo))?];
+        ops.extend(self.auto_sync_ops_from(i.photo, &i.original, &cur, &i.label));
+        let op = if ops.len() == 1 { ops.remove(0) } else { Op::Batch { ops } };
+        // Check the actual final batch before taking the interaction or restoring its start.
+        self.authorize_mutation(&op)?;
+        let Some(i) = self.interaction.take() else { return Ok(()) };
+        self.apply_silent(Op::SetDevelop { id: i.photo, settings: i.original, label: i.label.clone(), edited: None })?;
+        self.commit(&i.label, op)
     }
 
     pub fn cancel_interaction(&mut self) -> Result<()> {
+        if let Some(op) =
+            self.interaction.as_ref().map(|i| Op::SetDevelop { id: i.photo, settings: i.original.clone(), label: i.label.clone(), edited: None })
+        {
+            // Cancelling restores only this preview; it never invokes Auto Sync.
+            self.authorize_mutation(&op)?;
+        }
         if let Some(i) = self.interaction.take() {
             self.apply_silent(Op::SetDevelop { id: i.photo, settings: i.original, label: i.label, edited: None })?;
         }

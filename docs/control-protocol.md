@@ -53,8 +53,13 @@ filmstrip is visible.
 ## Methods
 
 The native Photo Companion extension registers `ai.open`, `ai.start`, `ai.stop`, `ai.undo`,
-`ai.clear`, and `ai.status` as UI commands. `ai.start {prompt?, consent?: true}` sends only a
-compressed preview and the current photo's context. Opening the independent window (Window ▸ AI Photo Companion) sends nothing. `ai.status
+`ai.clear`, and `ai.status` as UI commands. `ai.start {prompt?, photo?}` requires prior consent
+through `checkbox:aiConsent`; JSON parameters cannot grant consent. Exactly one available,
+non-deleted photo must be selected, and explicit `photo` must match it. Every desktop instance
+permits one task across submitting, queued and processing. The task photo is protected from
+local identity creation before enqueue; edits to other photos remain available. Final mutation
+batches, Auto Sync and Undo/Redo are checked atomically before any side effects.
+It sends only a compressed preview and the current photo's context. Opening the independent window (Window ▸ AI Photo Companion) sends nothing. `ai.status
 {photo?}` reports `busy`, `workerBusy`, `photo`, `round`, `activePhotos`, and streamed `text`;
 `ai.stop`, `ai.undo`, and `ai.clear` also accept `photo?` (otherwise the active photo).
 Conversations use independent versioned storage in the library’s `companion/` folder (`state.json` and preview attachments); the upstream catalog format is unchanged. Predevelopment AI archives from earlier builds are discarded.
