@@ -104,6 +104,83 @@ fn explicit_live_round_revert_restores_the_whole_start_only_on_its_photo() {
 }
 
 #[test]
+fn newer_identical_round_has_no_later_edit_warning_or_revert_permission() {
+    use lightcraft_engine::companion::{LocalRoundId, RoundRevertState};
+    let (mut app, photo, _, earlier, start) = published_round();
+    let result = app.session.develop_of(photo).unwrap();
+    let identical = LocalRoundId::new().unwrap();
+    let lease = app.session.acquire_companion_lease(photo, identical.clone()).unwrap();
+    let op = app.session.develop_op(photo, (*result).clone(), "AI edit plan").unwrap();
+    app.session.commit_companion(&lease, &identical, app.session.photo_revision(photo), op).unwrap();
+    drop(lease);
+    app.session.set_photo_companion(photo, Some(json!({"schema_version":2,"messages":[],"rounds":[],"round_records":[{
+        "local_round_id":identical,"photo_id":photo.0,"recent_complete_result":result,"recent_complete_hash":result.hash64(),
+        "stages":[{"stage":"initial","reason":"Identical result; no parameters changed.","locally_published":true,"before_state":result,"applied_state":result,"execution_outcome":"succeeded","render_outcome":"succeeded"}]
+    }, {
+        "local_round_id":earlier,"photo_id":photo.0,"recent_complete_result":result,"recent_complete_hash":result.hash64(),
+        "stages":[{"stage":"correction","locally_published":true,"before_state":start,"applied_state":result,"execution_outcome":"succeeded","render_outcome":"succeeded"}]
+    }]}))).unwrap();
+    let mut h = crate::headless::Headless::new(app, [1400.0, 1000.0], 1.0);
+    let app = &mut h.app;
+    let status = app.run("ai.status", json!({})).unwrap();
+    assert_eq!(status["resultCards"][0]["currentPhotoHasLaterEdits"], false);
+    assert_eq!(status["resultCards"][0]["canUndo"], false);
+    assert_eq!(app.session.companion_round_revert_state(photo, &identical), RoundRevertState::Unverified);
+    assert!(app.session.verify_round_revert(photo, &earlier).is_ok());
+    assert!(app.run("ai.undo", json!({"photo":photo.0,"local_round_id":identical})).is_err());
+    identical_card_screens(&mut h);
+    let app = &mut h.app;
+    app.run("develop.set", json!({"values":{"light.exposure":0.5}})).unwrap();
+    app.run("develop.set", json!({"values":{"light.exposure":0.2}})).unwrap();
+    assert_eq!(app.session.companion_round_revert_state(photo, &earlier), RoundRevertState::LaterEdits);
+    assert!(app.run("ai.undo", json!({"photo":photo.0,"local_round_id":earlier})).is_err());
+    assert_eq!(*app.session.develop_of(photo).unwrap(), *result);
+    let newer = LocalRoundId::new().unwrap();
+    let lease = app.session.acquire_companion_lease(photo, newer.clone()).unwrap();
+    for exposure in [0.7, 0.2] {
+        let mut settings = (*result).clone();
+        settings.light.exposure = exposure;
+        let op = app.session.develop_op(photo, settings, "AI edit plan").unwrap();
+        app.session.commit_companion(&lease, &newer, app.session.photo_revision(photo), op).unwrap();
+        let status = app.run("ai.status", json!({})).unwrap();
+        let old_card = status["resultCards"].as_array().unwrap().iter().find(|card| card["localRoundId"] == earlier.as_str()).unwrap();
+        assert_eq!(old_card["canUndo"], false, "a superseded card never regains permission even when its result returns");
+        if exposure == 0.7 {
+            assert_eq!(old_card["currentPhotoHasLaterEdits"], true, "the saved result still exposes actual current parameter differences");
+        }
+    }
+    drop(lease);
+    assert!(app.run("ai.undo", json!({"photo":photo.0,"local_round_id":earlier})).is_err());
+}
+
+fn identical_card_screens(h: &mut crate::headless::Headless) {
+    let Ok(dir) = std::env::var("UX17_SCREENSHOT_DIR") else { return };
+    h.app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+    h.app.services.png = Some(Box::new(|image| {
+        lightcraft_engine::export::encode_image(
+            image,
+            &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+        )
+        .unwrap()
+    }));
+    h.app.run("ai.open", json!({})).unwrap();
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        h.app.ui.language = language;
+        for _ in 0..4 {
+            h.step();
+        }
+        assert_eq!(
+            h.request(
+                "ui.screenshot",
+                json!({"path":format!("{dir}/identical-normal-{}.png",language.code()),"headless":true}),
+                std::time::Duration::from_secs(30)
+            )["ok"],
+            true
+        );
+    }
+}
+
+#[test]
 fn live_round_cannot_regain_revert_after_manual_edit_away_and_back() {
     let (mut app, photo, _, round, _) = published_round();
     app.run("develop.set", json!({"values":{"light.exposure":0.5}})).unwrap();

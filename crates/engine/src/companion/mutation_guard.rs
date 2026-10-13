@@ -191,7 +191,9 @@ impl Session {
             return RoundRevertState::Unverified;
         };
         if &proof.round != round {
-            return RoundRevertState::LaterEdits;
+            // A different identity may be a newer no-op or an older result.
+            // This one current proof has no ordering fact about that round.
+            return RoundRevertState::Unverified;
         }
         if proof.reverted && proof.later_after_revert {
             RoundRevertState::RevertedWithLaterEdits
