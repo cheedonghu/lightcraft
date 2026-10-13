@@ -27,7 +27,7 @@ fn revoke_then_reconsent_never_revives_the_old_submission_or_content() {
             result: Err(cancelled),
         })
         .unwrap();
-    state.poll_inner(&mut app, &egui::Context::default());
+    super::identity_tests::poll_after_feedback(&mut state, &mut app);
     assert!(!state.jobs.contains_key(&photo));
     assert!(app.session.companion_task_photo().is_none());
     let notice = state.conversations.get(&photo).unwrap().notice.clone();
@@ -255,8 +255,7 @@ fn actual_checkbox_shows_cancelling_until_an_unadmitted_submission_is_safe() {
     }
 }
 
-#[test]
-fn stop_feedback_frame_precedes_blocked_storage_and_failed_save_retries_without_reviving() {
+fn full_production_feedback_barrier(route: &str, prior_dirty: bool) {
     use lightcraft_catalog::{MemStore, Store};
     use std::io;
     struct BarrierStore {
@@ -264,6 +263,7 @@ fn stop_feedback_frame_precedes_blocked_storage_and_failed_save_retries_without_
         armed: Arc<AtomicBool>,
         painted: Arc<AtomicBool>,
         fail: Arc<AtomicBool>,
+        premature: Arc<AtomicBool>,
         entered: mpsc::SyncSender<()>,
         release: mpsc::Receiver<()>,
     }
@@ -283,7 +283,10 @@ fn stop_feedback_frame_precedes_blocked_storage_and_failed_save_retries_without_
         fn write_atomic(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
             if name.starts_with("companion/") {
                 if self.armed.swap(false, Ordering::Relaxed) {
-                    assert!(self.painted.load(Ordering::Relaxed), "archive I/O ran before the cancellation feedback frame completed");
+                    if !self.painted.load(Ordering::Relaxed) {
+                        self.premature.store(true, Ordering::Relaxed);
+                        return Err(io::Error::other("archive I/O before feedback frame"));
+                    }
                     self.entered.send(()).unwrap();
                     self.release.recv_timeout(Duration::from_secs(3)).expect("storage barrier was not released");
                 }
@@ -303,12 +306,14 @@ fn stop_feedback_frame_precedes_blocked_storage_and_failed_save_retries_without_
             "UI feedback storage barrier".into()
         }
     }
-    for revoke in [false, true] {
+    let revoke = route == "consent";
+    {
         let catalog = MemStore::new();
         let files = MemStore::new();
         let armed = Arc::new(AtomicBool::new(false));
         let painted = Arc::new(AtomicBool::new(false));
         let fail = Arc::new(AtomicBool::new(false));
+        let premature = Arc::new(AtomicBool::new(false));
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let mut session = lightcraft_engine::Session::new();
@@ -321,6 +326,7 @@ fn stop_feedback_frame_precedes_blocked_storage_and_failed_save_retries_without_
                         armed: armed.clone(),
                         painted: painted.clone(),
                         fail: fail.clone(),
+                        premature: premature.clone(),
                         entered: entered_tx,
                         release: release_rx,
                     }),
@@ -342,37 +348,70 @@ fn stop_feedback_frame_precedes_blocked_storage_and_failed_save_retries_without_
         state.server(&mut app, &egui::Context::default(), "round.state", &json!({"round_id":"round","payload":{"submission_seq":identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":identity.scope.library_generation},"state":"queued"}})).unwrap();
         let gate = state.jobs.get(&photo).unwrap().cancel.clone();
         app.ai = state;
+        app.run("ai.open", json!({})).unwrap();
+        app.ui.settings.gpu = false;
+        let (control_tx, control_rx) = mpsc::channel();
+        app = app.with_control(control_rx);
         // Real egui pointer input in the app's headless surface, never OS input.
         let mut view = crate::headless::HeadlessView::new();
-        let raw = |events| crate::headless::HeadlessView::raw_input(egui::vec2(1000.0, 700.0), 1.0, 0.0, events);
+        let raw = |events| crate::headless::HeadlessView::raw_input(egui::vec2(1000.0, 700.0), 1.0, 10.0, events);
         for _ in 0..2 {
             view.run(raw(vec![]), |ui| {
-                poll(&mut app, ui.ctx());
-                show(&mut app, ui.ctx());
+                app.logic(ui.ctx());
+                app.ui(ui);
             });
         }
         let widget = if revoke { "checkbox:aiConsent" } else { "button:aiStop" };
-        let pos = crate::widgets::take_registry(&view.ctx).into_iter().find(|(id, _)| id == widget).unwrap().1.center();
+        let pos = app.widgets.iter().find(|(id, _)| id == widget).unwrap().1.center();
+        view.run(raw(vec![egui::Event::PointerMoved(pos)]), |ui| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        });
         view.run(
             raw(vec![
                 egui::Event::PointerMoved(pos),
                 egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
             ]),
             |ui| {
-                poll(&mut app, ui.ctx());
-                show(&mut app, ui.ctx());
+                app.logic(ui.ctx());
+                app.ui(ui);
             },
         );
-        armed.store(true, Ordering::Relaxed);
-        fail.store(true, Ordering::Relaxed);
+        if prior_dirty {
+            fail.store(true, Ordering::Relaxed);
+            let mut state = std::mem::take(&mut app.ai);
+            assert!(state.save(&mut app, photo).is_err());
+            app.ai = state;
+        }
         let began = Instant::now();
-        view.run(
-            raw(vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]),
-            |ui| {
-                poll(&mut app, ui.ctx());
-                show(&mut app, ui.ctx());
-            },
-        );
+        let (request, response) = crate::ControlRequest::new("ui.menu.invoke", json!({"command":"ai.stop"}));
+        if route == "command" {
+            fail.store(true, Ordering::Relaxed);
+            armed.store(true, Ordering::Relaxed);
+            control_tx.send(request).unwrap();
+            view.run(raw(vec![]), |ui| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            });
+            assert_eq!(response.try_recv().unwrap()["ok"], true);
+        } else {
+            let mut passes = 0;
+            view.run(
+                raw(vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]),
+                |ui| {
+                    app.logic(ui.ctx());
+                    app.ui(ui);
+                    if passes == 0 {
+                        assert!(app.ai.jobs.is_empty(), "the real widget must cancel before the discard barrier is armed");
+                        armed.store(true, Ordering::Relaxed);
+                        ui.ctx().request_discard("deterministic cancellation feedback rerun");
+                    }
+                    passes += 1;
+                },
+            );
+            assert!(passes >= 2);
+        }
+        assert!(!premature.load(Ordering::Relaxed), "archive I/O ran before the cancellation feedback frame completed");
         assert!(began.elapsed() < Duration::from_secs(1), "stop feedback must not wait for disk");
         assert!(gate.load(Ordering::Relaxed));
         assert!(app.ai.jobs.is_empty());
@@ -385,8 +424,8 @@ fn stop_feedback_frame_precedes_blocked_storage_and_failed_save_retries_without_
             release_tx.send(()).unwrap();
         });
         view.run(raw(vec![]), |ui| {
-            poll(&mut app, ui.ctx());
-            show(&mut app, ui.ctx());
+            app.logic(ui.ctx());
+            app.ui(ui);
         });
         monitor.join().unwrap();
         assert!(app.ai.pending_local_saves.contains(&photo));
@@ -396,8 +435,8 @@ fn stop_feedback_frame_precedes_blocked_storage_and_failed_save_retries_without_
         fail.store(false, Ordering::Relaxed);
         app.ai.local_save_retry_at = None; // advance only the retry barrier, never replay an edit/request.
         view.run(raw(vec![]), |ui| {
-            poll(&mut app, ui.ctx());
-            show(&mut app, ui.ctx());
+            app.logic(ui.ctx());
+            app.ui(ui);
         });
         assert!(app.ai.pending_local_saves.is_empty());
         assert!(app.ai.jobs.is_empty());
@@ -420,6 +459,16 @@ fn stop_feedback_frame_precedes_blocked_storage_and_failed_save_retries_without_
         let saved = reopened.load_companion_conversation(photo).unwrap().unwrap();
         assert_eq!(saved["round_records"][0]["local_terminal"], "cancelled");
     }
+}
+
+#[test]
+fn full_app_dirty_retry_cannot_block_stop_or_revoke_feedback_on_discard() {
+    full_production_feedback_barrier("stop", true);
+    full_production_feedback_barrier("consent", true);
+}
+#[test]
+fn full_app_control_stop_defers_storage_until_its_feedback_frame_completes() {
+    full_production_feedback_barrier("command", false);
 }
 
 #[test]

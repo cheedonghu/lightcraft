@@ -16,6 +16,14 @@ pub(super) fn started() -> (LightcraftApp, State, PhotoId, mpsc::Receiver<networ
     (app, state, photo, requests, events)
 }
 
+pub(super) fn poll_after_feedback(state: &mut State, app: &mut LightcraftApp) {
+    let mut view = crate::headless::HeadlessView::new();
+    for _ in 0..2 {
+        let raw = crate::headless::HeadlessView::raw_input(egui::vec2(800.0, 600.0), 1.0, 0.0, vec![]);
+        view.run(raw, |ui| state.poll_inner(app, ui.ctx()));
+    }
+}
+
 fn state_event(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, phase: &str) {
     let identity = state.jobs.get(&photo).unwrap().identity.clone();
     state.server(app, &egui::Context::default(), "round.state", &json!({"round_id":"backend-round","payload":{"submission_seq":identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":identity.scope.library_generation},"state":phase}})).unwrap();
@@ -171,7 +179,7 @@ fn failed_stop_delivery_still_closes_its_connection_after_local_finish() {
             result: Err("stop delivery failed".into()),
         })
         .unwrap();
-    state.poll_inner(&mut app, &egui::Context::default());
+    poll_after_feedback(&mut state, &mut app);
     assert!(state.connection.as_ref().unwrap().is_closing(), "failed stop must close and retain its connection until workers finish");
     assert!(state.start(&mut app).is_err(), "a closing connection cannot admit a replacement");
     assert_eq!(*app.session.develop_of(photo).unwrap(), *original);

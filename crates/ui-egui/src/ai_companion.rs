@@ -49,6 +49,7 @@ pub struct State {
     pending_local_saves: BTreeSet<PhotoId>,
     local_save_retry_at: Option<Instant>,
     local_save_after_frame: Option<u64>,
+    feedback_pending: bool,
     jobs: BTreeMap<PhotoId, Job>,
     workers: BTreeMap<PhotoId, Arc<AtomicBool>>,
     tx: mpsc::SyncSender<WorkerMessage>,
@@ -72,6 +73,7 @@ impl Default for State {
             pending_local_saves: BTreeSet::new(),
             local_save_retry_at: None,
             local_save_after_frame: None,
+            feedback_pending: false,
             jobs: BTreeMap::new(),
             workers: BTreeMap::new(),
             tx,
@@ -353,8 +355,18 @@ impl State {
         }
         Ok(())
     }
+    fn request_feedback(&mut self) {
+        // Commands can cancel outside a UI pass; bind their first feedback frame
+        // when poll next sees the actual app context.
+        self.feedback_pending = true;
+        self.local_save_after_frame = None;
+    }
     fn defer_local_saves_for_feedback(&mut self, ctx: &egui::Context) {
+        self.feedback_pending = false;
         self.local_save_after_frame = Some(ctx.cumulative_frame_nr());
+    }
+    pub(crate) fn feedback_needs_paint(&self, ctx: &egui::Context) -> bool {
+        self.feedback_pending || self.local_save_after_frame.is_some_and(|frame| ctx.cumulative_frame_nr() <= frame)
     }
     fn flush_local_saves(&mut self, app: &mut LightcraftApp) -> Result<(), String> {
         let mut failure = None;
@@ -374,6 +386,9 @@ impl State {
         }
     }
     fn stop(&mut self, photo: PhotoId) -> Result<Value, String> {
+        if self.jobs.contains_key(&photo) {
+            self.request_feedback();
+        }
         let round = if let Some(job) = self.jobs.get_mut(&photo) {
             job.stopped = true;
             job.cancel.store(true, Ordering::Relaxed);
@@ -851,13 +866,6 @@ impl State {
         Ok(())
     }
     fn poll_inner(&mut self, app: &mut LightcraftApp, ctx: &egui::Context) {
-        // Egui may discard and rerun a pass within the same frame. Do not let
-        // late receipts (which also save records) enter storage before the
-        // first local stop feedback frame has completed.
-        if self.local_save_after_frame.is_some_and(|frame| ctx.cumulative_frame_nr() <= frame) {
-            ctx.request_repaint();
-            return;
-        }
         let generation = app.session.library_generation();
         if self.generation != generation {
             let photos: Vec<_> = self.jobs.keys().copied().collect();
@@ -870,7 +878,17 @@ impl State {
             self.pending_local_saves.clear();
             self.local_save_retry_at = None;
             self.local_save_after_frame = None;
+            self.feedback_pending = false;
             self.generation = generation;
+        }
+        if self.feedback_pending {
+            self.defer_local_saves_for_feedback(ctx);
+        }
+        // Egui may rerun a discarded pass; receipts and record retries must wait
+        // until the first feedback frame has completed.
+        if self.feedback_needs_paint(ctx) {
+            ctx.request_repaint();
+            return;
         }
         self.workers.retain(|_, alive| alive.load(Ordering::Relaxed));
         if self.open
@@ -1043,6 +1061,7 @@ impl State {
                 Ok(()) => {
                     self.local_save_retry_at = None;
                     self.local_save_after_frame = None;
+                    self.feedback_pending = false;
                 }
                 Err(error) => {
                     self.text = error;
@@ -1214,6 +1233,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         state.pending_local_saves.clear();
         state.local_save_retry_at = None;
         state.local_save_after_frame = None;
+        state.feedback_pending = false;
         state.generation = app.session.library_generation();
     }
     let photo = params.get("photo").and_then(Value::as_u64).map(PhotoId).or_else(|| app.session.active());
@@ -1234,6 +1254,8 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         }
         "ai.stop" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
             state.pending_local_saves.insert(p);
+            state.request_feedback();
+            app.session.defer_companion_retry(true);
             state.stop(p)?;
             Ok(Value::Null)
         }),
@@ -1378,10 +1400,11 @@ fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
         let consent = ui.checkbox(&mut consent_value, tr("Allow compressed previews to be sent to the cloud model"));
         crate::widgets::register(ui.ctx(), "checkbox:aiConsent", consent.rect);
         if consent.changed() {
-            app.ai.defer_local_saves_for_feedback(ui.ctx());
             if let Err(e) = app.ai.set_consent(consent_value) {
                 app.ai.text = e;
             }
+            app.ai.defer_local_saves_for_feedback(ui.ctx());
+            app.session.defer_companion_retry(true);
         }
         if !busy {
             let admission = app.ai.admission(app, None);
@@ -1417,8 +1440,9 @@ fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
                 let stop = ui.button(tr("Stop Generating"));
                 crate::widgets::register(ui.ctx(), "button:aiStop", stop.rect);
                 if stop.clicked() {
-                    app.ai.defer_local_saves_for_feedback(ui.ctx());
                     let _ = app.run("ai.stop", json!({}));
+                    app.ai.defer_local_saves_for_feedback(ui.ctx());
+                    app.session.defer_companion_retry(true);
                 }
             });
         }
