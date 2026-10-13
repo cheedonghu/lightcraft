@@ -15,6 +15,7 @@ fn phase(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, phase: &str
 }
 fn render(state: &mut State, app: &mut LightcraftApp) {
     let msg = state.rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    super::identity_tests::await_producer_retirement(state, &msg);
     state.prepared(app, &egui::Context::default(), msg).unwrap();
 }
 #[test]
@@ -108,8 +109,15 @@ fn real_initial_correction_save_reopen_retains_associations_previews_and_actual_
     assert_eq!(record["backend_confirmed_plan"], "c");
     assert_eq!(record["stages"][0]["model_call_id"], 1);
     assert_eq!(record["stages"][1]["model_call_id"], 1);
-    let assistant_ids: Vec<_> =
-        state.conversations[&photo].messages.iter().filter(|m| m["role"] == "assistant").map(|m| m["local_message_id"].clone()).collect();
+    let assistant_ids: Vec<_> = state.conversations[&photo]
+        .view
+        .as_ref()
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .map(|m| m["local_message_id"].clone())
+        .collect();
     assert_eq!(assistant_ids.len(), 2);
     assert_ne!(assistant_ids[0], assistant_ids[1]);
     let history = state.history(&mut reopened, photo).unwrap();
@@ -118,12 +126,16 @@ fn real_initial_correction_save_reopen_retains_associations_previews_and_actual_
     let root: Value = serde_json::from_slice(&files.get("companion/state.json").unwrap()).unwrap();
     assert_eq!(root["version"], 2);
     // A single damaged attachment retains readable messages, but blocks full model input.
-    let image = &state.conversations[&photo].messages[0]["images"][0];
+    let image = &state.conversations[&photo].view.as_ref().unwrap().messages[0]["images"][0];
     let key = image["attachment"].as_str().unwrap();
     files.set(key, b"damaged JPEG".to_vec());
     let mut reading = State::default();
     reading.load(&mut reopened, photo).unwrap();
-    assert_eq!(reading.conversations[&photo].messages.len(), state.conversations[&photo].messages.len());
+    assert_eq!(
+        reading.conversations[&photo].view.as_ref().unwrap().messages.len(),
+        state.conversations[&photo].view.as_ref().unwrap().messages.len()
+    );
+    assert!(reading.conversations[&photo].messages.is_empty(), "reopened history stays outside the mutable current-round tail");
     assert!(reading.history(&mut reopened, photo).is_err());
 }
 #[test]
@@ -160,8 +172,8 @@ fn pure_explanation_round_is_saved_and_reopens_without_a_result_or_resumed_job()
     let mut app = self::app(catalog, files);
     let mut state = State::default();
     state.load(&mut app, photo).unwrap();
-    assert_eq!(state.conversations[&photo].messages[1]["text"], "Explanation only.");
-    assert_eq!(state.conversations[&photo].messages[1]["model_call_id"], "call-1");
+    assert_eq!(state.conversations[&photo].view.as_ref().unwrap().messages[1]["text"], "Explanation only.");
+    assert_eq!(state.conversations[&photo].view.as_ref().unwrap().messages[1]["model_call_id"], "call-1");
     assert!(state.conversations[&photo].checkpoint.is_none());
     assert!(state.jobs.is_empty());
 }
@@ -239,7 +251,9 @@ fn failed_render_saves_true_failure_and_late_receipt_cannot_claim_a_successful_p
     assert_eq!(*reopened.session.develop_of(photo).unwrap(), *original);
     let mut reading = State::default();
     reading.load(&mut reopened, photo).unwrap();
-    assert!(reading.conversations[&photo].messages.iter().any(|m| m["text"].as_str().is_some_and(|t| t.contains("render_failed"))));
+    assert!(
+        reading.conversations[&photo].view.as_ref().unwrap().messages.iter().any(|m| m["text"].as_str().is_some_and(|t| t.contains("render_failed")))
+    );
 }
 
 #[test]
@@ -318,4 +332,55 @@ fn post_failure_and_explicit_stop_preserve_published_result_but_have_distinct_te
         assert_eq!(record["recent_complete_result"]["light"]["exposure"], 0.3);
         assert_eq!(reopened.session.develop_of(photo).unwrap().light.exposure, 0.3);
     }
+}
+
+#[test]
+fn a_new_round_seals_saved_history_but_old_late_confirmation_survives_later_tail_saves() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut app = app(catalog.clone(), files.clone());
+    let photo = app.session.active().unwrap();
+    let (connection, requests, events) = network::test_connection();
+    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    state.start(&mut app).unwrap();
+    requests.try_recv().unwrap();
+    phase(&mut state, &mut app, photo, "awaiting_input");
+    render(&mut state, &mut app);
+    requests.try_recv().unwrap();
+    phase(&mut state, &mut app, photo, "awaiting_initial_execution");
+    state.server(&mut app,&egui::Context::default(),"message.completed",&json!({"round_id":"round","stage":"initial","payload":{"message_id":"round/1","model_call_id":1,"tool_calls":[{"id":"tool","name":"apply_edit_plan","arguments":{"operations":[]}}]}})).unwrap();
+    let revision = app.session.photo_revision(photo);
+    state.server(&mut app,&egui::Context::default(),"edit.plan",&json!({"round_id":"round","payload":{"plan_id":"old-plan","tool_call_id":"tool","capability_version":"lightcraft-v2","expected_revision":revision,"operations":[{"type":"set_controls","values":{"light.exposure":0.4}}]}})).unwrap();
+    render(&mut state, &mut app);
+    let late = requests.try_recv().unwrap();
+    let old = late.identity.clone();
+    state.server(&mut app, &egui::Context::default(), "round.ended", &json!({"round_id":"round","payload":{"terminal_state":"completed"}})).unwrap();
+    app.session.execute("develop.set", &json!({"ids":[photo.0],"values":{"light.exposure":0.6}})).unwrap();
+    state.start(&mut app).unwrap();
+    requests.try_recv().unwrap();
+    assert_eq!(state.conversations[&photo].messages.len(), 1, "the prior round is an immutable prefix, not a growing memory tail");
+    assert_eq!(state.conversations[&photo].records.len(), 1);
+    assert_ne!(state.conversations[&photo].records[0]["local_round_id"], old.local_round_id.as_str());
+    let revision = app.session.photo_revision(photo);
+    events
+        .try_send(network::Event::Response {
+            submission: 0,
+            round: "round".into(),
+            path: late.path,
+            identity: old.clone(),
+            result: Ok(json!({"accepted":true,"_client_execution_plan_id":"old-plan"})),
+        })
+        .unwrap();
+    state.poll_inner(&mut app, &egui::Context::default());
+    assert!(state.pending_confirmations.is_empty());
+    assert_eq!(app.session.companion_round(photo, old.local_round_id.as_str()).unwrap().unwrap()["backend_confirmed_plan"], "old-plan");
+    state.save(&mut app, photo).unwrap();
+    assert_eq!(
+        app.session.companion_round(photo, old.local_round_id.as_str()).unwrap().unwrap()["backend_confirmed_plan"],
+        "old-plan",
+        "saving the new tail preserves the patched prior record"
+    );
+    assert_eq!(app.session.photo_revision(photo), revision);
+    assert_eq!(app.session.companion_metadata(photo).unwrap().unwrap()["checkpoint"]["eligible"], false);
+    assert_eq!(app.session.companion_metadata(photo).unwrap().unwrap()["checkpoint"]["local_round_id"], old.local_round_id.as_str());
+    assert_eq!(app.session.develop_of(photo).unwrap().light.exposure, 0.6);
 }

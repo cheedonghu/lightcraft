@@ -21,6 +21,8 @@ pub(crate) struct Archive {
     pub(super) photos: BTreeMap<PhotoId, Value>,
     pub(super) legacy: bool,
     pub(super) v2: bool,
+    pub(super) tails: BTreeMap<PhotoId, super::storage::TailUpdate>,
+    pub(super) prefixes: BTreeMap<PhotoId, super::storage::PhotoHeader>,
     pub(super) dirty_photos: BTreeSet<PhotoId>,
     pub(super) revert_dirty: BTreeSet<PhotoId>,
     dirty: bool,
@@ -55,6 +57,11 @@ impl Archive {
     }
     pub(crate) fn invalidate(&mut self, ids: &BTreeSet<PhotoId>) {
         for id in ids {
+            if let Some(update) = self.tails.get_mut(id)
+                && update.metadata.pointer("/checkpoint/eligible").and_then(Value::as_bool) == Some(true)
+            {
+                update.metadata["checkpoint"]["eligible"] = json!(false);
+            }
             if let Some(a) = self.photos.get_mut(id)
                 && a.pointer("/checkpoint/eligible").and_then(Value::as_bool) == Some(true)
             {
@@ -81,27 +88,43 @@ impl Archive {
         }
     }
     pub(crate) fn needs_retry(&self) -> bool {
-        (self.dirty || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty()) && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t)
+        (self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty())
+            && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t)
     }
     pub(crate) fn unsaved(&self) -> Option<&str> {
-        self.error.as_deref().filter(|_| self.dirty || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty())
+        self.error.as_deref().filter(|_| self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty())
     }
     fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {
         if let Some(e) = &self.blocked {
-            if self.dirty || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() {
+            if self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() {
                 return Err(error(e));
             }
             return Ok(());
         }
-        if self.v2 || !self.dirty_photos.is_empty() {
-            if !self.revert_dirty.is_empty() {
-                if let Err(e) = super::storage::invalidate_revert(library.files.as_mut(), &self.revert_dirty) {
-                    self.error = Some(e.to_string());
-                    return Err(EngineError::NotSaved(e.to_string()));
+        if self.v2 || !self.tails.is_empty() || !self.dirty_photos.is_empty() {
+            let mut tail_failed = None;
+            for photo in self.tails.keys().copied().collect::<Vec<_>>() {
+                let Some(update) = self.tails.get(&photo) else { continue };
+                match super::storage::persist_tail(library.files.as_mut(), photo, update) {
+                    Ok(()) => {
+                        self.tails.remove(&photo);
+                    }
+                    Err(error) => {
+                        tail_failed = Some(error.to_string());
+                    }
                 }
-                self.revert_dirty.clear();
             }
-            let mut failed = None;
+            let mut failed = tail_failed;
+            for photo in self.revert_dirty.clone() {
+                match super::storage::invalidate_revert(library.files.as_mut(), &BTreeSet::from([photo])) {
+                    Ok(()) => {
+                        self.revert_dirty.remove(&photo);
+                    }
+                    Err(e) => {
+                        failed = Some(e.to_string());
+                    }
+                }
+            }
             for photo in self.dirty_photos.clone() {
                 if let Some(value) = self.photos.get(&photo) {
                     match super::storage::stored_epoch(library.files.as_mut(), photo)
@@ -128,8 +151,9 @@ impl Archive {
                     }
                 }
             }
-            self.dirty = !self.dirty_photos.is_empty();
+            self.dirty = !self.tails.is_empty() || !self.dirty_photos.is_empty();
             self.error = failed.clone();
+            self.retry_at = failed.as_ref().map(|_| web_time::Instant::now() + std::time::Duration::from_secs(2));
             return failed.map_or(Ok(()), |e| Err(EngineError::NotSaved(e)));
         }
         if !self.dirty {
