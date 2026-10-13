@@ -196,6 +196,18 @@ pub(crate) fn decode_with_fallback(bytes: &[u8], opts: &DecodeOptions, fallback:
     finish(F, raw, meta, (m.width, m.height), opts)
 }
 
+/// Full entropy decode for integrity-sensitive consumers. The ordinary fast
+/// decoder remains tolerant; jpeg-decoder requires complete scan/marker data.
+pub(super) fn validate_complete(bytes: &[u8]) -> Result<()> {
+    let m = parse_markers(bytes).ok_or_else(|| Error::Malformed(F, "missing SOI".into()))?;
+    // The service's standard JPEG decoder supports 8-bit samples.
+    if m.precision != 8 {
+        return Err(Error::Unsupported(F, "complete-image validation requires 8-bit JPEG"));
+    }
+    decode_jpeg_decoder(bytes, &m, None)?;
+    Ok(())
+}
+
 fn decode_zune(bytes: &[u8], m: &Markers) -> Result<Raw> {
     use zune_core::bytestream::ZCursor;
     use zune_core::colorspace::ColorSpace;

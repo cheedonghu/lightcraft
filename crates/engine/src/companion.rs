@@ -381,9 +381,8 @@ pub fn validate_history_image(mime: &str, data: &[u8]) -> Result<(), String> {
     if data.is_empty() || data.len() > 128 * 1024 || lightcraft_codecs::sniff(data) != Some(expected) {
         return Err("invalid historical image".into());
     }
-    let decoded =
-        lightcraft_codecs::decode(data, lightcraft_codecs::DecodeOptions { max_size: None, max_pixels: 640 * 640 }).map_err(|e| e.to_string())?;
-    if decoded.image.width == 0 || decoded.image.height == 0 || decoded.image.width > 640 || decoded.image.height > 640 {
+    let decoded = lightcraft_codecs::validate_complete_image(data, 640 * 640).map_err(|e| e.to_string())?;
+    if decoded.width == 0 || decoded.height == 0 || decoded.width > 640 || decoded.height > 640 {
         return Err("historical image dimensions exceed service limits".into());
     }
     Ok(())

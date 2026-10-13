@@ -318,3 +318,55 @@ fn start_command_refuses_ambiguous_legacy_image_and_allows_next_ordinary_edit() 
     h.app.run("develop.set", json!({"control":"light.exposure","value":0.7})).unwrap();
     assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.7);
 }
+
+#[test]
+fn start_refuses_truncated_historical_jpeg_and_keeps_valid_jpeg_usable() {
+    use lightcraft_catalog::MemStore;
+    use lightcraft_engine::library::LibraryStores;
+    let valid = lightcraft_engine::export::encode_image(
+        &lightcraft_raster::Rgba8::from_fn(32, 32, |x, y| [(x * 7) as u8, (y * 7) as u8, 80, 255]),
+        &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Jpeg, ..Default::default() },
+    )
+    .unwrap();
+    let truncated = valid[..valid.len() - 2].to_vec();
+    if let Ok(dir) = std::env::var("UX11_STRICT_JPEG_FIXTURES") {
+        std::fs::write(format!("{dir}/caller-valid.jpg"), &valid).unwrap();
+        std::fs::write(format!("{dir}/caller-no-eoi.jpg"), &truncated).unwrap();
+    }
+    for (bytes, refused) in [(&truncated, true), (&valid, false)] {
+        let (catalog, files) = (MemStore::new(), MemStore::new());
+        let stores = || LibraryStores { catalog: Box::new(catalog.clone()), files: Box::new(files.clone()), dir: "memory".into(), on_disk: false };
+        let mut session = lightcraft_engine::Session::new();
+        session.open_library_in(stores(), true).unwrap();
+        let photo = session.active().unwrap();
+        session.close_library().unwrap();
+        let saved = json!({"schema_version":1,"messages":[{"role":"user","text":"keep JPEG history","images":[{"mime_type":"image/jpeg","data":Base64::encode_string(bytes)}]}],"rounds":[]});
+        files.set(
+            "companion/state.json",
+            serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():saved}})).unwrap(),
+        );
+        let mut session = lightcraft_engine::Session::new();
+        session.open_library_in(stores(), false).unwrap();
+        let mut app = LightcraftApp::new(session, crate::Services::default());
+        let (connection, requests, _events) = network::test_connection();
+        app.ai.generation = app.session.library_generation();
+        app.ai.connection = Some(connection);
+        let mut h = crate::headless::Headless::new(app, [1600.0, 1000.0], 1.0);
+        h.app.run("ai.open", json!({})).unwrap();
+        h.step();
+        h.step();
+        assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
+        let result = h.app.run("ai.start", json!({"prompt":"current request"}));
+        if refused {
+            let error = result.unwrap_err();
+            assert!(error.contains("history is incomplete or invalid"), "{error}");
+            assert!(requests.try_recv().is_err(), "corrupt JPEG must not create/upload a round");
+            assert_eq!(h.app.session.load_companion_conversation(photo).unwrap().unwrap(), saved, "complete local history is still readable");
+            h.app.run("develop.set", json!({"control":"light.exposure","value":0.7})).unwrap();
+            assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.7);
+        } else {
+            assert_eq!(result.unwrap()["started"], true);
+            assert_eq!(requests.try_recv().unwrap().path, "/v1/rounds");
+        }
+    }
+}
