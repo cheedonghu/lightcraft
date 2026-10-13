@@ -496,9 +496,6 @@ impl LightcraftApp {
         if let Some(result) = ai_companion::command(self, id, &params) {
             return result;
         }
-        if ai_companion::blocks_edit(self, id, &params) {
-            return Err("AI 正在处理此照片，请先停止生成。".into());
-        }
         if let Some(result) = model_setup::intercept(self, id, &params) {
             return result;
         }
@@ -517,7 +514,7 @@ impl LightcraftApp {
         } else {
             params
         };
-        let r = self.session.execute(id, &params).map_err(|e| e.to_string());
+        let r = self.session.execute(id, &params).map_err(|e| crate::i18n::tr(&e.to_string()).to_owned());
         if r.is_ok() && matches!(id, "crop.aspect" | "crop.rotateAspect") {
             self.ui.crop_default_aspect = if id == "crop.aspect" && params.get("aspect").and_then(Value::as_str) == Some("original") {
                 Some(serde_json::json!("original"))

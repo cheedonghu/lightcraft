@@ -1,4 +1,7 @@
 //! Photo-bound conversations and the native Photo Companion round protocol.
+#[cfg(test)]
+#[path = "ai_companion/admission_tests.rs"]
+mod admission_tests;
 mod archive;
 #[cfg(test)]
 #[path = "ai_companion/disconnect_tests.rs"]
@@ -18,10 +21,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use crate::i18n::tr;
 use base64ct::{Base64, Encoding};
 use lightcraft_catalog::PhotoId;
 use lightcraft_develop::DevelopSettings;
-use lightcraft_engine::companion::{LocalRoundId, PhotoScope, RoundIdentity};
+use lightcraft_engine::companion::{LeaseToken, LocalRoundId, PhotoScope, RoundIdentity};
 use lightcraft_engine::media::{RenderJob, RenderResult};
 use serde_json::{Value, json};
 
@@ -101,6 +105,7 @@ struct Checkpoint {
     eligible: bool,
 }
 struct Job {
+    lease: LeaseToken,
     identity: RoundIdentity,
     round: String,
     state: String,
@@ -190,24 +195,45 @@ impl State {
             None => Ok(()),
         }
     }
-    fn start(&mut self, app: &mut LightcraftApp) -> Result<Value, String> {
+    pub(crate) fn admission(&self, app: &LightcraftApp, explicit: Option<PhotoId>) -> Result<PhotoId, String> {
         if cfg!(target_arch = "wasm32") {
-            return Err("AI 助手目前仅支持桌面版。".into());
+            return Err(tr("AI Companion is currently available on desktop only.").into());
         }
         if !self.consent {
-            return Err("请先同意发送压缩预览。".into());
+            return Err(tr("Please consent to sending compressed previews first.").into());
         }
+        if !self.jobs.is_empty() || self.workers.values().any(|a| a.load(Ordering::Relaxed)) || app.session.companion_task_photo().is_some() {
+            return Err(tr("Another AI task is active; stop it or wait for completion.").into());
+        }
+        let photo = app.session.active().ok_or_else(|| tr("Select exactly one photo to start an AI task.").to_owned())?;
+        if app.session.selection.ids.as_slice() != [photo] {
+            return Err(tr("Select exactly one photo to start an AI task.").into());
+        }
+        if explicit.is_some_and(|id| id != photo) {
+            return Err(tr("The requested photo must match the single selected photo.").into());
+        }
+        let p = app.session.catalog.photo(photo).ok_or_else(|| tr("This photo is unavailable for AI processing.").to_owned())?;
+        if p.deleted {
+            return Err(tr("This photo is unavailable for AI processing.").into());
+        }
+        if let lightcraft_catalog::Source::File { path } = &p.source {
+            match app.session.media.availability.exists(path) {
+                Some(true) => {}
+                Some(false) => return Err(tr("This photo is unavailable for AI processing.").into()),
+                None => return Err(tr("Checking photo availability. Please try again.").into()),
+            }
+        }
+        Ok(photo)
+    }
+    #[cfg(test)]
+    fn start(&mut self, app: &mut LightcraftApp) -> Result<Value, String> {
+        self.start_for(app, None)
+    }
+    fn start_for(&mut self, app: &mut LightcraftApp, explicit: Option<PhotoId>) -> Result<Value, String> {
         if self.connection.as_ref().is_none_or(|c| !c.alive.load(Ordering::Relaxed)) {
             self.retire_disconnected_jobs(app)?;
         }
-        let photo = app.session.active().ok_or("请先选择一张照片。")?;
-        if self.jobs.contains_key(&photo) || self.worker_busy(photo) {
-            return Err("此照片仍在处理，请停止或等待结束。".into());
-        }
-        if self.jobs.len() >= 16 {
-            return Err("本机等待照片已满，请稍候。".into());
-        }
-        let history = self.history(app, photo)?;
+        let photo = self.admission(app, explicit)?;
         app.session.end_interaction().map_err(|e| e.to_string())?;
         let original = app.session.develop_of(photo).ok_or("照片不存在。")?;
         let content = app.session.catalog.photo(photo).map(|p| lightcraft_engine::media::content_key(p)).ok_or("照片不存在。")?;
@@ -228,6 +254,8 @@ impl State {
             submission_seq: self.serial,
             connection_generation: self.connection_generation,
         };
+        let lease = app.session.acquire_companion_lease(photo, identity.local_round_id.clone()).map_err(|e| tr(&e.to_string()).to_owned())?;
+        let history = self.history(app, photo)?;
         self.enqueue(
             "/v1/rounds".into(),
             json!({"submission_seq":self.serial,"photo_ref":{"library_generation":generation,"photo_id":photo.0},"photo_revision":revision}),
@@ -238,6 +266,7 @@ impl State {
         self.jobs.insert(
             photo,
             Job {
+                lease,
                 identity: identity.clone(),
                 round: String::new(),
                 state: "submitting".into(),
@@ -681,7 +710,9 @@ impl State {
         if let Some(plan) = plan {
             let rendered = snapshot.result.rendered.as_ref().map_err(Clone::clone)?;
             let op = app.session.develop_op(photo, (*settings).clone(), "AI edit plan").ok_or("照片不存在。")?;
-            app.session.commit("AI edit plan", op).map_err(|e| e.to_string())?;
+            app.session
+                .commit_companion(&job.lease, &identity.local_round_id, job.checkpoint.revision, op)
+                .map_err(|e| tr(&e.to_string()).to_owned())?;
             app.session.accept(&snapshot.result);
             app.renderer.publish_companion(ctx, photo, snapshot.result.key, rendered, app.session.active() == Some(photo));
             let new_revision = app.session.photo_revision(photo);
@@ -1085,13 +1116,14 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             Ok(Value::Null)
         }
         "ai.start" => {
-            if params.get("consent").and_then(Value::as_bool) == Some(true) {
-                state.consent = true;
-            }
             if let Some(prompt) = params.get("prompt").and_then(Value::as_str) {
                 state.prompt = prompt.into();
             }
-            state.start(app)
+            let explicit = params
+                .get("photo")
+                .map(|v| v.as_u64().map(PhotoId).ok_or_else(|| tr("The requested photo must match the single selected photo.").to_owned()))
+                .transpose();
+            explicit.and_then(|p| state.start_for(app, p))
         }
         "ai.stop" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
             state.stop(p)?;
@@ -1185,46 +1217,6 @@ fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId) -> Result<V
     }
     Ok(json!({"cleared":true}))
 }
-pub fn blocks_edit(app: &LightcraftApp, command: &str, params: &Value) -> bool {
-    if app.ai.jobs.is_empty() {
-        return false;
-    }
-    if matches!(command, "edit.undo" | "edit.redo" | "history.undo" | "history.redo") {
-        let entry = if command.ends_with("redo") { app.session.redo.last() } else { app.session.undo.last() };
-        let mut blocked = false;
-        if let Some(entry) = entry {
-            entry.op.photo_ids(&mut |id| blocked |= app.ai.jobs.contains_key(&id));
-        }
-        return blocked;
-    }
-    let safe = command.starts_with("view.")
-        || command.starts_with("ui.")
-        || matches!(
-            command,
-            "library.select"
-                | "library.next"
-                | "library.previous"
-                | "library.selectAll"
-                | "library.selectNone"
-                | "library.selectBy"
-                | "library.sort"
-                | "library.source"
-                | "library.clearFilter"
-                | "library.filter"
-                | "library.info"
-                | "library.open"
-                | "library.new"
-                | "library.close"
-                | "app.openLibrary"
-                | "app.newLibrary"
-                | "photo.info"
-                | "photo.inspect"
-                | "develop.get"
-                | "develop.controls"
-                | "app.quit"
-        );
-    !safe && app.session.targets(params).iter().any(|id| app.ai.jobs.contains_key(id))
-}
 fn display_text(conversation: &Conversation) -> String {
     let mut text = String::new();
     for message in &conversation.messages {
@@ -1254,7 +1246,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
         if let Some(photo) = app.session.active() {
             panel(app, ui, photo);
         } else {
-            ui.label("请选择一张照片。");
+            ui.label(tr("Select exactly one photo to start an AI task."));
         }
     });
     app.ai.open = open;
@@ -1264,15 +1256,25 @@ fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
         if let Some(p) = app.session.catalog.photo(photo) {
             ui.label(p.file_name.as_str());
         }
-        ui.label("理解照片并自然优化。原始照片留在本机。");
+        ui.label(tr("Understand and naturally optimize your photo. Originals stay on this computer."));
         let busy = app.ai.jobs.contains_key(&photo);
+        if app.session.companion_task_photo() == Some(photo) {
+            ui.label(tr("Manual editing is paused while AI processes this photo; stop it or wait for completion."));
+        }
         let worker = app.ai.worker_busy(photo);
-        let input = ui.add_enabled(!busy, egui::TextEdit::multiline(&mut app.ai.prompt).desired_rows(2).hint_text("例如：先评价照片，再自然优化"));
+        let input = ui.add_enabled(
+            !busy,
+            egui::TextEdit::multiline(&mut app.ai.prompt).desired_rows(2).hint_text(tr("For example: review this photo, then naturally optimize it")),
+        );
         crate::widgets::register(ui.ctx(), "field:aiPrompt", input.rect);
         if !busy {
-            let consent = ui.checkbox(&mut app.ai.consent, "同意将压缩预览发送给云端模型");
+            let consent = ui.checkbox(&mut app.ai.consent, tr("Allow compressed previews to be sent to the cloud model"));
             crate::widgets::register(ui.ctx(), "checkbox:aiConsent", consent.rect);
-            let start = ui.add_enabled(app.ai.consent && !worker && !cfg!(target_arch = "wasm32"), egui::Button::new("点评并优化"));
+            let admission = app.ai.admission(app, None);
+            if let Err(message) = &admission {
+                ui.label(message);
+            }
+            let start = ui.add_enabled(admission.is_ok(), egui::Button::new(tr("Analyze and Optimize")));
             crate::widgets::register(ui.ctx(), "button:aiStart", start.rect);
             if start.clicked()
                 && let Err(e) = app.run("ai.start", json!({}))
@@ -1281,9 +1283,11 @@ fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
                 app.ai.conversations.entry(photo).or_default().notice = e;
             }
             if worker {
-                ui.label("正在结束此照片的处理…");
+                ui.label(tr("Finishing processing for this photo…"));
             }
-            for (label, widget, command) in [("撤回本轮", "button:aiUndo", "ai.undo"), ("删除对话", "button:aiClear", "ai.clear")] {
+            for (label, widget, command) in
+                [(tr("Undo AI Round"), "button:aiUndo", "ai.undo"), (tr("Delete Conversation"), "button:aiClear", "ai.clear")]
+            {
                 let button = ui.add_enabled(!worker, egui::Button::new(label));
                 crate::widgets::register(ui.ctx(), widget, button.rect);
                 if button.clicked()
@@ -1295,8 +1299,8 @@ fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
         } else {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("正在处理此照片…");
-                let stop = ui.button("停止生成");
+                ui.label(tr("Processing this photo…"));
+                let stop = ui.button(tr("Stop Generating"));
                 crate::widgets::register(ui.ctx(), "button:aiStop", stop.rect);
                 if stop.clicked() {
                     let _ = app.run("ai.stop", json!({}));

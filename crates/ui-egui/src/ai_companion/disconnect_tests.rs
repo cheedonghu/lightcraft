@@ -25,6 +25,7 @@ fn ready_candidate_cannot_publish_after_connection_invalidation() {
     state.jobs.insert(
         photo,
         Job {
+            lease: app.session.acquire_companion_lease(photo, LocalRoundId::new().unwrap()).unwrap(),
             identity: RoundIdentity {
                 scope: PhotoScope { library_generation: generation, photo },
                 local_round_id: LocalRoundId::new().unwrap(),
@@ -72,6 +73,7 @@ fn explanation_keeps_stable_local_identity_after_selection_and_backend_admission
     state.jobs.insert(
         photo,
         Job {
+            lease: app.session.acquire_companion_lease(photo, LocalRoundId::new().unwrap()).unwrap(),
             identity: RoundIdentity {
                 scope: PhotoScope { library_generation: generation, photo },
                 local_round_id: LocalRoundId::new().unwrap(),
