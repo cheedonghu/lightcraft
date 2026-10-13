@@ -116,6 +116,10 @@ fn real_checkbox_submission_and_other_photo_editing_headless() {
         if let Ok(dir) = std::env::var("UX03_SCREENSHOT_DIR") {
             let shot = h.request("ui.screenshot", json!({"path":format!("{dir}/submitting-{}.png",language.code()),"headless":true}), timeout);
             assert_eq!(shot["ok"], true, "{shot}");
+            let inspect = h.request("ui.inspect", json!({}), timeout);
+            assert_eq!(inspect["ok"], true, "{inspect}");
+            assert!(inspect["result"]["perf"]["frameMs"].is_number());
+            std::fs::write(format!("{dir}/inspect-submitting-{}.json", language.code()), serde_json::to_vec_pretty(&inspect).unwrap()).unwrap();
         }
         h.app.run("library.select", json!({"ids":[other.0],"active":other.0})).unwrap();
         h.step();
