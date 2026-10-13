@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use super::settings::{check, heading, hint};
 use crate::LightcraftApp;
+use crate::i18n::{tr, tr_format};
 use crate::theme::Tokens;
 use crate::widgets::register;
 
@@ -147,8 +148,8 @@ pub fn setup_banner(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 6)).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(message).font(t.font(12.5)).color(t.text_dim));
-            let r = ui.button(button);
+            ui.label(RichText::new(tr(message)).font(t.font(12.5)).color(t.text_dim));
+            let r = ui.button(tr(button));
             register(ui.ctx(), "faces:setup", r.rect);
             if r.clicked() {
                 take_step(app, ui.ctx(), step);
@@ -181,13 +182,26 @@ fn sentence(s: &str) -> String {
 
 /// "Apache-2.0 · commercial use allowed"
 fn licence_line(m: &Value) -> String {
-    let name = m["licence"]["name"].as_str().filter(|s| !s.is_empty()).unwrap_or("Unknown licence");
+    let name = m["licence"]["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(tr("Unknown licence"));
     let terms = match m["licence"]["commercial"].as_str() {
         Some("yes") => "commercial use allowed",
         Some("no") => "non-commercial use only",
         _ => "terms unclear",
     };
-    format!("{name} · {terms}")
+    tr_format!("{name} · {terms}", name = name, terms = tr(terms))
+}
+
+/// Translate the engine's speed description while retaining its ratio and reference model.
+fn speed_text(source: &str) -> String {
+    if let Some((times, reference)) = source.split_once("× faster than ") {
+        tr_format!("{}× faster than {}", times, tr(reference))
+    } else if let Some((times, reference)) = source.split_once("× slower than ") {
+        tr_format!("{}× slower than {}", times, tr(reference))
+    } else if let Some(reference) = source.strip_prefix("Same speed as ") {
+        tr_format!("Same speed as {}", tr(reference))
+    } else {
+        source.to_string()
+    }
 }
 
 fn open_page(app: &mut LightcraftApp, url: &str) {
@@ -245,12 +259,12 @@ pub fn settings_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         let can = app.services.pick_model_file.is_some();
-        let r = ui.add_enabled(can, egui::Button::new("Add a model file…"));
+        let r = ui.add_enabled(can, egui::Button::new(tr("Add a model file…")));
         register(ui.ctx(), "faces:addModel", r.rect);
         if r.clicked() {
             let _ = app.run("dialog.faceModel", json!({}));
         }
-        ui.label(RichText::new("or drop a .onnx file on the window").color(t.text_dim));
+        ui.label(RichText::new(tr("or drop a .onnx file on the window")).color(t.text_dim));
     });
     // what is wrong with the user's own catalog (catalog.json in the models folder), if anything
     for e in list["catalog"]["errors"].as_array().into_iter().flatten().filter_map(Value::as_str).take(3) {
@@ -258,7 +272,11 @@ pub fn settings_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
     }
     if let Some(d) = all.iter().find(|m| m["role"] == "detector") {
         ui.add_space(4.0);
-        hint(ui, t, &format!("Faces are found by {} ({}, included).", d["name"].as_str().unwrap_or("the detector"), mb(d["sizeBytes"].as_u64())));
+        hint(
+            ui,
+            t,
+            &tr_format!("Faces are found by {} ({}, included).", d["name"].as_str().unwrap_or(tr("the detector")), mb(d["sizeBytes"].as_u64())),
+        );
     }
 }
 
@@ -266,10 +284,10 @@ pub fn settings_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
 fn scan_progress(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
     let (left, peak, faces) = (app.caches.faces_pending, app.caches.faces_peak.max(1), app.caches.faces_indexed);
     if left == 0 {
-        hint(ui, t, &format!("{faces} faces learned."));
+        hint(ui, t, &tr_format!("{faces} faces learned.", faces = faces));
         return;
     }
-    let text = format!("Scanning photos for faces: {left} left · {faces} faces so far");
+    let text = tr_format!("Scanning photos for faces: {left} left · {faces} faces so far", left = left, faces = faces);
     let bar = ui.add(
         egui::ProgressBar::new((1.0 - left as f32 / peak as f32).clamp(0.0, 1.0)).desired_width(380.0).text(RichText::new(text).font(t.font(11.5))),
     );
@@ -293,9 +311,9 @@ fn model_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, m: &Value, 
                         ui.label(RichText::new(size).color(t.text_dim));
                     }
                     if selected {
-                        ui.label(RichText::new("in use").color(t.accent));
+                        ui.label(RichText::new(tr("in use")).color(t.accent));
                     } else if installed {
-                        ui.label(RichText::new("installed").color(t.text_dim));
+                        ui.label(RichText::new(tr("installed")).color(t.text_dim));
                     }
                 });
                 ui.label(RichText::new(licence_line(m)).font(t.font(11.5)).color(if m["licence"]["commercial"] == "yes" {
@@ -305,13 +323,13 @@ fn model_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, m: &Value, 
                 }));
                 // how fast it is, as times faster than a ResNet-100 model (milliseconds would depend on the computer),
                 // with whether it passed its test when it has been installed
-                let speed = m["speedText"].as_str().filter(|s| !s.is_empty());
+                let speed = m["speedText"].as_str().filter(|s| !s.is_empty()).map(speed_text);
                 let (line, ok) = match m["accepted"]["selfTest"].as_object() {
                     Some(test) if test.get("ok").and_then(Value::as_bool) == Some(true) => {
-                        (Some(speed.map_or("Works".to_string(), |s| format!("Works · {s}"))), true)
+                        (Some(speed.map_or(tr("Works").to_string(), |s| tr_format!("Works · {s}", s = s))), true)
                     }
-                    Some(_) => (Some("Failed its last test".to_string()), false),
-                    None => (speed.map(str::to_string), true),
+                    Some(_) => (Some(tr("Failed its last test").to_string()), false),
+                    None => (speed, true),
                 };
                 if let Some(line) = line {
                     ui.label(RichText::new(line).font(t.font(11.5)).color(if ok { t.text_dim } else { t.caution }));
@@ -321,18 +339,18 @@ fn model_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, m: &Value, 
                         let (got, total) = (d["bytes"].as_u64().unwrap_or(0), d["total"].as_u64().unwrap_or(0));
                         let frac = if total > 0 { (got as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
                         let text = if total > 0 && got >= total {
-                            "Checking…".to_string()
+                            tr("Checking…").to_string()
                         } else {
-                            format!("{} of {} from {host}", mb(Some(got)), mb(Some(total)))
+                            tr_format!("{} of {} from {host}", mb(Some(got)), mb(Some(total)), host = host)
                         };
                         let bar = ui.add(egui::ProgressBar::new(frac).desired_width(260.0).text(RichText::new(text).font(t.font(11.5))));
                         register(ui.ctx(), format!("faces:progress:{id}"), bar.rect);
                     }
                     (Some("done"), _) => {
-                        ui.label(RichText::new("Downloaded and checked. Installing…").font(t.font(11.5)).color(t.text_dim));
+                        ui.label(RichText::new(tr("Downloaded and checked. Installing…")).font(t.font(11.5)).color(t.text_dim));
                     }
                     (Some("failed"), Some(d)) => {
-                        let why = sentence(d["error"].as_str().unwrap_or("The download failed"));
+                        let why = sentence(tr(d["error"].as_str().unwrap_or("The download failed")));
                         ui.add(egui::Label::new(RichText::new(why).font(t.font(11.5)).color(t.caution)).wrap());
                     }
                     _ => {}
@@ -340,14 +358,14 @@ fn model_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, m: &Value, 
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if installed {
-                    let r = ui.button("Remove");
+                    let r = ui.button(tr("Remove"));
                     register(ui.ctx(), format!("faces:remove:{id}"), r.rect);
                     if r.clicked() {
                         let _ = app.run("faces.models.remove", json!({"id": id}));
                         app.caches.faces_epoch += 1;
                     }
                     if !selected && !detector {
-                        let r = ui.button("Use");
+                        let r = ui.button(tr("Use"));
                         register(ui.ctx(), format!("faces:use:{id}"), r.rect);
                         if r.clicked() {
                             let _ = app.run("faces.models.select", json!({"id": id}));
@@ -357,7 +375,7 @@ fn model_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, m: &Value, 
                 } else {
                     match dl_state {
                         Some("running") => {
-                            let r = ui.button("Cancel");
+                            let r = ui.button(tr("Cancel"));
                             register(ui.ctx(), format!("faces:cancelDownload:{id}"), r.rect);
                             if r.clicked() {
                                 let _ = app.run("faces.models.downloadCancel", json!({"id": id}));
@@ -369,8 +387,8 @@ fn model_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, m: &Value, 
                         _ => {
                             if let Some(url) = m["source"].as_str() {
                                 let r = ui
-                                    .button("Open page")
-                                    .on_hover_text("Opens the model's own page in your browser, to read about it or get the file yourself.");
+                                    .button(tr("Open page"))
+                                    .on_hover_text(tr("Opens the model's own page in your browser, to read about it or get the file yourself."));
                                 register(ui.ctx(), format!("faces:get:{id}"), r.rect);
                                 if r.clicked() {
                                     open_page(app, url);
@@ -378,12 +396,13 @@ fn model_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, m: &Value, 
                             }
                             if !host.is_empty() {
                                 let label = if dl_state == Some("failed") { "Try again" } else { "Download" };
-                                let tip = format!(
+                                let tip = tr_format!(
                                     "Shows the model's terms, then downloads {} from {host} and installs it{}. Nothing else is sent.",
                                     mb(m["sizeBytes"].as_u64()),
-                                    if detector { "" } else { ", starts using it" }
+                                    tr(if detector { "" } else { ", starts using it" }),
+                                    host = host
                                 );
-                                let r = ui.button(label).on_hover_text(tip);
+                                let r = ui.button(tr(label)).on_hover_text(tip);
                                 register(ui.ctx(), format!("faces:download:{id}"), r.rect);
                                 if r.clicked() {
                                     open_download_dialog(app, m);
@@ -403,15 +422,15 @@ pub fn model_dialog(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, info
     let kind = info["kind"].as_str().unwrap_or("unsupported");
     let file = info["fileName"].as_str().unwrap_or("");
     if kind == "unsupported" {
-        ui.label(RichText::new("This file cannot be used yet").font(t.semibold(13.5)).color(t.caution));
+        ui.label(RichText::new(tr("This file cannot be used yet")).font(t.semibold(13.5)).color(t.caution));
         ui.add(
             egui::Label::new(
-                RichText::new(sentence(info["reason"].as_str().unwrap_or("It is not a face recognition model LightCraft understands")))
+                RichText::new(sentence(tr(info["reason"].as_str().unwrap_or("It is not a face recognition model LightCraft understands"))))
                     .color(t.text_label),
             )
             .wrap(),
         );
-        ui.label(RichText::new(format!("{file} · {}", mb(info["sizeBytes"].as_u64()))).color(t.text_dim));
+        ui.label(RichText::new(tr_format!("{file} · {size}", file = file, size = mb(info["sizeBytes"].as_u64()))).color(t.text_dim));
         return;
     }
     let m = &info["model"];
@@ -420,17 +439,18 @@ pub fn model_dialog(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, info
         ui.label(RichText::new(mb(info["sizeBytes"].as_u64())).color(t.text_dim));
     });
     if info["alreadyInstalled"] == true {
-        ui.label(RichText::new("Already installed. Installing again is harmless.").color(t.text_dim));
+        ui.label(RichText::new(tr("Already installed. Installing again is harmless.")).color(t.text_dim));
     }
     let download = info["download"].is_string();
     let detector = m["role"] == "detector";
     if download {
-        let host = info["host"].as_str().unwrap_or("its own repository");
+        let host = info["host"].as_str().unwrap_or(tr("its own repository"));
         ui.add(
             egui::Label::new(
-                RichText::new(format!(
+                RichText::new(tr_format!(
                     "Downloads from {host}. Once it has arrived and checked out, LightCraft installs it{}.",
-                    if detector { "" } else { ", starts using it and turns face recognition on" }
+                    tr(if detector { "" } else { ", starts using it and turns face recognition on" }),
+                    host = host
                 ))
                 .color(t.text_label),
             )
@@ -445,17 +465,17 @@ pub fn model_dialog(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, info
     }
     let provenance = m["provenance"].as_str().unwrap_or("");
     if !provenance.is_empty() {
-        ui.add(egui::Label::new(RichText::new(format!("Trained on: {provenance}")).color(t.text_dim)).wrap());
+        ui.add(egui::Label::new(RichText::new(tr_format!("Trained on: {provenance}", provenance = provenance)).color(t.text_dim)).wrap());
     }
     if kind == "draft" {
         ui.add_space(2.0);
-        ui.label(RichText::new("LightCraft does not know this model, so it assumed:").color(t.text_label));
+        ui.label(RichText::new(tr("LightCraft does not know this model, so it assumed:")).color(t.text_label));
         for a in info["assumptions"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-            ui.add(egui::Label::new(RichText::new(format!("•  {a}")).font(t.font(12.0)).color(t.text_dim)).wrap());
+            ui.add(egui::Label::new(RichText::new(tr_format!("•  {assumption}", assumption = tr(a))).font(t.font(12.0)).color(t.text_dim)).wrap());
         }
     }
     if let Some(url) = m["source"].as_str().or(m["licence"]["url"].as_str()) {
-        let r = ui.link("Open the model's page");
+        let r = ui.link(tr("Open the model's page"));
         register(ui.ctx(), "faceModel:page", r.rect);
         if r.clicked() {
             open_page(app, url);
@@ -468,7 +488,7 @@ pub fn model_dialog(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, info
     } else {
         "The model is kept on this computer only. LightCraft never uploads or shares it."
     };
-    ui.label(RichText::new(closing).font(t.font(11.5)).color(t.text_dim));
+    ui.label(RichText::new(tr(closing)).font(t.font(11.5)).color(t.text_dim));
 }
 
 /// Pressing Download: the model's terms first, in the same dialog as a model file. Accepting them starts the download;
@@ -507,7 +527,7 @@ pub fn open_dialog(app: &mut LightcraftApp, path: &str) -> Result<Value, String>
 /// install it. Either way the model ends up installed, in use, with recognition on.
 pub fn install(app: &mut LightcraftApp, path: &str, info: &Value, accepted: bool) -> Result<Value, String> {
     if !accepted {
-        return Err("Tick the box to accept the model's terms first".into());
+        return Err(tr("Tick the box to accept the model's terms first").into());
     }
     app.caches.faces_epoch += 1;
     let back_to_settings = |app: &mut LightcraftApp| app.ui.dialog = Some(crate::state::Dialog::Settings { tab: "faces".into() });
@@ -522,11 +542,11 @@ pub fn install(app: &mut LightcraftApp, path: &str, info: &Value, accepted: bool
     }
     let r = app.run("faces.models.install", json!({"path": path, "acknowledged": true}));
     if let Ok(v) = &r {
-        let name = v["installed"]["name"].as_str().unwrap_or("The model");
+        let name = v["installed"]["name"].as_str().unwrap_or(tr("The model"));
         app.ui.status = if v["installed"]["role"] == "detector" {
-            format!("{name} is installed")
+            tr_format!("{name} is installed", name = name)
         } else {
-            format!("{name} is installed and in use: face recognition is on")
+            tr_format!("{name} is installed and in use: face recognition is on", name = name)
         };
         back_to_settings(app);
     }
@@ -601,7 +621,7 @@ pub fn name_editor(
     let shown = egui::Area::new(egui::Id::new("face-name-editor")).order(egui::Order::Foreground).fixed_pos(at).constrain(true).show(ctx, |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.set_min_width(230.0);
-            let r = ui.add(egui::TextEdit::singleline(&mut edit.text).hint_text("Name").desired_width(220.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut edit.text).hint_text(tr("Name")).desired_width(220.0));
             register(ui.ctx(), "field:faceName", r.rect);
             if edit.fresh {
                 r.request_focus();
@@ -634,13 +654,13 @@ pub fn name_editor(
                 }
             }
             if let Some(label) = setup.short() {
-                let b = ui.add(egui::Button::new(RichText::new(label).font(t.font(12.0)).color(t.accent)).frame(false));
+                let b = ui.add(egui::Button::new(RichText::new(tr(label)).font(t.font(12.0)).color(t.accent)).frame(false));
                 register(ui.ctx(), "faces:setup", b.rect);
                 if b.clicked() {
                     outcome = Editor::Setup;
                 }
             }
-            ui.label(RichText::new("Enter to confirm, Esc to cancel").font(t.font(11.0)).color(t.text_dim));
+            ui.label(RichText::new(tr("Enter to confirm, Esc to cancel")).font(t.font(11.0)).color(t.text_dim));
         });
     });
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -748,7 +768,11 @@ fn watch_downloads(app: &mut LightcraftApp, ctx: &egui::Context) {
             .execute("faces.models.list", &json!({}))
             .ok()
             .is_some_and(|l| l["models"].as_array().is_some_and(|a| a.iter().any(|m| m["id"] == id.as_str() && m["role"] == "detector")));
-        let text = if detector { format!("{name} is installed") } else { format!("{name} is installed and in use: face recognition is on") };
+        let text = if detector {
+            tr_format!("{name} is installed", name = name)
+        } else {
+            tr_format!("{name} is installed and in use: face recognition is on", name = name)
+        };
         app.ui.status = text.clone();
         app.toast(ctx, text);
     }
@@ -758,6 +782,17 @@ fn watch_downloads(app: &mut LightcraftApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_licence_names_stay_verbatim_in_translated_prompts() {
+        crate::i18n::set_language(crate::i18n::Locale::ZhHans);
+        let model = json!({"licence": {"name": "Faces", "commercial": "yes"}});
+        assert_eq!(licence_line(&model), "Faces · 允许商业使用");
+        assert_eq!(crate::panels::denoise::licence_line(&model), "Faces · 允许商业使用");
+        let unknown = json!({"licence": {"commercial": "unknown"}});
+        assert_eq!(licence_line(&unknown), "未知许可证 · 使用条款不明确");
+        crate::i18n::set_language(crate::i18n::Locale::En);
+    }
 
     #[test]
     fn the_scan_works_hard_only_when_nobody_is_in_the_way() {

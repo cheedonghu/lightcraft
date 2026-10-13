@@ -598,14 +598,14 @@ pub(super) fn sentence(s: &str) -> String {
 }
 
 pub(super) fn licence_line(m: &Value) -> String {
-    let name = m["licence"]["name"].as_str().filter(|s| !s.is_empty()).unwrap_or("Unknown licence");
+    let name = m["licence"]["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(tr("Unknown licence"));
     let terms = match m["licence"]["commercial"].as_str() {
         Some("yes") if name.starts_with("GPL") => "commercial use subject to GPL conditions",
         Some("yes") => "commercial use allowed",
         Some("no") => "non-commercial use only",
         _ => "terms unclear",
     };
-    tr_format!("{name} · {terms}", name = tr(name), terms = tr(terms))
+    tr_format!("{name} · {terms}", name = name, terms = tr(terms))
 }
 
 pub(super) fn open_page(app: &mut LightcraftApp, url: &str) {
@@ -639,7 +639,7 @@ pub fn model_dialog(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, info
     }
     let download = info["download"].is_string();
     if download {
-        let host = info["host"].as_str().unwrap_or("its own repository");
+        let host = info["host"].as_str().unwrap_or(tr("its own repository"));
         let after = if info["domain"] == "denoise" { "starts using it for AI Denoise" } else { "makes AI Denoise available" };
         ui.add(
             egui::Label::new(

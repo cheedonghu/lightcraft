@@ -543,6 +543,58 @@ mod tests {
         assert_eq!(tr("Exposure"), "Exposure");
     }
 
+    #[test]
+    fn simplified_chinese_settings_paint_translated_model_tabs() {
+        let ctx = fonts_ctx(&[]);
+        let mut app = crate::LightcraftApp::new(lightcraft_engine::Session::with_demo(), Default::default());
+        app.session.face_models_dir = Some(std::env::temp_dir().join(format!("lc-chinese-models-{}", std::process::id())));
+        app.session.set_denoise_models_dir(Some(std::env::temp_dir().join(format!("lc-chinese-denoise-{}", std::process::id()))));
+        for tab in ["general", "performance", "faces", "denoise"] {
+            app.ui.dialog = None;
+            app.run("app.settings", serde_json::json!({"tab": tab})).unwrap();
+            let text = painted_text(&ctx, &mut app, Locale::ZhHans);
+            assert!(text.contains("设置") && text.contains("人脸") && text.contains("AI 降噪"), "{tab}: {text}");
+            for english in [
+                "AI Denoise",
+                "Faces",
+                "Face recognition",
+                "Recognition models",
+                "Cache",
+                "Processor",
+                "Graphics card",
+                "Open page",
+                "Download",
+                "Add a model file",
+                "commercial use allowed",
+                "faster than",
+                "Same speed as",
+                "Cleans noise out of raw photos",
+            ] {
+                assert!(!text.contains(english), "{tab} still paints {english:?}: {text}");
+            }
+            if tab == "faces" {
+                assert!(text.contains("打开网页") && text.contains("允许商业使用"), "model rows were not painted: {text}");
+            } else if tab == "denoise" {
+                assert!(text.contains("原始文件不会被修改") && text.contains("从文件安装"), "{text}");
+            }
+        }
+        let list = app.session.execute("faces.models.list", &serde_json::json!({})).unwrap();
+        let model = list["models"].as_array().unwrap().iter().find(|m| m["role"] == "embedder").unwrap();
+        crate::panels::faces::open_download_dialog(&mut app, model);
+        let text = painted_text(&ctx, &mut app, Locale::ZhHans);
+        assert!(text.contains("下载人脸模型") && text.contains("安装模型") && text.contains("人脸识别"), "{text}");
+        assert!(text.contains("我已阅读并接受") && text.contains("模型仅保存在本机"), "{text}");
+        for english in ["Downloads from", "Trained on", "commercial use allowed", "Nothing is fetched", "Open the model's page"] {
+            assert!(!text.contains(english), "model dialog still paints {english:?}: {text}");
+        }
+        app.ui.dialog = None;
+        app.run("app.language.english", serde_json::json!({})).unwrap();
+        app.run("app.settings", serde_json::json!({"tab": "general"})).unwrap();
+        let text = painted_text(&ctx, &mut app, Locale::En);
+        assert!(text.contains("Settings") && text.contains("AI Denoise"), "{text}");
+        set_language(Locale::En);
+    }
+
     /// Format strings carry their values in every language, and a language without a translation
     /// falls back to the English format rather than dropping the values.
     #[test]

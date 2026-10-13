@@ -244,5 +244,16 @@
   "not added to Apple Photos: {e}": "nicht zu Apple Fotos hinzugefügt: {e}",
   "{n} added to Apple Photos album “{album}”": "{n} zum Apple-Fotos-Album „{album}“ hinzugefügt",
   "{n} added to Apple Photos": "{n} zu Apple Fotos hinzugefügt",
-  "{n} photos opened for editing; each is stacked with its original": "{n} Fotos zur Bearbeitung geöffnet; jedes ist mit seinem Original gestapelt"
+  "{n} photos opened for editing; each is stacked with its original": "{n} Fotos zur Bearbeitung geöffnet; jedes ist mit seinem Original gestapelt",
+  "Same speed as {}": "Same speed as {}",
+  "Faces are found by {} ({}, included).": "Faces are found by {} ({}, included).",
+  "Works · {s}": "Works · {s}",
+  "{name} is installed and in use: face recognition is on": "{name} is installed and in use: face recognition is on",
+  "{}× faster than {}": "{}× faster than {}",
+  "{name} is installed": "{name} is installed",
+  "Downloads from {host}. Once it has arrived and checked out, LightCraft installs it{}.": "Downloads from {host}. Once it has arrived and checked out, LightCraft installs it{}.",
+  "Scanning photos for faces: {left} left · {faces} faces so far": "Scanning photos for faces: {left} left · {faces} faces so far",
+  "{}× slower than {}": "{}× slower than {}",
+  "Shows the model's terms, then downloads {} from {host} and installs it{}. Nothing else is sent.": "Shows the model's terms, then downloads {} from {host} and installs it{}. Nothing else is sent.",
+  "{faces} faces learned.": "{faces} faces learned."
 }

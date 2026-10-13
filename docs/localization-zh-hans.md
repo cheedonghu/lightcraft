@@ -3,7 +3,7 @@
 LightCraft 的界面支持英语、简体中文、繁体中文（台湾）和日语。语言设置保存在 `ui.json` 的 `language` 字段中。
 
 - 通过「编辑 → 语言」或「设置 → 一般 → 语言」切换，选择会保留到下次启动。
-- 已翻译的范围与 `zh-hant.json` 键集完全一致（1246 条），两份目录的键与键序一一对应。
+- 常用菜单、图库、编辑与设置页面已有简体中文翻译，包括 AI 降噪、人脸识别、模型安装与缓存提示。翻译目录随功能持续维护，不同语言的覆盖范围可能不同。
 - 正文字重与半粗体都使用 SIL OFL 的 **Noto Sans CJK SC**（简体中文）与 BIZ UDPGothic（日语）。
   这些字体不在本仓库，而在 [storytold/craft-fonts](https://github.com/storytold/craft-fonts)；
   使用可选的构建输入 `CRAFT_FONTS_DIR=../craft-fonts` 时（所有正式发布版）会内嵌进来。
@@ -12,6 +12,7 @@ LightCraft 的界面支持英语、简体中文、繁体中文（台湾）和日
   `cargo::warning` 提示这一点。
 - 翻译只发生在显示层：命令 ID、照片文件名、用户输入的元数据都不做改动。
 - 尚未翻译的技术性错误、补充说明和发行说明仍以英文显示。
+- 相邻 Photo Companion 工程的桌面启动脚本首次默认简体中文，并在构建时要求内嵌中文字库。普通启动会保存手动语言选择；`--memory` / `-Memory` 临时模式不保存设置，已保存的设置仍优先于启动默认值。
 - 网页版将 Noto Sans CJK SC 作为独立的 `lightcraft_zh_hans.otf` 文件随站点分发，页面启动时加载；
   这样可显示简体中文，也避免把约 16 MB 字体放进受单文件大小限制的 WASM。部署时需上传整个
   `target/web-site/` 目录。未指定 `CRAFT_FONTS_DIR` 的开发构建仍缺少中文字体。
