@@ -288,6 +288,9 @@ impl Fields {
                         if self.legacy && self.value.bytes.len() >= 64 * 1024 {
                             self.capture = false;
                             self.value.bytes.clear();
+                            if self.in_stage {
+                                self.stage.insert("parameter_details_unavailable".into(), Value::Bool(true));
+                            }
                         }
                         match self.value.byte(b, self.capture, 1024 * 1024 - self.retained)? {
                             1 => self.save()?,

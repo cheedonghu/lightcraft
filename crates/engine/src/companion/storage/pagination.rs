@@ -55,6 +55,10 @@ pub(super) fn entry(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRo
             {
                 return Err(error("invalid record bounds"));
             }
+            let payload = record.chunk_payload.unwrap_or(BLOCK);
+            if payload == 0 || payload > BLOCK || (record.chunk_payload.is_some() && payload != BLOCK - 32) {
+                return Err(error("invalid chunk layout"));
+            }
             return Ok(record);
         }
         if let Some(jump) = index.jumps.iter().rev().find(|j| j.upper > cursor && j.upper < index.start) {

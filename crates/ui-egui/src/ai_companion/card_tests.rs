@@ -628,3 +628,223 @@ fn native_card_projection_failure_preserves_the_already_readable_message_page() 
         std::thread::yield_now();
     }
 }
+
+fn sampled_mask(op: lightcraft_develop::MaskOp, invert: bool) -> lightcraft_develop::DevelopSettings {
+    let mut before = lightcraft_develop::DevelopSettings::default();
+    before.masks.push(lightcraft_develop::Mask {
+        id: 7,
+        name: "Sampled colors".into(),
+        components: vec![lightcraft_develop::MaskComponent {
+            name: None,
+            op,
+            invert,
+            shape: lightcraft_develop::MaskShape::ColorRange { samples: vec![[0.5, 0.1, 0.1]], refine: 50.0 },
+        }],
+        ..Default::default()
+    });
+    before
+}
+fn update_sampled_mask(before: &lightcraft_develop::DevelopSettings, sample_a: f64) -> lightcraft_develop::DevelopSettings {
+    let context = lightcraft_engine::companion::CandidateContext::new(
+        std::sync::Arc::new(lightcraft_raster::Rgb32f::filled(60, 40, [0.2; 3])),
+        Default::default(),
+        before,
+        "current",
+    );
+    lightcraft_engine::companion::candidate(before, &json!({"operations":[{"type":"update_manual_mask","ref":"mask-7","frame_id":"current","coordinate_space":"native_normalized","shape":{"kind":"colorRange","samples":[[0.5,sample_a,0.1]],"refine":50.0}}]}), &context).unwrap()
+}
+#[test]
+fn supported_color_range_sample_update_displays_the_actual_oklab_values() {
+    let before = sampled_mask(lightcraft_develop::MaskOp::Add, false);
+    let after = update_sampled_mask(&before, -0.1);
+    assert_ne!(before, after, "supported candidate actually changes the sampled color");
+    let s = json!({"stage":"initial","before_state":before,"proposed_state":after,"applied_state":after,"locally_published":true,"delivery_state":"confirmed"});
+    let (mut h, _) = headless(vec![json!({"local_round_id":"sample-card","stages":[s]})]);
+    let result = h.app.run("ai.status", json!({})).unwrap();
+    let rows = result["resultCards"][0]["stages"][0]["changes"].as_array().unwrap();
+    assert!(rows.iter().any(|r| r["control"] == "mask.7.component.0.samples"
+        && r["before"] == "(0.50, 0.10, 0.10)"
+        && r["actual"] == "(0.50, -0.10, 0.10)"
+        && r["unit"] == "OkLab"));
+    for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        h.app.ui.language = locale;
+        h.step();
+        if locale == crate::i18n::Locale::En {
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiParameters:sample-card"}), std::time::Duration::from_secs(10))["ok"], true);
+        }
+        for _ in 0..4 {
+            h.step();
+        }
+        assert!(h.painted_text().iter().any(|t| t == "(0.50, 0.10, 0.10) → (0.50, -0.10, 0.10)"));
+        screenshot(&mut h, &format!("sample-{}", locale.code()));
+    }
+}
+
+fn screenshot(h: &mut Headless, name: &str) {
+    if let Ok(dir) = std::env::var("UX16_SCREENSHOT_DIR") {
+        h.app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+        h.app.services.png = Some(Box::new(|image| {
+            lightcraft_engine::export::encode_image(
+                image,
+                &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+            )
+            .unwrap()
+        }));
+        assert_eq!(
+            h.request("ui.screenshot", json!({"path":format!("{dir}/{name}.png"),"headless":true}), std::time::Duration::from_secs(30))["ok"],
+            true
+        );
+    }
+}
+#[test]
+fn supported_manual_mask_update_displays_changed_combination_and_inversion() {
+    let before = sampled_mask(lightcraft_develop::MaskOp::Subtract, true);
+    let after = update_sampled_mask(&before, 0.1);
+    assert_eq!(after.masks[0].components[0].op, lightcraft_develop::MaskOp::Add);
+    assert!(!after.masks[0].components[0].invert);
+    let s = json!({"stage":"initial","before_state":before,"proposed_state":after,"applied_state":after,"locally_published":true,"delivery_state":"confirmed"});
+    let (mut h, _) = headless(vec![json!({"local_round_id":"combine-card","stages":[s]})]);
+    let result = h.app.run("ai.status", json!({})).unwrap();
+    let rows = result["resultCards"][0]["stages"][0]["changes"].as_array().unwrap();
+    assert!(rows.iter().any(|r| r["control"] == "mask.7.component.0.op" && r["before"] == "Subtract" && r["actual"] == "Add"));
+    assert!(rows.iter().any(|r| r["control"] == "mask.7.component.0.component_invert" && r["before"] == "On" && r["actual"] == "Off"));
+    for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        h.app.ui.language = locale;
+        h.step();
+        if locale == crate::i18n::Locale::En {
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiParameters:combine-card"}), std::time::Duration::from_secs(10))["ok"], true);
+        }
+        for _ in 0..4 {
+            h.step();
+        }
+        let expected =
+            if locale == crate::i18n::Locale::En { ["Subtract → Add", "On → Off"] } else { ["减去 → 添加", "开启 → 关闭"] };
+        for literal in expected {
+            assert!(h.painted_text().iter().any(|t| t == literal), "{literal}");
+        }
+        screenshot(&mut h, &format!("combine-{}", locale.code()));
+    }
+}
+#[test]
+fn zero_chunk_payload_returns_an_error_and_keeps_valid_history_readable() {
+    use lightcraft_engine::companion::storage::{DisplayRecord, DisplayScan, HistoryCursor};
+    for background in [false, true] {
+        let mut files = MemStore::new();
+        files.background = background;
+        let mut session = Session::new();
+        session
+            .open_library_in(
+                LibraryStores { catalog: Box::new(MemStore::new()), files: Box::new(files.clone()), dir: "memory".into(), on_disk: false },
+                true,
+            )
+            .unwrap();
+        let photo = session.active().unwrap();
+        session.save_companion_conversation(photo,json!({"schema_version":2,"messages":[{"role":"assistant","text":"VALID_LAYOUT_MESSAGE","local_round_id":"bad-layout"}],"round_records":[{"local_round_id":"bad-layout","stages":[stage("initial",0.0,0.35)]}],"rounds":[]})).unwrap();
+        let mut header = session.companion_photo_header(photo).unwrap().unwrap();
+        let root = header.record_root.as_mut().unwrap();
+        let mut index: Value = serde_json::from_slice(&files.get(&root.key).unwrap()).unwrap();
+        index["entries"][0]["chunk_payload"] = json!(0);
+        let bytes = serde_json::to_vec(&index).unwrap();
+        root.digest = lightcraft_preview::hash_bytes(&bytes).to_string();
+        files.set(&root.key, bytes);
+        // A checksum-consistent malformed input, published only in the isolated filesystem adapter.
+        let head_key = format!("companion/v2/photos/{}/HEAD.json", photo.0);
+        let mut head: Value = serde_json::from_slice(&files.get(&head_key).unwrap()).unwrap();
+        let manifest = serde_json::to_vec(&header).unwrap();
+        files.set(head["manifest"].as_str().unwrap(), manifest.clone());
+        head["manifest_digest"] = json!(lightcraft_preview::hash_bytes(&manifest).to_string());
+        files.set(&head_key, serde_json::to_vec(&head).unwrap());
+        let mut scan = DisplayScan::new(header.clone(), DisplayRecord::Round(0));
+        let error = session.companion_display_step(&mut scan).expect_err("invalid layout must error without panicking");
+        assert!(error.to_string().contains("invalid chunk layout"));
+        assert!(session.companion_rounds_display_at(&header, 0, 32).is_err());
+        if let Some(mut reader) = session.companion_reader(&header).unwrap() {
+            assert!(reader.rounds_display(0, 32).is_err());
+        }
+        let page = session.companion_history_slice_at(&header, HistoryCursor::default(), 256 * 1024).unwrap();
+        assert_eq!(page.records[0]["text"], "VALID_LAYOUT_MESSAGE");
+        let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1400.0, 1000.0], 1.0);
+        h.app.run("ai.open", json!({})).unwrap();
+        let status = ready(&mut h);
+        assert!(status["text"].as_str().unwrap().contains("VALID_LAYOUT_MESSAGE"));
+        assert!(status["text"].as_str().unwrap().contains("invalid chunk layout"));
+        assert_eq!(status["resultCards"], json!([]));
+    }
+}
+#[test]
+fn oversized_legacy_parameters_are_explicitly_unavailable_without_losing_the_result() {
+    for background in [false, true] {
+        let mut before = lightcraft_develop::DevelopSettings::default();
+        before.masks.push(lightcraft_develop::Mask {
+            id: 7,
+            components: vec![lightcraft_develop::MaskComponent {
+                name: None,
+                op: Default::default(),
+                invert: false,
+                shape: lightcraft_develop::MaskShape::Brush {
+                    strokes: vec![lightcraft_develop::BrushStroke {
+                        points: (0..12000).map(|_| lightcraft_geom::Point::new(0.1, 0.2)).collect(),
+                        ..Default::default()
+                    }],
+                },
+            }],
+            ..Default::default()
+        });
+        let mut after = before.clone();
+        after.light.exposure = 0.35;
+        let mut files = MemStore::new();
+        files.background = background;
+        let mut session = Session::new();
+        session
+            .open_library_in(LibraryStores { catalog: Box::new(MemStore::new()), files: Box::new(files), dir: "memory".into(), on_disk: false }, true)
+            .unwrap();
+        let photo = session.active().unwrap();
+        session.save_companion_conversation(photo,json!({"schema_version":2,"messages":[{"role":"assistant","text":"VALID_LEGACY_MESSAGE","local_round_id":"legacy-detail"}],"round_records":[{"local_round_id":"legacy-detail","local_terminal":"completed","recent_complete_result":after,"stages":[{"stage":"initial","reason":"Brighter","before_state":before,"proposed_state":after,"applied_state":after,"locally_published":true,"delivery_state":"confirmed"}]}],"rounds":[]})).unwrap();
+        let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1400.0, 1000.0], 1.0);
+        h.app.run("ai.open", json!({})).unwrap();
+        let status = ready(&mut h);
+        assert!(status["text"].as_str().unwrap().contains("VALID_LEGACY_MESSAGE"));
+        let stage = &status["resultCards"][0]["stages"][0];
+        assert_eq!(stage["status"], "applied");
+        assert_eq!(stage["parameterDetailsUnavailable"], true, "missing detail must not pretend to be no parameter changes");
+        for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+            h.app.ui.language = locale;
+            for _ in 0..4 {
+                h.step();
+            }
+            let expected =
+                if locale == crate::i18n::Locale::En { "Historical parameter details are unavailable." } else { "历史参数详情不可用。" };
+            assert!(h.painted_text().iter().any(|t| t == expected), "{expected}");
+            screenshot(&mut h, &format!("legacy-detail-{background}-{}", locale.code()));
+        }
+    }
+}
+#[test]
+fn failed_proposal_retained_categorical_value_uses_the_selected_language() {
+    let before = lightcraft_develop::DevelopSettings::default();
+    let mut proposed = before.clone();
+    proposed.crop.flip_h = true;
+    let s = json!({"stage":"initial","before_state":before,"proposed_state":proposed,"locally_published":false,"execution_outcome":"failed","delivery_state":"not_sent"});
+    let (mut h, _) = headless(vec![json!({"local_round_id":"failed-category","stages":[s],"local_terminal":"failed"})]);
+    for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        h.app.ui.language = locale;
+        for _ in 0..4 {
+            h.step();
+        }
+        if locale == crate::i18n::Locale::En {
+            assert_eq!(
+                h.request("ui.clickWidget", json!({"id":"button:aiParameters:failed-category"}), std::time::Duration::from_secs(10))["ok"],
+                true
+            );
+        }
+        for _ in 0..4 {
+            h.step();
+        }
+        let expected = if locale == crate::i18n::Locale::En { "Off" } else { "关闭" };
+        assert!(h.painted_text().iter().any(|t| t == expected), "retained actual: {expected}");
+        if locale == crate::i18n::Locale::ZhHans {
+            assert!(!h.painted_text().iter().any(|t| t == "Off"));
+        }
+        screenshot(&mut h, &format!("failed-category-{}", locale.code()));
+    }
+}

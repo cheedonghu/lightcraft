@@ -2110,5 +2110,9 @@
   "The AI draft is unavailable.": "AI 草稿不可用。",
   "The AI draft belongs to a closed library.": "AI 草稿属于已关闭的图库。",
   "The complete AI history exceeds the service limit. Local history is retained.": "AI 完整历史超过服务限制，完整本地历史仍保留，未删减。",
-  "Loading draft…": "正在读取草稿…"
+  "Loading draft…": "正在读取草稿…",
+  "Samples": "采样颜色",
+  "Combination": "组合方式",
+  "On": "开启",
+  "Historical parameter details are unavailable.": "历史参数详情不可用。"
 }

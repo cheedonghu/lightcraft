@@ -25,6 +25,8 @@ pub(super) struct Stage {
     pub status: String,
     pub feedback: String,
     pub changes: Vec<Change>,
+    #[serde(rename = "parameterDetailsUnavailable")]
+    pub parameter_details_unavailable: bool,
 }
 #[derive(Clone, Serialize)]
 pub(super) struct Change {
@@ -154,6 +156,8 @@ pub(super) fn from_record(record: &Value, current: Option<&DevelopSettings>) -> 
                     }
                     .into(),
                     changes,
+                    parameter_details_unavailable: s["parameter_details_unavailable"] == true
+                        && !(s["display_before"]["values"].is_array() && s["display_target"]["values"].is_array()),
                 }
             })
             .collect(),
@@ -178,6 +182,9 @@ pub(super) fn show(ui: &mut egui::Ui, card: &Card) -> bool {
             super::composer_widget(ui, &format!("ai:stage:{}:{}", card.local_round_id, stage.kind), row.response.rect);
             if stage.status == "applied" && stage.feedback == "unconfirmed" {
                 ui.label(tr("Applied result retained; feedback was not confirmed."));
+            }
+            if stage.parameter_details_unavailable {
+                ui.label(tr("Historical parameter details are unavailable."));
             }
             if !stage.reason.is_empty() {
                 ui.label(&stage.reason);
@@ -208,7 +215,7 @@ pub(super) fn show(ui: &mut egui::Ui, card: &Card) -> bool {
                         if stage.status != "applied" {
                             ui.label(tr("Proposed target"));
                             ui.label(tr("Actual retained value"));
-                            ui.label(&change.actual);
+                            ui.label(tr(&change.actual));
                         }
                     });
                 }
@@ -330,6 +337,13 @@ fn composition(settings: &DevelopSettings, compare: Option<&DevelopSettings>) ->
             if old_masks.get(&mask.id).and_then(|m| m.components.get(i)) == Some(component) {
                 continue;
             }
+            let op = match component.op {
+                lightcraft_develop::MaskOp::Add => "Add",
+                lightcraft_develop::MaskOp::Subtract => "Subtract",
+                lightcraft_develop::MaskOp::Intersect => "Intersect",
+            };
+            rows.push(serde_json::json!({"control":format!("mask.{}.component.{i}.op",mask.id),"label":"Combination","value":op,"unit":"","context":mask.name}));
+            rows.push(serde_json::json!({"control":format!("mask.{}.component.{i}.component_invert",mask.id),"label":"Invert Component","value":if component.invert {"On"} else {"Off"},"unit":"","context":mask.name}));
             if let Ok(Value::Object(shape)) = serde_json::to_value(&component.shape) {
                 if let Some(strokes) = shape.get("strokes").and_then(Value::as_array) {
                     for (stroke_index, stroke) in strokes.iter().enumerate() {
@@ -396,7 +410,19 @@ fn composition(settings: &DevelopSettings, compare: Option<&DevelopSettings>) ->
                     } else if let (Some(x), Some(y)) = (value["x"].as_f64(), value["y"].as_f64()) {
                         (format!("({:.1}, {:.1})", x * 100.0, y * 100.0), "%")
                     } else if let Some(v) = value.as_array() {
-                        (v.len().to_string(), "")
+                        if key == "samples" {
+                            let text = v
+                                .iter()
+                                .filter_map(|s| s.as_array())
+                                .filter_map(|s| {
+                                    Some(format!("({:.2}, {:.2}, {:.2})", s.first()?.as_f64()?, s.get(1)?.as_f64()?, s.get(2)?.as_f64()?))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            (text, "OkLab")
+                        } else {
+                            (v.len().to_string(), "")
+                        }
                     } else {
                         continue;
                     };
