@@ -101,6 +101,9 @@ impl HistoryProjection {
                 if !matches!(mime, "image/jpeg" | "image/png") {
                     return Err(invalid());
                 }
+                if image.get("attachment").is_some() && image.get("data").is_some() {
+                    return Err(invalid());
+                }
                 if let Some(name) = image.get("attachment").and_then(Value::as_str)
                     && (image.get("data").is_some()
                         || !(name.starts_with(&format!("companion/v2/photos/{}/previews/", self.photo.0))

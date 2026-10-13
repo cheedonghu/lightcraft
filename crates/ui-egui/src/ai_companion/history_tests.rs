@@ -284,3 +284,37 @@ fn valid_legacy_empty_optional_message_fields_follow_go_wire_semantics() {
     assert_eq!(result[1]["text"], "");
     assert_eq!(result.len(), 2);
 }
+
+#[test]
+fn start_command_refuses_ambiguous_legacy_image_and_allows_next_ordinary_edit() {
+    use lightcraft_catalog::MemStore;
+    use lightcraft_engine::library::LibraryStores;
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let stores = || LibraryStores { catalog: Box::new(catalog.clone()), files: Box::new(files.clone()), dir: "memory".into(), on_disk: false };
+    let mut session = lightcraft_engine::Session::new();
+    session.open_library_in(stores(), true).unwrap();
+    let photo = session.active().unwrap();
+    session.close_library().unwrap();
+    let bytes = lightcraft_engine::export::encode_image(
+        &lightcraft_raster::Rgba8::filled(16, 16, [12, 30, 50, 255]),
+        &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+    )
+    .unwrap();
+    files.set("companion/state.json", serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():{"schema_version":1,"messages":[{"role":"user","text":"keep readable history","images":[{"mime_type":"image/png","data":Base64::encode_string(&bytes),"attachment":123}]}],"rounds":[]}}})).unwrap());
+    let mut session = lightcraft_engine::Session::new();
+    session.open_library_in(stores(), false).unwrap();
+    let mut app = LightcraftApp::new(session, crate::Services::default());
+    let (connection, requests, _events) = network::test_connection();
+    app.ai.generation = app.session.library_generation();
+    app.ai.connection = Some(connection);
+    let mut h = crate::headless::Headless::new(app, [1600.0, 1000.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    h.step();
+    h.step();
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
+    let error = h.app.run("ai.start", json!({"prompt":"current request"})).unwrap_err();
+    assert!(error.contains("history is incomplete or invalid"), "{error}");
+    assert!(requests.try_recv().is_err(), "no creation request should reach the transport adapter");
+    h.app.run("develop.set", json!({"control":"light.exposure","value":0.7})).unwrap();
+    assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.7);
+}
