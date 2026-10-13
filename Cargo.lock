@@ -3215,6 +3215,7 @@ name = "lightcraft-engine"
 version = "0.7.0"
 dependencies = [
  "ab_glyph",
+ "base64ct",
  "crc32fast",
  "getrandom 0.4.3",
  "harfrust",

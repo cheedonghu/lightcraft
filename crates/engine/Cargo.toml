@@ -30,6 +30,7 @@ miniz_oxide = { workspace = true }
 lightcraft-merge = { workspace = true }
 lightcraft-geocode = { workspace = true }
 rayon = { workspace = true }
+base64ct = { version = "1.8", features = ["alloc"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 crc32fast = { workspace = true }

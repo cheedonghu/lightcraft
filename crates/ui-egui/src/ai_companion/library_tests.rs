@@ -76,7 +76,7 @@ fn invalid_library_keeps_the_round_and_new_library_archives_it() {
     assert!(!app.ai.is_busy(photo));
     assert_ne!(app.session.library_generation(), generation);
     app.run("app.openLibrary", json!({"path":old.to_string_lossy()})).unwrap();
-    let archive = app.session.photo_companion(photo).unwrap().unwrap();
+    let archive = app.session.load_companion_conversation(photo).unwrap().unwrap();
     assert_eq!(archive["messages"][0]["text"], "keep this conversation");
     assert!(archive["messages"].as_array().unwrap().iter().any(|m| m["role"] == "tool" && m["tool_call_id"] == "pending"));
     app.session.close_library().unwrap();
