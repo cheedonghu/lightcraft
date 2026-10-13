@@ -597,33 +597,39 @@ fn cell(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, r: Rect, square
         crate::state::GridBadges::Always => true,
         crate::state::GridBadges::Never => false,
     };
+    let show_modified = app.ui.settings.grid_badges != crate::state::GridBadges::Never && photo.is_edited();
     let badge_bar = Rect::from_min_max(pos2(img_rect.left(), img_rect.bottom() - 24.0), img_rect.right_bottom());
     if !square && photo.label.is_some() {
         // Justified photos fill the whole cell, so the label shows as a translucent tinted footer
         // over the photo's bottom edge (opaque, it would hide 24 px of every labelled photo).
         p.rect_filled(badge_bar, 0.0, crate::theme::label_background(t.cell, photo.label, selected).gamma_multiply(0.7));
     }
-    if show_badges {
+    if show_badges || show_modified {
         let bar = badge_bar;
         if (resp.hovered() || selected) && (square || photo.label.is_none()) {
             p.rect_filled(bar, 0.0, Color32::from_black_alpha(120));
         }
         let mut x = bar.left() + 6.0;
-        for i in 0..photo.rating {
-            paint(p, Rect::from_min_size(pos2(x + i as f32 * 13.0, bar.center().y - 6.0), vec2(12.0, 12.0)), Icon::StarFilled, t.star);
-        }
-        x += photo.rating as f32 * 13.0 + 4.0;
-        match photo.flag {
-            Flag::Pick => paint(p, Rect::from_min_size(pos2(x, bar.center().y - 7.0), vec2(14.0, 14.0)), Icon::FlagPick, t.pick),
-            Flag::Reject => paint(p, Rect::from_min_size(pos2(x, bar.center().y - 7.0), vec2(14.0, 14.0)), Icon::FlagReject, t.reject),
-            Flag::None => {}
+        if show_badges {
+            for i in 0..photo.rating {
+                paint(p, Rect::from_min_size(pos2(x + i as f32 * 13.0, bar.center().y - 6.0), vec2(12.0, 12.0)), Icon::StarFilled, t.star);
+            }
+            x += photo.rating as f32 * 13.0 + 4.0;
+            match photo.flag {
+                Flag::Pick => paint(p, Rect::from_min_size(pos2(x, bar.center().y - 7.0), vec2(14.0, 14.0)), Icon::FlagPick, t.pick),
+                Flag::Reject => paint(p, Rect::from_min_size(pos2(x, bar.center().y - 7.0), vec2(14.0, 14.0)), Icon::FlagReject, t.reject),
+                Flag::None => {}
+            }
         }
         let mut right = bar.right();
-        if photo.is_edited() {
-            paint(p, Rect::from_min_size(pos2(right - 20.0, bar.center().y - 7.0), vec2(14.0, 14.0)), Icon::Sliders, t.text_label);
+        if show_modified {
+            let br = Rect::from_min_size(pos2(right - 20.0, bar.center().y - 7.0), vec2(14.0, 14.0));
+            paint(p, br, Icon::Sliders, t.text_label);
+            register(ui.ctx(), format!("badge:modified:grid:{}", id.0), br);
+            ui.interact(br, egui::Id::new(("modified-grid-badge", id.0)), Sense::hover()).on_hover_text(crate::i18n::tr("Has Edits"));
             right -= 20.0;
         }
-        if let Some(l) = photo.label {
+        if show_badges && let Some(l) = photo.label {
             p.circle(pos2(right - 12.0, bar.center().y), 5.0, label_color(l), Stroke::new(1.0, Color32::from_black_alpha(120)));
         }
     }

@@ -387,6 +387,20 @@ impl Photo {
             None => self.camera_defaults(),
         }
     }
+    /// The logical baseline of a full Reset, including the default import look. A decoder can
+    /// supply a newer as-shot reference without replacing a default preset's Custom WB. The
+    /// baseline belongs to the source photo, so virtual copies keep it when inheriting edits.
+    pub fn reset_defaults(&self, as_shot: Option<(f64, f64)>) -> DevelopSettings {
+        let mut d = self.import_defaults();
+        d.process = lightcraft_develop::ProcessVersion::LATEST;
+        if d.wb.mode == WbMode::AsShot
+            && let Some((temp, tint)) = as_shot
+        {
+            d.wb.temp = temp;
+            d.wb.tint = tint;
+        }
+        d
+    }
     /// The built-in defaults for this photo, before any user default preset: raws start from
     /// their as-shot white balance; embedded lens corrections on when the file has them. They
     /// carry the photo's own rendering process ([`lightcraft_develop::ProcessVersion`]): which
@@ -452,14 +466,24 @@ impl Photo {
     pub fn in_library(&self) -> bool {
         !self.deleted && !self.local
     }
-    /// Edited by the user: settings differ from what import gave the photo.
+    /// Current logical settings differ from the full Reset baseline, regardless of edit source.
     pub fn is_edited(&self) -> bool {
-        let mut defaults = self.import_defaults();
-        // As Shot reads the source's current WB; stored numbers can predate a decoder update.
-        if self.develop.wb.mode == WbMode::AsShot && defaults.wb.mode == WbMode::AsShot {
+        let mut defaults = self.reset_defaults(None);
+        // A process upgrade is a system rendering choice, not a logical parameter edit.
+        defaults.process = self.develop.process;
+        let reference = lightcraft_develop::white_balance::WbReference {
+            kelvin: self.develops_raw() && !self.relative_wb(),
+            legacy_relative: self.fitted_look(),
+            as_shot: self.as_shot_wb.unwrap_or((5500.0, 0.0)),
+        };
+        // AsShot reads the source's current reference. Custom values keep their differences, but
+        // converting an old relative default look to its equivalent Kelvin values is not an edit.
+        if (self.develop.wb.mode == WbMode::AsShot && defaults.wb.mode == WbMode::AsShot)
+            || self.develop.wb.normalized(reference) == defaults.wb.normalized(reference)
+        {
             defaults.wb = self.develop.wb;
         }
-        *self.develop != defaults && !self.develop.is_unedited()
+        *self.develop != defaults
     }
     /// Capture time if known, else import time (sort key).
     pub fn date(&self) -> &str {
@@ -510,6 +534,65 @@ mod edited_tests {
     use lightcraft_develop::WbScale;
 
     #[test]
+    fn modification_state_uses_reset_look_and_preserves_custom_white_balance() {
+        let mut p = Photo::new(PhotoId(1), Source::Demo { scene: 0 }, "a.jpg", "JPEG", 10, 10, "2026-10-01T00:00:00");
+        let mut custom = DevelopSettings::default();
+        custom.wb.mode = WbMode::Custom;
+        custom.wb.temp = 5800.0;
+        p.develop = Arc::new(custom);
+        assert!(p.is_edited(), "WB alone is an edit even on a rendered photo");
+
+        let mut look = DevelopSettings::default();
+        look.light.exposure = 0.3;
+        p.import_look = Some(Arc::new(look.clone()));
+        p.develop = Arc::new(look);
+        assert!(!p.is_edited(), "the default import look is the Reset baseline");
+        p.develop = Arc::new(DevelopSettings::default());
+        assert!(p.is_edited(), "zero parameters differ from a nonzero default look");
+    }
+
+    #[test]
+    fn retained_disabled_parameters_and_metadata_have_distinct_modification_state() {
+        let mut p = Photo::new(PhotoId(1), Source::Demo { scene: 0 }, "a.jpg", "JPEG", 10, 10, "2026-10-01T00:00:00");
+        p.rating = 4;
+        p.flag = Flag::Pick;
+        p.meta.caption = "metadata only".into();
+        assert!(!p.is_edited());
+        let mut d = (*p.develop).clone();
+        d.wb.mode = WbMode::Custom;
+        d.disabled_sections.push("wb".into());
+        p.develop = Arc::new(d);
+        assert!(p.is_edited(), "disabled edits remain logical edits");
+        let mut d = DevelopSettings::default();
+        d.masks.push(lightcraft_develop::Mask { visible: false, ..Default::default() });
+        p.develop = Arc::new(d);
+        assert!(p.is_edited(), "a retained disabled, zero-effect mask is still an edit");
+    }
+
+    #[test]
+    fn reset_baseline_keeps_raw_defaults_and_custom_import_white_balance() {
+        let mut p = Photo::new(PhotoId(1), Source::Demo { scene: 0 }, "a.dng", "DNG", 10, 10, "2026-10-01T00:00:00");
+        p.kind = MediaKind::Raw;
+        p.as_shot_wb = Some((5200.0, 4.0));
+        p.embedded_lens = Some(lightcraft_develop::EmbeddedLens::default());
+        let reset = p.reset_defaults(Some((4986.0, -2.0)));
+        assert_eq!((reset.wb.temp, reset.wb.tint, reset.wb.scale), (4986.0, -2.0, WbScale::Kelvin));
+        assert_eq!((reset.detail.sharpen_amount, reset.detail.nr_color), (40.0, 25.0));
+        assert!(reset.optics.lens_profile);
+        p.develop = Arc::new(reset);
+        assert!(!p.is_edited(), "a decoder reference refresh does not create an edit");
+
+        let mut look = p.camera_defaults();
+        look.wb.mode = WbMode::Custom;
+        look.wb.temp = 5800.0;
+        p.import_look = Some(Arc::new(look));
+        let reset = p.reset_defaults(Some((4986.0, -2.0)));
+        assert_eq!((reset.wb.mode, reset.wb.temp), (WbMode::Custom, 5800.0));
+        p.develop = Arc::new(reset);
+        assert!(!p.is_edited(), "an intentional default Custom WB belongs to the baseline");
+    }
+
+    #[test]
     fn raw_with_import_settings_is_not_edited() {
         let mut p = Photo::new(PhotoId(1), Source::Demo { scene: 0 }, "a.arw", "ARW", 10, 10, "2026-10-01T00:00:00");
         p.as_shot_wb = Some((5200.0, 4.0));
@@ -520,7 +603,9 @@ mod edited_tests {
         p.develop = Arc::new(d);
         assert!(p.is_edited());
         p.develop = Arc::new(DevelopSettings::default());
-        assert!(!p.is_edited(), "a full reset is unedited too");
+        assert!(p.is_edited(), "generic defaults differ from the source Reset baseline");
+        p.develop = Arc::new(p.reset_defaults(None));
+        assert!(!p.is_edited(), "the source-aware Reset is unedited");
     }
 
     #[test]
