@@ -10,11 +10,17 @@ use serde_json::{Value, json};
 const SMALL: u64 = 32 * 1024;
 const BLOCK: u64 = 4 * 1024 * 1024;
 const PAGE_ITEMS: usize = 128;
-const PACK_ITEMS: usize = 64;
+const PACK_ITEMS: usize = 32;
 mod pagination;
+pub(super) mod reader_pins;
+mod recovery;
+mod retirement;
 use pagination::load_index;
 pub use pagination::{DisplayRecord, DisplayScan, HistoryCursor, HistoryItem, HistoryReader, HistorySlice, RoundSearch, record_size};
-pub(crate) use pagination::{TailUpdate, persist_tail};
+pub(crate) use pagination::{TailUpdate, persist_tail, retry_receipt};
+pub use reader_pins::HistoryRetention;
+pub use retirement::CleanupReport;
+pub(crate) use retirement::collect;
 
 const FORMAT: &str = "lightcraft-companion";
 
@@ -69,6 +75,8 @@ struct Entry {
     chunk_payload: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text_range: Option<[u64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preview_refs: Option<Vec<String>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Index {
@@ -83,7 +91,7 @@ struct Jump {
     root: IndexRoot,
     upper: u64,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingCommit {
     pub photo: PhotoId,
     pub transaction_id: String,
@@ -96,6 +104,10 @@ pub struct PendingCommit {
     reuse: Option<PhotoHeader>,
     #[serde(default)]
     revert_override: Option<Value>,
+    #[serde(default)]
+    content_digest: Option<String>,
+    #[serde(default)]
+    receipt: Option<Value>,
 }
 fn base(photo: PhotoId) -> String {
     format!("companion/v2/photos/{}", photo.0)
@@ -238,6 +250,24 @@ fn read_blob(store: &mut dyn Store, photo: PhotoId, first: &str, mut offset: u64
     }
     Ok(bytes)
 }
+/// Small complete attachment inventories permit bounded reclamation without
+/// materializing arbitrarily long message JSON. Oversized/unknown inventories
+/// conservatively retain preview ownership, never impose a local history quota.
+fn preview_inventory(value: &Value) -> Option<Vec<String>> {
+    let Some(images) = value.get("images") else { return Some(Vec::new()) };
+    let images = images.as_array()?;
+    let mut refs = Vec::new();
+    let mut size = 2usize;
+    for image in images {
+        let key = image.get("attachment")?.as_str()?;
+        size = size.checked_add(key.len().checked_add(4)?)?;
+        if size > 256 {
+            return None;
+        }
+        refs.push(key.to_owned());
+    }
+    Some(refs)
+}
 struct Writer<'a> {
     store: &'a mut dyn Store,
     pending: PendingCommit,
@@ -281,13 +311,14 @@ impl Writer<'_> {
                 self.block(&mut bytes, &mut offsets, &mut entries)?;
                 let mut entry = pagination::stream_record(self, record, length)?;
                 entry.text_range = pagination::text_range(record, None)?;
+                entry.preview_refs = preview_inventory(record);
                 entries.push(entry);
             } else {
                 let data = serde_json::to_vec(record).map_err(error)?;
                 if bytes.len().saturating_add(data.len()) as u64 > BLOCK {
                     self.block(&mut bytes, &mut offsets, &mut entries)?;
                 }
-                offsets.push((bytes.len() as u64, data.len(), digest(&data), pagination::text_range(record, None)?));
+                offsets.push((bytes.len() as u64, data.len(), digest(&data), pagination::text_range(record, None)?, preview_inventory(record)));
                 bytes.extend_from_slice(&data);
             }
             if offsets.len() + entries.len() >= PACK_ITEMS {
@@ -322,13 +353,18 @@ impl Writer<'_> {
         }
         Ok(jumps)
     }
-    fn block(&mut self, bytes: &mut Vec<u8>, offsets: &mut Vec<(u64, usize, String, Option<[u64; 2]>)>, entries: &mut Vec<Entry>) -> Result<()> {
+    fn block(
+        &mut self,
+        bytes: &mut Vec<u8>,
+        offsets: &mut Vec<(u64, usize, String, Option<[u64; 2]>, Option<Vec<String>>)>,
+        entries: &mut Vec<Entry>,
+    ) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         let key = self.file("blocks/", "bin", bytes)?;
-        for (offset, length, digest, text_range) in offsets.drain(..) {
-            entries.push(Entry { block: key.clone(), offset, length, digest, chunk_payload: None, text_range });
+        for (offset, length, digest, text_range, preview_refs) in offsets.drain(..) {
+            entries.push(Entry { block: key.clone(), offset, length, digest, chunk_payload: None, text_range, preview_refs });
         }
         bytes.clear();
         Ok(())
@@ -340,26 +376,11 @@ pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, expected_epoch: u64, 
         return Err(error("conversation epoch changed"));
     }
     let pending_key = format!("{}/pending.json", base(photo));
-    let existing = read::<PendingCommit>(store, &pending_key, SMALL)?;
-    let actual: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
-    let reusable = existing.filter(|p| actual.as_ref().map(|h| &h.transaction_id) != Some(&p.transaction_id));
-    let pending = if let Some(p) = reusable {
-        if !valid_transaction(&p.transaction_id)
-            || p.head.transaction_id != p.transaction_id
-            || p.head.manifest != format!("{}/manifest-{}.json", base(photo), p.transaction_id)
-            || p.photo != photo
-            || p.expected_epoch != expected_epoch
-            || p.old_head != actual
-        {
-            return Err(error("unresolved archive transaction; recovery required"));
-        }
-        p
-    } else {
-        let tx = super::LocalRoundId::new().map_err(error)?.as_str().to_owned();
-        let head = Head { manifest: format!("{}/manifest-{tx}.json", base(photo)), transaction_id: tx.clone(), manifest_digest: String::new() };
-        let old_head = actual;
-        PendingCommit { photo, transaction_id: tx, expected_epoch, old_head, head, reserved_files: 0, reuse: None, revert_override: None }
-    };
+    let fingerprint = recovery::fingerprint(conversation)?;
+    let (pending, complete) = recovery::prepare(store, photo, expected_epoch, &fingerprint)?;
+    if complete {
+        return Ok(pending);
+    }
     write(store, &pending_key, &pending)?;
     let mut writer = Writer { store, pending, sequence: 0 };
     let mut normalized = conversation.clone();
@@ -480,6 +501,15 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
     {
         return Err(error("invalid pending transaction"));
     }
+    let persisted: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(pending.photo)), SMALL)?;
+    let visible: Option<Head> = read(store, &format!("{}/HEAD.json", base(pending.photo)), SMALL)?;
+    if persisted.as_ref().is_some_and(|p| p != pending) || (persisted.is_none() && visible.as_ref() != Some(&pending.head)) {
+        return Err(error("pending transaction changed before commit"));
+    }
+    // A visible final reservation may still be the result of a failed sync.
+    if persisted.is_some() {
+        write(store, &format!("{}/pending.json", base(pending.photo)), pending)?;
+    }
     validate_key(pending.photo, &pending.head.manifest, "manifest-")?;
     let bytes = store.read_limited(&pending.head.manifest, SMALL).map_err(error)?.ok_or_else(|| error("staged manifest missing"))?;
     if digest(&bytes) != pending.head.manifest_digest {
@@ -520,16 +550,16 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
     let head_key = format!("{}/HEAD.json", base(pending.photo));
     // Retrying the same transaction after an ambiguous fsync is idempotent.
     let visible: Option<Head> = read(store, &head_key, SMALL)?;
-    if visible.as_ref() != Some(&pending.head) {
-        if visible != pending.old_head {
-            return Err(error("HEAD changed before commit"));
-        }
-        write(store, &head_key, &pending.head)?;
+    if visible.as_ref() != Some(&pending.head) && visible != pending.old_head {
+        return Err(error("HEAD changed before commit"));
     }
+    retirement::own(store, pending)?;
+    // Equality only proves visibility. Repeating the bounded atomic write is the
+    // durability confirmation after a possible rename/directory-sync error.
+    write(store, &head_key, &pending.head)?;
     let manifest = header(store, pending.photo)?.ok_or_else(|| error("committed manifest missing"))?;
     let metadata = pagination::metadata_raw(store, &manifest)?;
-    let live_revert: Option<Value> =
-        if pending.revert_override.is_some() { read(store, &format!("{}/revert.json", base(pending.photo)), SMALL)? } else { None };
+    let live_revert: Option<Value> = read(store, &format!("{}/revert.json", base(pending.photo)), SMALL)?;
     let revert = pending.revert_override.as_ref();
     let override_eligible = revert.map(|r| {
         r["eligible"] == true
@@ -539,16 +569,51 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
                     && current["eligible"] == true
             })
     });
+    let local_round_id = revert.and_then(|r| r.get("local_round_id")).or_else(|| metadata.pointer("/checkpoint/local_round_id"));
+    let invalidated = live_revert.as_ref().is_some_and(|r| {
+        r["eligible"] == false
+            && r.get("local_round_id") == local_round_id
+            && (r["transaction_id"] == pending.transaction_id || pending.old_head.as_ref().is_some_and(|h| r["transaction_id"] == h.transaction_id))
+    });
+    let eligible =
+        !invalidated && override_eligible.unwrap_or_else(|| metadata.pointer("/checkpoint/eligible").and_then(Value::as_bool).unwrap_or(false));
     write(
         store,
         &format!("{}/revert.json", base(pending.photo)),
-        &json!({"transaction_id":pending.transaction_id,"local_round_id":revert.and_then(|r|r.get("local_round_id")).or_else(||metadata.pointer("/checkpoint/local_round_id")),"eligible":override_eligible.unwrap_or_else(||metadata.pointer("/checkpoint/eligible").and_then(Value::as_bool).unwrap_or(false))}),
+        &json!({"transaction_id":pending.transaction_id,"local_round_id":local_round_id,"eligible":eligible}),
     )?;
-    // Cleanup cannot turn a visible valid commit into an archive-save error.
-    if let Err(e) = store.remove(&format!("{}/pending.json", base(pending.photo))) {
-        log::warn!("archive pending cleanup: {e}");
+    Ok(())
+}
+/// Ownership and HEAD are already durable. Pending removal is cleanup debt and
+/// can never reverse the accepted conversation commit.
+pub(crate) fn reconcile_visible_pending(store: &mut dyn Store, photo: PhotoId, known_published: Option<&str>) -> Result<()> {
+    let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    let Some(p) = p else { return Ok(()) };
+    let visible: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
+    recovery::validate(&p, photo, &visible)?;
+    if visible.as_ref() == Some(&p.head) {
+        let h = header(store, photo)?.ok_or_else(|| error("published manifest missing"))?;
+        if h.conversation_epoch != p.expected_epoch
+            || (known_published != Some(p.transaction_id.as_str()) && !retirement::publication_confirmed(store, &p)?)
+        {
+            return Err(error("publication confirmation unavailable; pending graph protected"));
+        }
+        // Repeat the small proof write after an ambiguous directory-sync error.
+        retirement::confirm_publication(store, &p)?;
+        store.remove(&format!("{}/pending.json", base(photo))).map_err(error)?;
     }
     Ok(())
+}
+pub(crate) fn finish_pending(store: &mut dyn Store, photo: PhotoId) -> Result<()> {
+    let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    if let Some(p) = p {
+        retirement::confirm_publication(store, &p)?;
+    }
+    store.remove(&format!("{}/pending.json", base(photo))).map_err(error)
+}
+pub(crate) fn published_pending_transaction(store: &mut dyn Store, photo: PhotoId) -> Result<Option<String>> {
+    let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    Ok(p.filter(|p| !p.head.manifest_digest.is_empty()).map(|p| p.transaction_id))
 }
 pub(crate) fn activate(store: &mut dyn Store) -> Result<()> {
     if let Some(root) = read::<Value>(store, STATE_FILE, SMALL)?
@@ -559,9 +624,42 @@ pub(crate) fn activate(store: &mut dyn Store) -> Result<()> {
     write(store, STATE_FILE, &json!({"format":FORMAT,"version":2,"layout":"photo-head-v2"}))
 }
 impl Session {
+    /// Retain a main-frame/resumable reader from capture until actual retirement.
+    pub fn retain_companion_history(&mut self, header: &PhotoHeader) -> Result<HistoryRetention> {
+        let library = self.library.as_mut().ok_or_else(|| error("library closed"))?;
+        let lock = library.retain_read_lock();
+        reader_pins::capture(&self.companion_archive.readers, library.files.as_mut(), header, lock)
+    }
+    /// A bounded cleanup timer needs future frames even after the last AI job ends.
+    pub fn companion_cleanup_pending(&self) -> bool {
+        !self.companion_archive.cleanup_photos.is_empty()
+            || !self.companion_archive.cleanup_waiting.is_empty()
+            || self.companion_archive.readers.has_releases()
+    }
+    pub fn companion_photo_cleanup_pending(&self, photo: PhotoId) -> bool {
+        self.companion_archive.cleanup_photos.contains(&photo)
+            || self.companion_archive.cleanup_waiting.contains(&photo)
+            || self.companion_archive.readers.photo_released(photo)
+    }
+    pub fn companion_cleanup_error(&self, photo: PhotoId) -> Option<&str> {
+        self.companion_archive.cleanup_errors.get(&photo).map(String::as_str)
+    }
+    pub fn companion_photo_unsaved(&self, photo: PhotoId) -> bool {
+        self.companion_archive.editors.dirty_for(photo) || self.companion_history_unsaved(photo)
+    }
+    pub fn companion_history_unsaved(&self, photo: PhotoId) -> bool {
+        self.companion_archive.tails.contains_key(&photo)
+            || self.companion_archive.dirty_photos.contains(&photo)
+            || self.companion_archive.revert_dirty.contains(&photo)
+            || self.companion_archive.receipts.contains_key(&photo)
+    }
     pub fn companion_photo_header(&mut self, photo: PhotoId) -> Result<Option<PhotoHeader>> {
         let lib = self.library.as_mut().ok_or_else(|| error("library closed"))?;
-        header(lib.files.as_mut(), photo)
+        let h = header(lib.files.as_mut(), photo)?;
+        if h.is_some() && self.companion_archive.v2 {
+            self.companion_archive.cleanup_photos.insert(photo);
+        }
+        Ok(h)
     }
     pub fn companion_messages_page(&mut self, photo: PhotoId, cursor: u64, budget: usize) -> Result<RecordPage> {
         let h = self.companion_photo_header(photo)?.ok_or_else(|| error("conversation missing"))?;
@@ -621,6 +719,11 @@ impl Session {
             activate(store)?;
             self.companion_archive.v2 = true;
         }
+        self.companion_archive.cleanup_published.insert(pending.photo, pending.transaction_id.clone());
+        if let Err(e) = finish_pending(store, pending.photo) {
+            self.companion_archive.cleanup_errors.insert(pending.photo, e.to_string());
+        }
+        self.companion_archive.cleanup_photos.insert(pending.photo);
         Ok(CommitReceipt { photo: pending.photo, conversation_epoch: pending.expected_epoch, transaction_id: pending.transaction_id.clone() })
     }
     pub fn save_companion_conversation(&mut self, photo: PhotoId, conversation: Value) -> Result<()> {
@@ -648,7 +751,11 @@ impl Session {
                 // payload. Successful full-value compatibility saves are not cached.
                 self.companion_archive.photos.remove(&photo);
                 self.companion_archive.dirty_photos.remove(&photo);
-                if self.companion_archive.dirty_photos.is_empty() && self.companion_archive.revert_dirty.is_empty() {
+                if self.companion_archive.dirty_photos.is_empty()
+                    && self.companion_archive.revert_dirty.is_empty()
+                    && self.companion_archive.tails.is_empty()
+                    && self.companion_archive.receipts.is_empty()
+                {
                     self.companion_archive.error = None;
                 }
                 Ok(())
@@ -763,7 +870,14 @@ pub(crate) fn invalidate_revert(store: &mut dyn Store, photos: &std::collections
     for photo in photos {
         let result = (|| {
             if let Some(h) = header(store, *photo)? {
-                write(store, &format!("{}/revert.json", base(*photo)), &json!({"transaction_id":h.transaction_id,"eligible":false}))?;
+                let key = format!("{}/revert.json", base(*photo));
+                let mut guard: Value = read(store, &key, SMALL)?.unwrap_or_else(|| json!({}));
+                if !guard.is_object() {
+                    return Err(error("unknown revert guard protected"));
+                }
+                guard["transaction_id"] = json!(h.transaction_id);
+                guard["eligible"] = json!(false);
+                write(store, &key, &guard)?;
             }
             Ok(())
         })();
