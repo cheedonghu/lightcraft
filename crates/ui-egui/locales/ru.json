@@ -2176,5 +2176,19 @@
   "Add a model file…": "Add a model file…",
   "Set up name suggestions…": "Set up name suggestions…",
   "Model installation failed": "Model installation failed",
-  "Face recognition is off. Turn it on to get name suggestions and see look-alike faces together.": "Face recognition is off. Turn it on to get name suggestions and see look-alike faces together."
+  "Face recognition is off. Turn it on to get name suggestions and see look-alike faces together.": "Face recognition is off. Turn it on to get name suggestions and see look-alike faces together.",
+  "AI Assistant": "AI Assistant",
+  "Ready for your request": "Ready for your request",
+  "AI Photo Companion": "AI Photo Companion",
+  "Please review this photo and optimize it naturally.": "Please review this photo and optimize it naturally.",
+  "Submitting…": "Submitting…",
+  "Waiting in the queue…": "Waiting in the queue…",
+  "Uploading photo context…": "Uploading photo context…",
+  "AI is analyzing the photo…": "AI is analyzing the photo…",
+  "Applying the edit plan…": "Applying the edit plan…",
+  "AI is reviewing the result…": "AI is reviewing the result…",
+  "Applying the correction…": "Applying the correction…",
+  "Stopping generation…": "Stopping generation…",
+  "Generation stopped; confirming submission cancellation…": "Generation stopped; confirming submission cancellation…",
+  "Generation stopped; keeping the latest complete result.": "Generation stopped; keeping the latest complete result."
 }

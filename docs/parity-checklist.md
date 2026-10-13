@@ -1,6 +1,6 @@
 # Lightroom parity checklist
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** patch (UX-11: complete legal model history and pre-create service budget validation; UX-04: round upload cancellation and priority stop controls; UX-05: source Reset baseline, logical WB normalization and consistent modified filters / thumbnail badges; statuses and summary counts unchanged) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** patch (UX-11: complete legal model history and pre-create service budget validation; UX-06: AI Assistant shares Tools with a fixed composer, independent message scrolling and explicit menu reveal; UX-04: priority cancellation and full-app feedback guard; UX-05: source Reset baseline and consistent modified filters / badges; statuses and summary counts unchanged) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
 
 The measured, row-by-row checklist: one row per Lightroom feature, menu item and shortcut, what we
 have and what is missing. It answers *does the feature exist?* (feature breadth). Whether it is good
@@ -574,7 +574,7 @@ visible menu bar yet: the menu model is only exposed through the control channel
 | MENU-PHOTO-DELETE | Delete N photos… | P0 | ✅ | `cmd:photo.delete` | no confirmation; static label |
 | MENU-PHOTO-MOVETOCLOUD | Move/copy to cloud | OOS | 🚫 | | |
 | MENU-WINDOW-MINIMIZE | Minimize / zoom | P1 | ✅ | `apps/lightcraft/src/native_menu.rs` | the system's Minimize (⌘M) and Zoom items at the top of Window |
-| MENU-WINDOW-PANELS | Panel switches | P0 | ✅ | `cmd:panel.edit`, `cmd:panel.crop`, `cmd:panel.remove`, `cmd:panel.masking`, `cmd:panel.presets`, `cmd:panel.versions` | |
+| MENU-WINDOW-PANELS | Panel switches | P0 | ✅ | `cmd:panel.edit`, `cmd:panel.crop`, `cmd:panel.remove`, `cmd:panel.masking`, `cmd:panel.presets`, `cmd:panel.versions`, `cmd:panel.ai`, `cmd:ai.open` | AI Assistant shares Tools; its menu opens and reveals hidden/collapsed Tools without changing the photo view. Messages scroll independently of stage/input/actions (`crates/ui-egui/src/ai_companion/panel_tests.rs`). |
 | MENU-WINDOW-BRINGFRONT | Bring all to front | P2 | ✅ | `apps/lightcraft/src/native_menu.rs` | the system's item at the end of Window |
 | MENU-HELP-HELP | Help | P2 | ✅ | `cmd:app.help` | opens the documentation |
 | MENU-HELP-TUTORIALS | Tutorials | OOS | 🚫 | | |
@@ -795,6 +795,7 @@ Latin stays upright. Advanced Japanese composition remains open. Regression cove
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | patch | UX-06: MENU-WINDOW-PANELS documents the shared AI Assistant, idempotent explicit menu reveal, and fixed composer. Statuses and summary counts unchanged. |
 | 2026-10-13 | patch | UX-04: PC-01 records irreversible request cancellation, reserved Stop delivery and safe uncertain-creation retirement; status and summary counts unchanged. |
 | 2026-10-13 | patch | UX-05: LR-IMP-RAWDEFAULT and LR-FILT-TYPE document source Reset / logical WB comparison; LR-VIEW-PHOTOGRID and LR-VIEW-FILMSTRIP document consistent modified badges and explicit visibility settings. Statuses and summary counts unchanged. |
 | 2026-10-11 | minor | KEY-SLIDER-TYPE: honor immediate Return/Escape and keep typed keys in the value editor; add regression references |

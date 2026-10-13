@@ -82,7 +82,7 @@ fn actual_checkbox_can_revoke_during_a_queued_task_in_both_locales() {
             .unwrap()
         }));
         app.ai = state;
-        app.ai.open = true;
+        app.run("ai.open", json!({})).unwrap();
         app.ui.settings.gpu = false;
         app.ui.language = locale;
         let identity = app.ai.jobs.get(&photo).unwrap().identity.clone();
@@ -226,7 +226,7 @@ fn actual_checkbox_shows_cancelling_until_an_unadmitted_submission_is_safe() {
             .unwrap()
         }));
         app.ai = state;
-        app.ai.open = true;
+        app.run("ai.open", json!({})).unwrap();
         app.ui.settings.gpu = false;
         app.ui.language = locale;
         let gate = app.ai.jobs.get(&photo).unwrap().cancel.clone();
