@@ -16,11 +16,13 @@ mod identity_tests;
 #[path = "ai_companion/library_tests.rs"]
 mod library_tests;
 mod network;
+#[cfg(test)]
+mod persistence_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::i18n::tr;
 use base64ct::{Base64, Encoding};
@@ -44,6 +46,9 @@ pub struct State {
     #[cfg(test)]
     next_connection: Option<network::Connection>,
     conversations: BTreeMap<PhotoId, Conversation>,
+    pending_local_saves: BTreeSet<PhotoId>,
+    local_save_retry_at: Option<Instant>,
+    local_save_after_frame: Option<u64>,
     jobs: BTreeMap<PhotoId, Job>,
     workers: BTreeMap<PhotoId, Arc<AtomicBool>>,
     tx: mpsc::SyncSender<WorkerMessage>,
@@ -64,6 +69,9 @@ impl Default for State {
             #[cfg(test)]
             next_connection: None,
             conversations: BTreeMap::new(),
+            pending_local_saves: BTreeSet::new(),
+            local_save_retry_at: None,
+            local_save_after_frame: None,
             jobs: BTreeMap::new(),
             workers: BTreeMap::new(),
             tx,
@@ -71,14 +79,29 @@ impl Default for State {
         }
     }
 }
-#[derive(Default)]
 struct Conversation {
     scope: Option<PhotoScope>,
+    schema_version: u64,
+    records: Vec<Value>,
     messages: Vec<Value>,
     rounds: Vec<Value>,
     pending: BTreeMap<String, String>,
     notice: String,
     checkpoint: Option<Checkpoint>,
+}
+impl Default for Conversation {
+    fn default() -> Self {
+        Self {
+            scope: None,
+            schema_version: 2,
+            records: Vec::new(),
+            messages: Vec::new(),
+            rounds: Vec::new(),
+            pending: BTreeMap::new(),
+            notice: String::new(),
+            checkpoint: None,
+        }
+    }
 }
 #[derive(Clone)]
 struct Checkpoint {
@@ -286,7 +309,8 @@ impl State {
             },
         );
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
-        conversation.messages.push(json!({"role":"user","text":prompt,"local_round_id":identity.local_round_id}));
+        conversation.records.push(json!({"local_round_id":identity.local_round_id,"photo_id":photo.0,"request_text":prompt,"submission_seq":identity.submission_seq,"connection_generation":identity.connection_generation,"runtime_library_generation":identity.scope.library_generation,"original":self.jobs.get(&photo).map(|j| &j.checkpoint.original),"stages":[],"phase":"submitting"}));
+        conversation.messages.push(json!({"role":"user","text":prompt,"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request"}));
         conversation.notice = "正在提交…".into();
         self.save(app, photo)?;
         Ok(json!({"started":true,"photo":photo.0,"localRoundId":identity.local_round_id}))
@@ -322,11 +346,27 @@ impl State {
         self.consent = consent;
         if !consent {
             let photos: Vec<_> = self.jobs.keys().copied().collect();
+            self.pending_local_saves.extend(photos.iter().copied());
             for photo in photos {
                 self.stop(photo)?;
             }
         }
         Ok(())
+    }
+    fn defer_local_saves_for_feedback(&mut self, ctx: &egui::Context) {
+        self.local_save_after_frame = Some(ctx.cumulative_frame_nr());
+    }
+    fn flush_local_saves(&mut self, app: &mut LightcraftApp) -> Result<(), String> {
+        let mut failure = None;
+        for photo in self.pending_local_saves.iter().copied().collect::<Vec<_>>() {
+            if let Err(error) = self.save(app, photo) {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     fn close_connection(&self) {
         if let Some(connection) = &self.connection {
@@ -364,6 +404,33 @@ impl State {
         {
             if !job.plans.is_empty() {
                 conversation.checkpoint = Some(job.checkpoint.clone());
+            }
+            if let Some(record) = conversation.records.iter_mut().find(|r| r["local_round_id"] == job.identity.local_round_id.as_str()) {
+                if record.get("local_terminal").is_none() {
+                    record["local_terminal"] = json!(if job.stopped { "cancelled" } else { "failed" });
+                }
+                let cancelled = record["local_terminal"] == "cancelled";
+                if let Some(stages) = record.get_mut("stages").and_then(Value::as_array_mut) {
+                    for step in stages {
+                        if step["execution_outcome"] == "not_executed" {
+                            step["execution_outcome"] = json!(if cancelled { "cancelled" } else { "failed" });
+                        }
+                    }
+                }
+                if let Some(requests) = record.get_mut("tool_requests").and_then(Value::as_array_mut) {
+                    for request in requests {
+                        if request["outcome"] == "not_executed" {
+                            request["outcome"] = json!(if cancelled { "cancelled" } else { "failed" });
+                        }
+                    }
+                }
+                let terminal_notice = record
+                    .pointer("/local_failure/message")
+                    .and_then(Value::as_str)
+                    .map(|e| format!("处理未完成：{e}。保留最近完整结果。"))
+                    .unwrap_or_else(|| notice.into());
+                record["terminal_notice"] = json!(terminal_notice);
+                record["backend_round_id"] = if job.round.is_empty() { Value::Null } else { json!(job.round) };
             }
             conversation.pending.clear();
             close_pending_tools(&mut conversation.messages);
@@ -421,6 +488,14 @@ impl State {
                 let state = payload.get("state").and_then(Value::as_str).ok_or("AI 状态无效。")?.to_owned();
                 let job = self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?;
                 let old = std::mem::replace(&mut job.state, state.clone());
+                if let Some(record) = self
+                    .conversations
+                    .get_mut(&photo)
+                    .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == job.identity.local_round_id.as_str()))
+                {
+                    record["phase"] = json!(state);
+                    record["backend_round_id"] = json!(round);
+                }
                 if state == "awaiting_input" && old != state {
                     let settings = job.checkpoint.expected.clone();
                     self.spawn(app, photo, None, settings)?;
@@ -441,13 +516,14 @@ impl State {
             "message.completed" => {
                 let id = payload.get("message_id").and_then(Value::as_str).ok_or("AI 消息编号缺失。")?;
                 let local_round_id = self.jobs.get(&photo).ok_or("AI 轮次已结束。")?.identity.local_round_id.clone();
+                let stage = data.get("stage").or_else(|| payload.get("stage"));
                 let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
                 let text = conversation.pending.remove(id).unwrap_or_default();
                 let calls = payload.get("tool_calls").filter(|v| !v.is_null()).cloned().unwrap_or_else(|| json!([]));
                 if !calls.is_array() {
                     return Err("AI 工具消息无效。".into());
                 }
-                conversation.messages.push(json!({"role":"assistant","text":text,"tool_calls":calls,"local_round_id":local_round_id}));
+                conversation.messages.push(json!({"role":"assistant","text":text,"tool_calls":calls,"local_round_id":local_round_id,"local_message_id":format!("{}-{}-{id}",local_round_id.as_str(),stage.and_then(Value::as_str).unwrap_or("unknown")),"model_call_id":payload.get("model_call_id"),"stage":stage,"complete_state":"complete","display_kind":"assistant"}));
                 self.save(app, photo)?;
             }
             "tool.request" => {
@@ -474,15 +550,36 @@ impl State {
                     return Err("AI 方案与当前照片状态不匹配。".into());
                 }
                 let snapshot = job.snapshot.as_ref().ok_or("当前预览未就绪。")?;
-                let candidate = lightcraft_engine::companion::candidate(&job.checkpoint.expected, payload, &snapshot.context)?;
+                let candidate = lightcraft_engine::companion::candidate(&job.checkpoint.expected, payload, &snapshot.context);
                 let local_round_id = job.identity.local_round_id.clone();
+                let stage = if job.plans.is_empty() { "initial" } else { "correction" };
+                let before = job.checkpoint.expected.clone();
+                let model_call = self
+                    .conversations
+                    .get(&photo)
+                    .and_then(|c| {
+                        c.messages.iter().rev().find(|m| {
+                            m.get("tool_calls")
+                                .and_then(Value::as_array)
+                                .is_some_and(|calls| calls.iter().any(|call| call.get("id") == payload.get("tool_call_id")))
+                        })
+                    })
+                    .and_then(|m| m.get("model_call_id"))
+                    .cloned();
+                if let Some(record) =
+                    self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == local_round_id.as_str()))
+                    && let Some(stages) = record.get_mut("stages").and_then(Value::as_array_mut)
+                {
+                    stages.push(json!({"stage":stage,"backend_stage":data.get("stage"),"model_call_id":model_call,"plan_id":plan_id,"tool_call_id":payload.get("tool_call_id"),"reason":payload.get("reason"),"operations":payload.get("operations"),"before_state":before,"proposed_state":candidate.as_ref().ok(),"execution_outcome":if candidate.is_ok() {"not_executed"} else {"validation_failed"}}));
+                }
+                let candidate = candidate?;
                 self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?.inflight_plan = Some(plan_id.into());
                 if let Some(id) = payload.get("tool_call_id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                     self.conversations
                         .get_mut(&photo)
                         .ok_or("AI 会话不存在。")?
                         .messages
-                        .push(json!({"role":"tool","text":"plan_proposed; await actual client execution feedback","tool_call_id":id,"local_round_id":local_round_id}));
+                        .push(json!({"role":"tool","text":"plan_proposed; await actual client execution feedback","tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":payload.get("tool_request_id"),"stage":payload.get("stage"),"model_call_id":payload.get("model_call_id"),"complete_state":"complete"}));
                 }
                 self.spawn(app, photo, Some(payload.clone()), Arc::new(candidate))?;
             }
@@ -497,6 +594,14 @@ impl State {
                 } else {
                     format!("处理未完成：{reason}; traceId={trace}。保留最近一次完整结果。")
                 };
+                if let Some(record) = self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["backend_round_id"] == round)) {
+                    record["local_terminal"] = json!(state);
+                    record["backend_terminal"] = json!(payload);
+                    record["trace_id"] = data.get("trace_id").cloned().unwrap_or(Value::Null);
+                    if let Some(confirmed) = payload.get("last_confirmed_plan_id").and_then(Value::as_str) {
+                        record["backend_reported_last_confirmed_plan_id"] = json!(confirmed);
+                    }
+                }
                 self.finish(photo, &notice);
                 self.save(app, photo)?;
             }
@@ -508,6 +613,18 @@ impl State {
     fn tool(&mut self, app: &mut LightcraftApp, photo: PhotoId, payload: &Value) -> Result<(), String> {
         let job = self.jobs.get(&photo).ok_or("AI 轮次已结束。")?;
         let request = payload.get("tool_request_id").and_then(Value::as_str).ok_or("AI 工具编号缺失。")?;
+        if let Some(record) = self
+            .conversations
+            .get_mut(&photo)
+            .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == job.identity.local_round_id.as_str()))
+        {
+            if record.get("tool_requests").is_none() {
+                record["tool_requests"] = json!([]);
+            }
+            if let Some(requests) = record.get_mut("tool_requests").and_then(Value::as_array_mut) {
+                requests.push(json!({"tool_request_id":request,"tool_call_id":payload.get("tool_call_id"),"tool_name":payload.get("tool_name"),"args":payload.get("args"),"expected_revision":payload.get("expected_revision"),"outcome":"not_executed"}));
+            }
+        }
         if payload.get("expected_revision").and_then(Value::as_u64) != Some(job.checkpoint.revision) {
             return Err("AI 读取版本不匹配。".into());
         }
@@ -541,19 +658,42 @@ impl State {
         let round = job.round.clone();
         let revision = job.checkpoint.revision;
         let local_round_id = job.identity.local_round_id.clone();
-        self.send(
-            format!("/v1/rounds/{round}/tool-results"),
-            json!({"tool_request_id":request,"photo_revision":revision,"outcome":"succeeded","result":result}),
-            0,
-            round,
-        )?;
+        let association = self
+            .conversations
+            .get(&photo)
+            .and_then(|c| {
+                c.messages.iter().rev().find(|m| {
+                    m.get("tool_calls")
+                        .and_then(Value::as_array)
+                        .is_some_and(|calls| calls.iter().any(|call| call.get("id") == payload.get("tool_call_id")))
+                })
+            })
+            .cloned();
+        let stage = association.as_ref().and_then(|m| m.get("stage")).cloned();
+        let model_call = association.as_ref().and_then(|m| m.get("model_call_id")).cloned();
         let id = payload.get("tool_call_id").and_then(Value::as_str).ok_or("AI 工具关联缺失。")?;
         self.conversations
             .get_mut(&photo)
             .ok_or("AI 会话不存在。")?
             .messages
-            .push(json!({"role":"tool","text":result["text"],"images":result["images"],"tool_call_id":id,"local_round_id":local_round_id}));
-        self.save(app, photo)
+            .push(json!({"role":"tool","text":result["text"],"images":result["images"],"tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":request,"stage":stage,"model_call_id":model_call,"complete_state":"complete","local_message_id":format!("{}-tool-{request}",local_round_id.as_str())}));
+        if let Some(record) =
+            self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == local_round_id.as_str()))
+            && let Some(fact) = record
+                .get_mut("tool_requests")
+                .and_then(Value::as_array_mut)
+                .and_then(|requests| requests.iter_mut().find(|r| r["tool_request_id"] == request))
+        {
+            fact["outcome"] = json!("succeeded");
+            fact["result_message_id"] = json!(format!("{}-tool-{request}", local_round_id.as_str()));
+        }
+        self.save(app, photo)?;
+        self.send(
+            format!("/v1/rounds/{round}/tool-results"),
+            json!({"tool_request_id":request,"photo_revision":revision,"outcome":"succeeded","result":result}),
+            0,
+            round,
+        )
     }
     fn prepared(&mut self, app: &mut LightcraftApp, ctx: &egui::Context, message: WorkerMessage) -> Result<(), String> {
         let WorkerMessage::Prepared { identity, plan, settings, result } = message;
@@ -584,12 +724,40 @@ impl State {
             Err(error) => {
                 if let Some(plan) = &plan {
                     let round = job.round.clone();
+                    let revision = job.checkpoint.revision;
+                    let actual = job.checkpoint.expected.clone();
+                    let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+                    if let Some(step) = conversation
+                        .records
+                        .iter_mut()
+                        .find(|r| r["local_round_id"] == identity.local_round_id.as_str())
+                        .and_then(|r| r.get_mut("stages"))
+                        .and_then(Value::as_array_mut)
+                        .and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan["plan_id"]))
+                    {
+                        step["execution_outcome"] = json!("failed");
+                        step["render_outcome"] = json!("failed");
+                        step["error"] = json!(error);
+                        step["delivery_state"] = json!("not_sent");
+                    }
+                    conversation.messages.push(json!({"local_round_id":identity.local_round_id,"local_message_id":format!("{}-{}-failure",identity.local_round_id.as_str(),plan["plan_id"]),"complete_state":"complete","display_kind":"execution_feedback","role":"user","text":format!("Actual execution feedback: {}",json!({"outcome":"failed","reason_code":"render_failed","photo_revision":revision,"actual_state":actual}))}));
+                    self.save(app, photo)?;
                     self.send(
                         format!("/v1/rounds/{round}/execution"),
-                        json!({"plan_id":plan["plan_id"],"outcome":"failed","photo_revision":job.checkpoint.revision,"reason_code":"render_failed"}),
+                        json!({"plan_id":plan["plan_id"],"outcome":"failed","photo_revision":revision,"reason_code":"render_failed"}),
                         0,
                         round,
                     )?;
+                    if let Some(step) = self
+                        .conversations
+                        .get_mut(&photo)
+                        .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()))
+                        .and_then(|r| r.get_mut("stages"))
+                        .and_then(Value::as_array_mut)
+                        .and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan["plan_id"]))
+                    {
+                        step["delivery_state"] = json!("queued");
+                    }
                 }
                 self.finish(photo, &format!("处理未完成：{error}。保留最近完整结果。"));
                 return self.save(app, photo);
@@ -608,6 +776,8 @@ impl State {
             let new_revision = app.session.photo_revision(photo);
             let feedback = json!({"plan_id":plan["plan_id"],"outcome":"succeeded","photo_revision":new_revision,"actual_state":settings,"preview":snapshot.preview});
             let job = self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?;
+            let before = job.checkpoint.expected.clone();
+            let stage = if job.plans.is_empty() { "initial" } else { "correction" };
             job.checkpoint.expected = settings.clone();
             job.checkpoint.revision = new_revision;
             let plan_id = plan.get("plan_id").and_then(Value::as_str).ok_or("AI 方案编号缺失。")?.to_owned();
@@ -617,12 +787,38 @@ impl State {
             let checkpoint = job.checkpoint.clone();
             let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
             conversation.checkpoint = Some(checkpoint.clone());
-            conversation.messages.push(json!({"local_round_id":identity.local_round_id,"role":"user","text":format!("Actual execution feedback: {}",json!({"outcome":"succeeded","actual_state":settings,"photo_revision":new_revision})),"images":[{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]}));
+            if let Some(record) = conversation.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()) {
+                record["recent_complete_result"] = json!(settings);
+                if let Some(stages) = record.get_mut("stages").and_then(Value::as_array_mut)
+                    && let Some(step) = stages.iter_mut().find(|s| s["plan_id"] == plan_id)
+                {
+                    step["before_state"] = json!(before);
+                    step["applied_state"] = json!(settings);
+                    step["effective_control_values"] = lightcraft_engine::companion::control_list(&settings, &snapshot.context.info);
+                    step["execution_outcome"] = json!("succeeded");
+                    step["delivery_state"] = json!("not_sent");
+                    step["render_outcome"] = json!("succeeded");
+                    step["locally_published"] = json!(true);
+                    step["preview_message_id"] = json!(format!("{}-{stage}", identity.local_round_id.as_str()));
+                }
+            }
+            conversation.messages.push(json!({"local_round_id":identity.local_round_id,"local_message_id":format!("{}-{stage}",identity.local_round_id.as_str()),"stage":stage,"complete_state":"complete","display_kind":"execution_feedback","role":"user","text":format!("Actual execution feedback: {}",json!({"outcome":"succeeded","actual_state":settings,"photo_revision":new_revision})),"images":[{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]}));
             conversation.rounds.push(
                 json!({"local_round_id":identity.local_round_id,"round_id":round,"plan_id":plan_id,"original":checkpoint.original,"actual_state":settings,"operations":plan["operations"]}),
             );
             // A failed POST retains the actual visible result; never roll back on network failure.
+            self.save(app, photo)?;
             self.send(format!("/v1/rounds/{round}/execution"), feedback, 0, round)?;
+            if let Some(step) = self
+                .conversations
+                .get_mut(&photo)
+                .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()))
+                .and_then(|r| r.get_mut("stages"))
+                .and_then(Value::as_array_mut)
+                .and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan_id))
+            {
+                step["delivery_state"] = json!("queued");
+            }
             self.save(app, photo)?;
         } else {
             let job = self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?;
@@ -630,13 +826,38 @@ impl State {
             let input = json!({"input_id":format!("input-{seq}"),"photo_revision":revision,"prompt":job.prompt,"current_state":settings,"preview":snapshot.preview,"history":job.history,"capabilities":capabilities(&settings)});
             let message =
                 self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?.messages.get_mut(job.user_message).ok_or("AI 用户请求缺失。")?;
-            *message = json!({"local_round_id":identity.local_round_id,"role":"user","text":format!("{}\nActual photo state: {}",job.prompt,settings.to_json()),"images":[{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]});
+            *message = json!({"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request","role":"user","text":format!("{}\nActual photo state: {}",job.prompt,settings.to_json()),"images":[{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]});
+            if let Some(record) = self
+                .conversations
+                .get_mut(&photo)
+                .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()))
+            {
+                record["original"] = json!(settings);
+                record["before_preview_message_id"] = json!(format!("{}-user", identity.local_round_id.as_str()));
+                record["input_delivery_state"] = json!("not_sent");
+                record["input_id"] = json!(format!("input-{seq}"));
+            }
+            self.save(app, photo)?;
             self.send(format!("/v1/rounds/{round}/input"), input, 0, round)?;
+            if let Some(record) = self
+                .conversations
+                .get_mut(&photo)
+                .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()))
+            {
+                record["input_delivery_state"] = json!("queued");
+            }
             self.save(app, photo)?;
         }
         Ok(())
     }
     fn poll_inner(&mut self, app: &mut LightcraftApp, ctx: &egui::Context) {
+        // Egui may discard and rerun a pass within the same frame. Do not let
+        // late receipts (which also save records) enter storage before the
+        // first local stop feedback frame has completed.
+        if self.local_save_after_frame.is_some_and(|frame| ctx.cumulative_frame_nr() <= frame) {
+            ctx.request_repaint();
+            return;
+        }
         let generation = app.session.library_generation();
         if self.generation != generation {
             let photos: Vec<_> = self.jobs.keys().copied().collect();
@@ -646,6 +867,9 @@ impl State {
             }
             self.connection = None;
             self.conversations.clear();
+            self.pending_local_saves.clear();
+            self.local_save_retry_at = None;
+            self.local_save_after_frame = None;
             self.generation = generation;
         }
         self.workers.retain(|_, alive| alive.load(Ordering::Relaxed));
@@ -681,9 +905,48 @@ impl State {
                     Ok(())
                 }
                 network::Event::Response { submission, round, path, identity, result } => {
-                    if identity.scope.library_generation != app.session.library_generation()
-                        || identity.connection_generation != self.connection_generation
+                    if identity.scope.library_generation != app.session.library_generation() {
+                        continue;
+                    }
+                    if path.ends_with("/execution")
+                        && let Ok(response) = &result
+                        && response.get("accepted").and_then(Value::as_bool) == Some(true)
+                        && let Some(plan_id) = response.get("_client_execution_plan_id").and_then(Value::as_str)
                     {
+                        if let Some(record) = self.conversations.get_mut(&identity.scope.photo).and_then(|c| {
+                            c.records.iter_mut().find(|r| {
+                                r["local_round_id"] == identity.local_round_id.as_str()
+                                    && r["submission_seq"] == identity.submission_seq
+                                    && r["connection_generation"] == identity.connection_generation
+                                    && r["runtime_library_generation"] == identity.scope.library_generation
+                            })
+                        }) && let Some(step) =
+                            record.get_mut("stages").and_then(Value::as_array_mut).and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan_id))
+                        {
+                            step["delivery_state"] = json!("confirmed");
+                            if step["execution_outcome"] == "succeeded" {
+                                record["backend_confirmed_plan"] = json!(plan_id);
+                            }
+                        }
+                        let _ = self.save(app, identity.scope.photo);
+                    }
+                    if path.ends_with("/input")
+                        && let Ok(response) = &result
+                        && response.get("accepted").and_then(Value::as_bool) == Some(true)
+                    {
+                        if let Some(record) = self.conversations.get_mut(&identity.scope.photo).and_then(|c| {
+                            c.records.iter_mut().find(|r| {
+                                r["local_round_id"] == identity.local_round_id.as_str()
+                                    && r["submission_seq"] == identity.submission_seq
+                                    && r["connection_generation"] == identity.connection_generation
+                                    && r["runtime_library_generation"] == identity.scope.library_generation
+                            })
+                        }) {
+                            record["input_delivery_state"] = json!("confirmed");
+                        }
+                        let _ = self.save(app, identity.scope.photo);
+                    }
+                    if identity.connection_generation != self.connection_generation {
                         continue;
                     }
                     if self.jobs.get(&identity.scope.photo).is_none_or(|j| j.identity != identity) {
@@ -701,6 +964,7 @@ impl State {
                             let _ = self.save(app, identity.scope.photo);
                             continue;
                         }
+                        self.mark_failure(identity.scope.photo, &error.to_string());
                         if path.ends_with("/stop") || (submission != 0 && !error.rejected) {
                             // A failed creation POST may have been accepted. Disconnect
                             // rather than abandon an unidentifiable server task.
@@ -714,6 +978,7 @@ impl State {
                                     c.pending.clear();
                                     c.notice = tr("Cancelling… Waiting for the AI connection to close safely.").into();
                                 }
+                                let _ = self.save(app, identity.scope.photo);
                                 continue;
                             }
                         }
@@ -770,11 +1035,44 @@ impl State {
             }
             let _ = self.save(app, photo);
         }
+        if !self.pending_local_saves.is_empty()
+            && self.local_save_after_frame.is_none_or(|frame| ctx.cumulative_frame_nr() > frame)
+            && self.local_save_retry_at.is_none_or(|at| at <= Instant::now())
+        {
+            match self.flush_local_saves(app) {
+                Ok(()) => {
+                    self.local_save_retry_at = None;
+                    self.local_save_after_frame = None;
+                }
+                Err(error) => {
+                    self.text = error;
+                    self.local_save_retry_at = Instant::now().checked_add(Duration::from_secs(1));
+                }
+            }
+        }
+        if !self.pending_local_saves.is_empty() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         if !self.jobs.is_empty() || !self.workers.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
+    /// Cancelling transport/work is a cleanup action, not the cause of failure.
+    fn mark_failure(&mut self, photo: PhotoId, error: &str) {
+        let Some(job) = self.jobs.get(&photo).filter(|j| !j.stopped) else { return };
+        if let Some(record) = self
+            .conversations
+            .get_mut(&photo)
+            .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == job.identity.local_round_id.as_str()))
+        {
+            if record.get("local_terminal").is_none() {
+                record["local_terminal"] = json!("failed");
+            }
+            record["local_failure"] = json!({"message":error,"reason":"client_failure"});
+        }
+    }
     fn fail_one(&mut self, app: &mut LightcraftApp, photo: PhotoId, error: &str) {
+        self.mark_failure(photo, error);
         let _ = self.stop(photo);
         if let Some(c) = self.conversations.get_mut(&photo) {
             c.notice = format!("处理未完成：{error}。保留最近完整结果。");
@@ -808,21 +1106,36 @@ fn render_snapshot(mut job: RenderJob, cancel: &AtomicBool) -> Result<Snapshot, 
     let mut result = job.run();
     result.loaded = Some(source);
     let rendered = result.rendered.as_ref().map_err(Clone::clone)?;
-    let options = lightcraft_engine::export::ExportOptions {
-        format: lightcraft_engine::export::ExportFormat::Jpeg,
-        quality: 75,
-        metadata: lightcraft_engine::export::MetadataPolicy::None,
-        ..Default::default()
-    };
-    let data = lightcraft_engine::export::encode_image(&rendered.image, &options)?;
-    if data.len() > 128 * 1024 {
-        return Err("压缩预览超过服务限制。".into());
-    }
+    let (data, width, height) = encode_preview(&rendered.image)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("已停止生成。".into());
     }
-    let preview = json!({"mime_type":"image/jpeg","width":rendered.image.width,"height":rendered.image.height,"frame_id":context.frame_id,"data_base64":Base64::encode_string(&data)});
+    let preview =
+        json!({"mime_type":"image/jpeg","width":width,"height":height,"frame_id":context.frame_id,"data_base64":Base64::encode_string(&data)});
     Ok(Snapshot { result, preview, context })
+}
+fn encode_preview(image: &lightcraft_raster::Rgba8) -> Result<(Vec<u8>, usize, usize), String> {
+    let options = lightcraft_engine::export::ExportOptions {
+        format: lightcraft_engine::export::ExportFormat::Jpeg,
+        quality: 75,
+        color_space: lightcraft_engine::export::OutputSpace::Srgb,
+        metadata: lightcraft_engine::export::MetadataPolicy::None,
+        ..Default::default()
+    };
+    let linear = image.to_linear();
+    let mut preview = lightcraft_raster::resample::fit(&linear, 640, 640, lightcraft_raster::resample::Filter::Bilinear).to_srgb8();
+    loop {
+        let bytes = lightcraft_engine::export::encode_image(&preview, &options)?;
+        if bytes.len() <= 128 * 1024 {
+            return Ok((bytes, preview.width, preview.height));
+        }
+        let edge = preview.width.max(preview.height);
+        if edge <= 1 {
+            return Err("压缩预览超过服务限制。".into());
+        }
+        let smaller = edge.saturating_mul(3) / 4;
+        preview = lightcraft_raster::resample::fit(&linear, smaller.max(1), smaller.max(1), lightcraft_raster::resample::Filter::Bilinear).to_srgb8();
+    }
 }
 fn capabilities(settings: &DevelopSettings) -> Value {
     let tools: [(&str, &str); 5] = [
@@ -838,12 +1151,12 @@ fn capabilities(settings: &DevelopSettings) -> Value {
 }
 
 fn close_pending_tools(messages: &mut Vec<Value>) {
-    let mut pending = BTreeSet::new();
+    let mut pending = BTreeMap::new();
     for message in messages.iter() {
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    pending.insert(id.to_owned());
+                    pending.insert(id.to_owned(), message.clone());
                 }
             }
         }
@@ -851,8 +1164,8 @@ fn close_pending_tools(messages: &mut Vec<Value>) {
             pending.remove(id);
         }
     }
-    for id in pending {
-        messages.push(json!({"role":"tool","tool_call_id":id,"text":"cancelled or failed before confirmed tool completion"}));
+    for (id, owner) in pending {
+        messages.push(json!({"role":"tool","tool_call_id":id,"text":"cancelled or failed before confirmed tool completion","local_round_id":owner.get("local_round_id"),"stage":owner.get("stage"),"model_call_id":owner.get("model_call_id"),"complete_state":"complete","display_kind":"tool_result"}));
     }
 }
 
@@ -877,6 +1190,7 @@ pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
             state.finish(photo, "图库已关闭，保留最近一次完整结果。");
             state.save(app, photo)?;
         }
+        state.flush_local_saves(app)?;
         state.connection = None;
         Ok(())
     })();
@@ -897,6 +1211,9 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         }
         state.connection = None;
         state.conversations.clear();
+        state.pending_local_saves.clear();
+        state.local_save_retry_at = None;
+        state.local_save_after_frame = None;
         state.generation = app.session.library_generation();
     }
     let photo = params.get("photo").and_then(Value::as_u64).map(PhotoId).or_else(|| app.session.active());
@@ -916,8 +1233,8 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             explicit.and_then(|p| state.start_for(app, p))
         }
         "ai.stop" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
+            state.pending_local_saves.insert(p);
             state.stop(p)?;
-            state.save(app, p)?;
             Ok(Value::Null)
         }),
         "ai.status" => {
@@ -997,6 +1314,11 @@ fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId) -> Result<V
     );
     if let Some(library) = app.session.library.as_mut() {
         for name in names {
+            // V2 objects belong to immutable transaction graphs. Bounded retirement
+            // owns their cleanup; the empty HEAD already excludes them from projection.
+            if name.starts_with("companion/v2/") {
+                continue;
+            }
             library.remove_companion_attachment(&name).map_err(|e| e.to_string())?;
         }
     }
@@ -1055,10 +1377,11 @@ fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
         let mut consent_value = app.ai.consent;
         let consent = ui.checkbox(&mut consent_value, tr("Allow compressed previews to be sent to the cloud model"));
         crate::widgets::register(ui.ctx(), "checkbox:aiConsent", consent.rect);
-        if consent.changed()
-            && let Err(e) = app.ai.set_consent(consent_value)
-        {
-            app.ai.text = e;
+        if consent.changed() {
+            app.ai.defer_local_saves_for_feedback(ui.ctx());
+            if let Err(e) = app.ai.set_consent(consent_value) {
+                app.ai.text = e;
+            }
         }
         if !busy {
             let admission = app.ai.admission(app, None);
@@ -1094,6 +1417,7 @@ fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
                 let stop = ui.button(tr("Stop Generating"));
                 crate::widgets::register(ui.ctx(), "button:aiStop", stop.rect);
                 if stop.clicked() {
+                    app.ai.defer_local_saves_for_feedback(ui.ctx());
                     let _ = app.run("ai.stop", json!({}));
                 }
             });

@@ -82,6 +82,8 @@ fn newer_or_corrupt_ai_storage_does_not_block_photos_and_is_never_overwritten() 
         s.execute("develop.set", &json!({"ids":[id.0],"values":{"light.exposure":0.5}})).unwrap();
         assert!(s.set_photo_companion(id, Some(json!({}))).is_err());
         assert_eq!(files.get(STATE_FILE).unwrap(), bytes);
+        s.close_library().unwrap();
+        assert_eq!(files.get(STATE_FILE).unwrap(), bytes, "a protected AI root does not trap ordinary photos in the library");
     }
 }
 
@@ -228,4 +230,200 @@ fn native_archive_and_attachments_save_reopen_and_delete_through_store() {
     drop(session);
     assert!(!dir.join(&name).exists());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fresh_v2_rounds_are_sharded_and_reopen_without_touching_catalog() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut s = open(catalog.clone(), Box::new(files.clone()));
+    let id = s.catalog.photos().next().unwrap().id;
+    let before = catalog.files.lock().unwrap().clone();
+    let messages: Vec<Value> = (0..260).map(|n| json!({"local_message_id":format!("m-{n}"),"role":"user","text":format!("request {n}")})).collect();
+    let value = json!({"schema_version":2,"messages":messages,"rounds":[{"local_round_id":"r-1","request_text":"explain","local_terminal":"completed"}],"draft":"saved draft"});
+    s.save_companion_conversation(id, value.clone()).unwrap();
+    assert_eq!(*catalog.files.lock().unwrap(), before);
+    let root: Value = serde_json::from_slice(&files.get(STATE_FILE).unwrap()).unwrap();
+    assert_eq!(root["version"], 2);
+    assert!(root.get("photos").is_none());
+    s.close_library().unwrap();
+    let mut s = open(catalog, Box::new(files.clone()));
+    assert_eq!(s.load_companion_conversation(id).unwrap(), Some(value));
+    let page = s.companion_messages_page(id, 128, 64).unwrap();
+    assert_eq!(page.records.len(), 64);
+    assert_eq!(page.records[0]["text"], "request 128");
+    assert!(files.files.lock().unwrap().iter().filter(|(k, _)| k.contains("manifest-")).all(|(_, v)| v.len() < 4096));
+}
+
+#[test]
+fn v2_failed_photo_commit_preserves_old_head_memory_and_other_photo_then_retries() {
+    struct Fault {
+        memory: MemStore,
+        fail_photo: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Store for Fault {
+        fn read(&mut self, key: &str) -> std::io::Result<Option<Vec<u8>>> {
+            self.memory.read(key)
+        }
+        fn read_limited(&mut self, key: &str, n: u64) -> std::io::Result<Option<Vec<u8>>> {
+            self.memory.read_limited(key, n)
+        }
+        fn read_range(&mut self, key: &str, o: u64, n: usize) -> std::io::Result<Vec<u8>> {
+            self.memory.read_range(key, o, n)
+        }
+        fn remove(&mut self, key: &str) -> std::io::Result<()> {
+            self.memory.remove(key)
+        }
+        fn write_atomic(&mut self, key: &str, b: &[u8]) -> std::io::Result<()> {
+            let photo = self.fail_photo.load(std::sync::atomic::Ordering::Relaxed);
+            if photo != 0 && key == format!("companion/v2/photos/{photo}/HEAD.json") {
+                return Err(std::io::Error::other("photo HEAD failure"));
+            }
+            self.memory.write_atomic(key, b)
+        }
+        fn append(&mut self, key: &str, b: &[u8]) -> std::io::Result<()> {
+            self.memory.append(key, b)
+        }
+        fn truncate(&mut self, key: &str, n: u64) -> std::io::Result<()> {
+            self.memory.truncate(key, n)
+        }
+        fn describe(&self) -> String {
+            "v2 fault".into()
+        }
+    }
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let fail = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut s = open(catalog.clone(), Box::new(Fault { memory: files.clone(), fail_photo: fail.clone() }));
+    let ids: Vec<_> = s.catalog.photos().take(2).map(|p| p.id).collect();
+    let id = ids[0];
+    let other = ids[1];
+    let saved = json!({"schema_version":2,"messages":[{"role":"user","text":"saved"}],"rounds":[]});
+    s.save_companion_conversation(id, saved.clone()).unwrap();
+    let old_head = files.get(&format!("companion/v2/photos/{}/HEAD.json", id.0)).unwrap();
+    fail.store(id.0, std::sync::atomic::Ordering::Relaxed);
+    let queued = json!({"schema_version":2,"messages":[{"role":"user","text":"actual result kept"}],"rounds":[]});
+    assert!(s.save_companion_conversation(id, queued.clone()).is_err());
+    assert_eq!(s.photo_companion(id).unwrap(), Some(&queued));
+    assert_eq!(s.load_companion_conversation(id).unwrap(), Some(queued.clone()), "reading must not overwrite queued actual result with old HEAD");
+    assert_eq!(files.get(&format!("companion/v2/photos/{}/HEAD.json", id.0)).unwrap(), old_head);
+    s.save_companion_conversation(other, saved.clone()).unwrap();
+    assert!(s.unsaved().is_some(), "other-photo success must not hide queued archive failure");
+    let mut reopened = open(catalog, Box::new(files.clone()));
+    assert_eq!(reopened.load_companion_conversation(id).unwrap(), Some(saved.clone()));
+    assert_eq!(reopened.load_companion_conversation(other).unwrap(), Some(saved));
+    fail.store(0, std::sync::atomic::Ordering::Relaxed);
+    s.persist().unwrap();
+    assert!(s.unsaved().is_none());
+    assert_eq!(reopened.load_companion_conversation(id).unwrap(), Some(queued));
+}
+
+#[test]
+fn v2_cold_edit_invalidates_separate_revert_state_without_opening_conversation() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut s = open(catalog.clone(), Box::new(files.clone()));
+    let id = s.catalog.photos().next().unwrap().id;
+    s.save_companion_conversation(id, json!({"schema_version":2,"messages":[],"rounds":[],"checkpoint":{"eligible":true}})).unwrap();
+    s.close_library().unwrap();
+    let mut s = open(catalog.clone(), Box::new(files.clone()));
+    assert!(s.photo_companion(id).unwrap().is_none(), "v2 library open must not hydrate global history");
+    s.execute("develop.set", &json!({"ids":[id.0],"values":{"light.exposure":0.6}})).unwrap();
+    s.close_library().unwrap();
+    let mut s = open(catalog, Box::new(files));
+    assert_eq!(s.load_companion_conversation(id).unwrap().unwrap()["checkpoint"]["eligible"], false);
+}
+
+#[test]
+fn v2_corrupt_staged_block_cannot_replace_committed_head() {
+    let files = MemStore::new();
+    let mut s = open(MemStore::new(), Box::new(files.clone()));
+    let id = s.catalog.photos().next().unwrap().id;
+    let old = json!({"schema_version":2,"messages":[{"role":"user","text":"old"}],"rounds":[]});
+    s.save_companion_conversation(id, old.clone()).unwrap();
+    let head_key = format!("companion/v2/photos/{}/HEAD.json", id.0);
+    let head = files.get(&head_key).unwrap();
+    let pending = s.companion_stage(id, 0, &json!({"schema_version":2,"messages":[{"role":"user","text":"new"}],"rounds":[]})).unwrap();
+    let key = files.files.lock().unwrap().keys().find(|k| k.contains(&pending.transaction_id) && k.contains("blocks/")).cloned().unwrap();
+    files.set(&key, b"corrupt block".to_vec());
+    assert!(s.companion_commit(&pending).is_err());
+    assert_eq!(files.get(&head_key).unwrap(), head);
+    assert_eq!(s.load_companion_conversation(id).unwrap(), Some(old));
+}
+
+#[test]
+fn v2_head_error_after_visible_rename_keeps_valid_result_and_retry_is_safe() {
+    struct AfterRename {
+        memory: MemStore,
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Store for AfterRename {
+        fn read(&mut self, k: &str) -> std::io::Result<Option<Vec<u8>>> {
+            self.memory.read(k)
+        }
+        fn read_limited(&mut self, k: &str, n: u64) -> std::io::Result<Option<Vec<u8>>> {
+            self.memory.read_limited(k, n)
+        }
+        fn read_range(&mut self, k: &str, o: u64, n: usize) -> std::io::Result<Vec<u8>> {
+            self.memory.read_range(k, o, n)
+        }
+        fn remove(&mut self, k: &str) -> std::io::Result<()> {
+            self.memory.remove(k)
+        }
+        fn write_atomic(&mut self, k: &str, b: &[u8]) -> std::io::Result<()> {
+            self.memory.write_atomic(k, b)?;
+            if k.ends_with("/HEAD.json") && self.fail.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::other("sync failed after visible rename"));
+            }
+            Ok(())
+        }
+        fn append(&mut self, k: &str, b: &[u8]) -> std::io::Result<()> {
+            self.memory.append(k, b)
+        }
+        fn truncate(&mut self, k: &str, n: u64) -> std::io::Result<()> {
+            self.memory.truncate(k, n)
+        }
+        fn describe(&self) -> String {
+            "after rename fault".into()
+        }
+    }
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut s = open(catalog.clone(), Box::new(AfterRename { memory: files.clone(), fail: fail.clone() }));
+    let id = s.catalog.photos().next().unwrap().id;
+    s.save_companion_conversation(id, json!({"schema_version":2,"messages":[],"rounds":[]})).unwrap();
+    fail.store(true, std::sync::atomic::Ordering::Relaxed);
+    let actual = json!({"schema_version":2,"messages":[{"role":"user","text":"complete actual result"}],"rounds":[]});
+    assert!(s.save_companion_conversation(id, actual.clone()).is_err());
+    assert_eq!(s.photo_companion(id).unwrap(), Some(&actual));
+    let mut reopened = open(catalog, Box::new(files));
+    assert_eq!(reopened.load_companion_conversation(id).unwrap(), Some(actual.clone()));
+    s.persist().unwrap();
+    assert!(s.unsaved().is_none());
+    assert_eq!(reopened.load_companion_conversation(id).unwrap(), Some(actual));
+}
+
+#[test]
+fn v2_large_record_splits_by_bytes_instead_of_imposing_a_local_history_quota() {
+    let files = MemStore::new();
+    let mut s = open(MemStore::new(), Box::new(files.clone()));
+    let id = s.catalog.photos().next().unwrap().id;
+    let value = json!({"schema_version":2,"messages":[{"role":"user","text":"x".repeat(6*1024*1024)}],"rounds":[]});
+    s.save_companion_conversation(id, value.clone()).unwrap();
+    assert!(files.files.lock().unwrap().iter().filter(|(k, _)| k.contains("blocks/")).all(|(_, b)| b.len() <= 4 * 1024 * 1024));
+    assert_eq!(s.load_companion_conversation(id).unwrap(), Some(value));
+}
+
+#[test]
+fn v2_tampered_pending_cannot_overwrite_an_old_committed_manifest() {
+    let files = MemStore::new();
+    let mut s = open(MemStore::new(), Box::new(files.clone()));
+    let id = s.catalog.photos().next().unwrap().id;
+    let old = json!({"schema_version":2,"messages":[{"role":"user","text":"protected old"}],"rounds":[]});
+    s.save_companion_conversation(id, old.clone()).unwrap();
+    let base = format!("companion/v2/photos/{}", id.0);
+    let head: Value = serde_json::from_slice(&files.get(&format!("{base}/HEAD.json")).unwrap()).unwrap();
+    s.companion_stage(id, 0, &json!({"schema_version":2,"messages":[],"rounds":[]})).unwrap();
+    let mut pending: Value = serde_json::from_slice(&files.get(&format!("{base}/pending.json")).unwrap()).unwrap();
+    pending["head"]["manifest"] = head["manifest"].clone();
+    files.set(&format!("{base}/pending.json"), serde_json::to_vec(&pending).unwrap());
+    assert!(s.companion_stage(id, 0, &json!({"schema_version":2,"messages":[],"rounds":[]})).is_err());
+    assert_eq!(s.load_companion_conversation(id).unwrap(), Some(old));
 }

@@ -299,6 +299,10 @@ fn post_scoped(
             ),
         });
     }
+    if (path.ends_with("/execution") || path.ends_with("/input")) && (status != 202 || result.get("accepted").and_then(Value::as_bool) != Some(true))
+    {
+        return Err(RequestFailure { rejected: false, cancelled_before_send: false, message: "后端回复无效。".into() });
+    }
     Ok(result)
 }
 fn next_request(requests: &mpsc::Receiver<Request>, controls: &mpsc::Receiver<Request>) -> Result<Request, mpsc::TryRecvError> {
@@ -384,7 +388,7 @@ fn receive(
                                     request.body["connection_id"] = json!(connection);
                                 }
                                 let control = request.path.ends_with("/stop");
-                                let result = post_scoped(
+                                let mut result = post_scoped(
                                     address,
                                     &request.path,
                                     &token,
@@ -392,6 +396,13 @@ fn receive(
                                     &cancel,
                                     (!control).then_some(request.cancel.as_ref()),
                                 );
+                                // Local receipt correlation is never part of the backend request/model history.
+                                if request.path.ends_with("/execution")
+                                    && let Ok(response) = &mut result
+                                    && let Some(object) = response.as_object_mut()
+                                {
+                                    object.insert("_client_execution_plan_id".into(), request.body.get("plan_id").cloned().unwrap_or(Value::Null));
+                                }
                                 if emit(
                                     &tx,
                                     Event::Response {

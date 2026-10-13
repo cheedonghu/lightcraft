@@ -355,6 +355,9 @@ impl Session {
             }
         }
         self.companion_archive.invalidate(&changed);
+        if let Some(library) = self.library.as_mut() {
+            self.companion_archive.invalidate_storage(library, &changed);
+        }
         Ok(())
     }
 

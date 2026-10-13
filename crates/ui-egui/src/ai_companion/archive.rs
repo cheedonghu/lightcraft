@@ -1,16 +1,18 @@
 //! Normal catalog persistence and bounded attachment hydration.
 use super::*;
 impl State {
-    pub(super) fn load(&mut self, app: &LightcraftApp, photo: PhotoId) -> Result<(), String> {
+    pub(super) fn load(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
         if self.conversations.contains_key(&photo) {
             return Ok(());
         }
         let mut conversation =
             Conversation { scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }), ..Default::default() };
-        if let Some(archive) = app.session.photo_companion(photo).map_err(|e| e.to_string())? {
-            if archive.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        if let Some(archive) = app.session.load_companion_conversation(photo).map_err(|e| e.to_string())? {
+            if !matches!(archive.get("schema_version").and_then(Value::as_u64), Some(1 | 2)) {
                 return Err("AI 对话格式不支持，未删减历史。".into());
             }
+            conversation.schema_version = archive["schema_version"].as_u64().unwrap_or(1);
+            conversation.records = archive.get("round_records").and_then(Value::as_array).cloned().unwrap_or_default();
             conversation.messages = archive.get("messages").and_then(Value::as_array).ok_or("AI 对话记录无效。")?.clone();
             conversation.rounds = archive.get("rounds").and_then(Value::as_array).cloned().unwrap_or_default();
             if let Some(saved) = archive.get("checkpoint").filter(|v| !v.is_null()) {
@@ -35,16 +37,34 @@ impl State {
     }
     pub(super) fn save(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
         let Some(conversation) = self.conversations.get_mut(&photo) else {
+            self.pending_local_saves.remove(&photo);
             return Ok(());
         };
         if conversation.scope.is_some_and(|scope| scope != PhotoScope { library_generation: app.session.library_generation(), photo }) {
             return Err("AI 会话属于已关闭的图库，未写入当前图库。".into());
         }
+        if let Some(checkpoint) = conversation.checkpoint.as_mut()
+            && checkpoint.eligible
+            && !current(app, checkpoint)
+        {
+            checkpoint.eligible = false;
+        }
+        // Archive a copy: a failed attachment/write must retain the complete in-memory result.
+        for (sequence, message) in conversation.messages.iter_mut().enumerate() {
+            if message.get("local_message_id").is_none()
+                && let Some(round) = message.get("local_round_id").and_then(Value::as_str)
+            {
+                message["local_message_id"] = json!(format!("{round}-message-{sequence}"));
+            }
+        }
+        let mut messages = conversation.messages.clone();
         if let Some(library) = app.session.library.as_mut() {
-            for message in &mut conversation.messages {
+            for message in &mut messages {
                 if let Some(images) = message.get_mut("images").and_then(Value::as_array_mut) {
                     for image in images {
-                        if let Some(data) = image.get("data").and_then(Value::as_str) {
+                        if conversation.schema_version == 1
+                            && let Some(data) = image.get("data").and_then(Value::as_str)
+                        {
                             if data.len() > 176 * 1024 {
                                 return Err("AI 预览附件过大。".into());
                             }
@@ -57,15 +77,22 @@ impl State {
                 }
             }
         }
-        let checkpoint = conversation.checkpoint.as_ref().map(|c| json!({"original":c.original,"expected":c.expected,"eligible":c.eligible}));
+        let checkpoint = conversation.checkpoint.as_ref().map(|c| json!({"original":c.original,"expected":c.expected,"eligible":c.eligible,"local_round_id":conversation.records.iter().rev().find(|r|r.get("recent_complete_result").is_some()).and_then(|r|r.get("local_round_id"))}));
         app.session
-            .set_photo_companion(
+            .save_companion_conversation(
                 photo,
-                Some(json!({"schema_version":1,"messages":conversation.messages,"rounds":conversation.rounds,"checkpoint":checkpoint})),
+                json!({"schema_version":conversation.schema_version,"messages":messages,"rounds":conversation.rounds,"round_records":conversation.records,"checkpoint":checkpoint}),
             )
             .map_err(|e| e.to_string())?;
+        if conversation.schema_version == 2
+            && app.session.library.is_some()
+            && let Some(saved) = app.session.load_companion_conversation(photo).map_err(|e| e.to_string())?
+        {
+            conversation.messages = saved.get("messages").and_then(Value::as_array).cloned().ok_or("AI 对话记录无效。")?;
+        }
         // Normal journal persistence, independent of the already visible execution result.
         app.session.persist_if_dirty();
+        self.pending_local_saves.remove(&photo);
         Ok(())
     }
     pub(super) fn history(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<Vec<Value>, String> {
@@ -79,7 +106,9 @@ impl State {
         for message in &mut messages {
             // Additive local metadata must not change the v1 model-input shape.
             if let Some(object) = message.as_object_mut() {
-                object.remove("local_round_id");
+                for key in ["local_round_id", "local_message_id", "stage", "model_call_id", "tool_request_id", "complete_state", "display_kind"] {
+                    object.remove(key);
+                }
             }
             text = text.saturating_add(message.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0));
             if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -92,14 +121,17 @@ impl State {
                 }
                 for picture in pictures {
                     if let Some(name) = picture.get("attachment").and_then(Value::as_str) {
-                        let data = app
-                            .session
-                            .library
-                            .as_mut()
-                            .ok_or("AI 预览附件的图库已关闭。")?
-                            .read_companion_attachment(name)
-                            .map_err(|e| e.to_string())?;
-                        picture.as_object_mut().ok_or("AI 图片记录无效。")?.remove("attachment");
+                        let library = app.session.library.as_mut().ok_or("AI 预览附件的图库已关闭。")?;
+                        let data = if name.starts_with("companion/v2/") {
+                            library.read_companion_preview(picture)
+                        } else {
+                            library.read_companion_attachment(name)
+                        }
+                        .map_err(|e| e.to_string())?;
+                        let object = picture.as_object_mut().ok_or("AI 图片记录无效。")?;
+                        for key in ["attachment", "digest", "length", "width", "height"] {
+                            object.remove(key);
+                        }
                         picture["data"] = json!(Base64::encode_string(&data));
                     }
                 }

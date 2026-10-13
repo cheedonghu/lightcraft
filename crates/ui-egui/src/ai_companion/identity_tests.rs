@@ -62,7 +62,7 @@ fn initial_and_correction_share_identity_and_stop_keeps_real_result() {
     state.save(&mut app, photo).unwrap();
     assert!(requests.try_recv().unwrap().path.ends_with("/stop"));
     let archive = app.session.photo_companion(photo).unwrap().unwrap();
-    assert_eq!(archive["schema_version"], 1);
+    assert_eq!(archive["schema_version"], 2);
     let rounds = archive["rounds"].as_array().unwrap();
     assert_eq!(rounds.len(), 2);
     for round in rounds {

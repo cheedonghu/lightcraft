@@ -124,7 +124,7 @@ fn explanation_keeps_stable_local_identity_after_selection_and_backend_admission
     assert!(app.session.photo_companion(other).unwrap().is_none());
     assert_eq!(*app.session.develop_of(photo).unwrap(), *original);
     state.conversations.clear();
-    state.load(&app, photo).unwrap();
+    state.load(&mut app, photo).unwrap();
     state.save(&mut app, photo).unwrap();
     assert_eq!(app.session.photo_companion(photo).unwrap().unwrap()["messages"][0]["local_round_id"], local);
 }
