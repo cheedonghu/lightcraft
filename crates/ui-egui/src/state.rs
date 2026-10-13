@@ -35,6 +35,8 @@ pub enum RightPanel {
     Activity,
     Keywords,
     Info,
+    /// Photo companion shares Tools without entering the editing view.
+    Ai,
     /// The profile browser (part of Edit).
     Profiles,
 }

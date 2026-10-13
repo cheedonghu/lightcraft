@@ -5,6 +5,7 @@ impl State {
         if let Some(conversation) = self.conversations.get(&photo) {
             if conversation.view.is_none()
                 && let Some(prefix) = conversation.prefix.as_ref()
+                && !self.paging.has_request(photo, &prefix.transaction_id)
             {
                 let cursor = lightcraft_engine::companion::storage::HistoryCursor { record: prefix.message_count.saturating_sub(32), offset: 0 };
                 self.request_page(app, photo, cursor)?;
@@ -230,7 +231,8 @@ impl State {
         let Some(prefix) = self.conversations.get(&photo).and_then(|c| c.prefix.clone()) else { return Ok(()) };
         let page = app.session.companion_history_slice_at(&prefix, cursor, 256 * 1024).map_err(|e| e.to_string())?;
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
-        conversation.view = Some(HistoryView { cursor, next: page.next, messages: page.records, fragments: page.fragments, bytes: page.bytes });
+        conversation.view =
+            Some(HistoryView { items: page.items, cursor, next: page.next, messages: page.records, fragments: page.fragments, bytes: page.bytes });
         self.prune_cache(app, photo);
         Ok(())
     }

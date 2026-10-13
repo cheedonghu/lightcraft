@@ -1,15 +1,22 @@
 //! Bounded page/fragment reads and immutable-prefix conversation updates.
 use super::*;
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryCursor {
     pub record: u64,
     pub offset: u64,
 }
+/// Ordered references into a slice's owned buffers; no text/body is duplicated.
+#[derive(Clone, Copy, Debug)]
+pub enum HistoryItem {
+    Record { record: u64, index: usize },
+    Fragment { record: u64, offset: u64, index: usize },
+}
 #[derive(Debug)]
 pub struct HistorySlice {
+    pub items: Vec<HistoryItem>,
     pub records: Vec<Value>,
-    /// Oversize records remain readable as consecutive UTF-8 serialized fragments.
+    /// Oversize message text remains readable as consecutive decoded UTF-8 fragments.
     pub fragments: Vec<String>,
     pub next: Option<HistoryCursor>,
     pub bytes: usize,
@@ -103,7 +110,7 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
     if !(1024..=256 * 1024).contains(&byte_budget) {
         return Err(error("history byte budget must be 1 KiB..256 KiB"));
     }
-    let mut result = HistorySlice { records: Vec::new(), fragments: Vec::new(), next: None, bytes: 0 };
+    let mut result = HistorySlice { items: Vec::new(), records: Vec::new(), fragments: Vec::new(), next: None, bytes: 0 };
     let mut scanned = 0usize;
     while cursor.record < h.message_count && scanned < 32 {
         scanned += 1;
@@ -144,6 +151,7 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
             if digest(&bytes) != entry.digest {
                 return Err(error("record digest mismatch"));
             }
+            result.items.push(HistoryItem::Record { record: cursor.record, index: result.records.len() });
             result.records.push(serde_json::from_slice(&bytes).map_err(error)?);
         } else {
             // Keep boundaries on complete UTF-8 scalars; the subsequent fragment resumes
@@ -154,6 +162,7 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
                 }
                 bytes.truncate(e.valid_up_to());
             }
+            result.items.push(HistoryItem::Fragment { record: cursor.record, offset: cursor.offset, index: result.fragments.len() });
             if text_end.is_some() {
                 let safe = complete_escape_prefix(&bytes);
                 bytes.truncate(safe);

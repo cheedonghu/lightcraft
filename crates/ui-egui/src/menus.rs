@@ -52,6 +52,7 @@ pub fn language_from_command(id: &str) -> Option<crate::i18n::Locale> {
 
 pub const UI_COMMANDS: &[UiCommand] = &[
     ("ai.open", "AI Photo Companion", None, "Window"),
+    ("panel.ai", "AI Assistant", None, ""),
     ("ai.start", "Analyze and Optimize", None, ""),
     ("ai.stop", "Stop AI", None, ""),
     ("ai.undo", "Undo AI Round", None, ""),
@@ -992,6 +993,10 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
         }
         "panel.versions" => {
             panel(app, &ctx, RightPanel::Versions, "Versions");
+            Ok(Value::Null)
+        }
+        "panel.ai" => {
+            panel(app, &ctx, RightPanel::Ai, "AI Assistant");
             Ok(Value::Null)
         }
         "panel.activity" => {

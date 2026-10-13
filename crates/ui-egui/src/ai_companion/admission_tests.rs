@@ -104,7 +104,7 @@ fn real_checkbox_submission_and_other_photo_editing_headless() {
         assert_eq!(request.path, "/v1/rounds");
         assert_eq!(h.app.session.companion_task_photo(), Some(photo));
         assert_eq!(h.app.ai.jobs.get(&photo).unwrap().state, "submitting");
-        h.app.ai.open = false;
+        h.app.run("panel.edit", json!({})).unwrap();
         h.step();
         h.step();
         let before = h.app.session.develop_of(photo).unwrap();

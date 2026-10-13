@@ -285,3 +285,339 @@ fn retired_history_worker_with_lost_completion_releases_the_local_lease() {
     assert!(requests.try_recv().is_err());
     assert_eq!(state.conversations[&photo].records[0]["local_terminal"], "failed");
 }
+
+#[test]
+fn shared_tools_mixed_continuation_renders_old_fragment_before_newer_record_and_current_tail() {
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        for current_tail in [false, true] {
+            let mut app = app(Box::new(MemStore::new()));
+            app.ui.language = language;
+            let photo = app.session.active().unwrap();
+            let old = format!("{}OLD_MESSAGE_END", "A".repeat(270_000));
+            let mut messages = vec![json!({"role":"assistant","text":old})];
+            if !current_tail {
+                messages.push(json!({"role":"user","text":"NEWER_MESSAGE"}));
+            }
+            app.session.save_companion_tail(photo, None, &messages, &[], &[], &json!({"schema_version":2})).unwrap();
+            let mut h = crate::headless::Headless::new(app, [1000.0, 680.0], 1.0);
+            h.app.run("ai.open", json!({})).unwrap();
+            for _ in 0..4 {
+                h.step();
+            }
+            assert!(h.app.ai.conversations[&photo].view.as_ref().unwrap().messages.is_empty());
+            if current_tail {
+                h.app.ai.conversations.get_mut(&photo).unwrap().messages.push(json!({"role":"user","text":"NEWER_MESSAGE"}));
+            }
+            let timeout = Duration::from_secs(10);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryNewer"}), timeout)["ok"], true);
+            for _ in 0..3 {
+                h.step();
+            }
+            let text = h.app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().to_owned();
+            assert!(text.find("OLD_MESSAGE_END").unwrap() < text.find("NEWER_MESSAGE").unwrap(), "{current_tail}: {text}");
+            let painted = h.painted_text().join("\n");
+            assert!(painted.find("OLD_MESSAGE_END").unwrap() < painted.find("NEWER_MESSAGE").unwrap());
+            assert!(h.app.ai.conversations[&photo].view.as_ref().unwrap().bytes <= 256 * 1024);
+            if let Ok(dir) = std::env::var("UX08_SCREENSHOT_DIR") {
+                h.app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+                h.app.services.png = Some(Box::new(|image| {
+                    lightcraft_engine::export::encode_image(
+                        image,
+                        &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+                    )
+                    .unwrap()
+                }));
+                assert_eq!(
+                    h.request(
+                        "ui.screenshot",
+                        json!({"path":format!("{dir}/fragment-{}-{}.png",language.code(),current_tail),"headless":true}),
+                        timeout
+                    )["ok"],
+                    true
+                );
+            }
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryOlder"}), timeout)["ok"], true);
+            for _ in 0..3 {
+                h.step();
+            }
+            assert_eq!(h.app.ai.conversations[&photo].view.as_ref().unwrap().cursor.offset, 0);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryNewer"}), timeout)["ok"], true);
+            for _ in 0..3 {
+                h.step();
+            }
+            let text = h.app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().to_owned();
+            assert!(text.find("OLD_MESSAGE_END").unwrap() < text.find("NEWER_MESSAGE").unwrap());
+        }
+    }
+}
+
+#[test]
+fn cold_native_history_command_and_rapid_requests_keep_the_latest_explicit_cursor() {
+    use std::sync::Mutex;
+    struct Gate {
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        used: AtomicBool,
+    }
+    struct ReaderStore {
+        files: MemStore,
+        gate: Arc<Gate>,
+        reader: bool,
+    }
+    impl ReaderStore {
+        fn wait(&self, name: &str) {
+            if self.reader && name.contains("/blocks/") && !self.gate.used.swap(true, Ordering::Relaxed) {
+                self.gate.entered.send(()).unwrap();
+                self.gate.release.lock().unwrap().recv().unwrap();
+            }
+        }
+    }
+    impl Store for ReaderStore {
+        fn read(&mut self, n: &str) -> std::io::Result<Option<Vec<u8>>> {
+            self.files.read(n)
+        }
+        fn read_limited(&mut self, n: &str, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+            self.wait(n);
+            self.files.read_limited(n, max)
+        }
+        fn read_range(&mut self, n: &str, o: u64, l: usize) -> std::io::Result<Vec<u8>> {
+            self.wait(n);
+            self.files.read_range(n, o, l)
+        }
+        fn write_atomic(&mut self, n: &str, b: &[u8]) -> std::io::Result<()> {
+            self.files.write_atomic(n, b)
+        }
+        fn remove(&mut self, n: &str) -> std::io::Result<()> {
+            self.files.remove(n)
+        }
+        fn append(&mut self, n: &str, b: &[u8]) -> std::io::Result<()> {
+            self.files.append(n, b)
+        }
+        fn truncate(&mut self, n: &str, l: u64) -> std::io::Result<()> {
+            self.files.truncate(n, l)
+        }
+        fn describe(&self) -> String {
+            "blocked native page".into()
+        }
+        fn background_writer(&self) -> Option<Box<dyn Store>> {
+            Some(Box::new(Self { files: self.files.clone(), gate: self.gate.clone(), reader: true }))
+        }
+    }
+    for blocked_default in [false, true] {
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        let gate = Arc::new(Gate { entered, release: Mutex::new(release_rx), used: AtomicBool::new(false) });
+        let mut app = app(Box::new(ReaderStore { files: MemStore::new(), gate, reader: false }));
+        let photo = app.session.active().unwrap();
+        let messages: Vec<_> = (0..260).map(|n| json!({"role":"assistant","text":format!("history {n}")})).collect();
+        app.session.save_companion_tail(photo, None, &messages, &[], &[], &json!({"schema_version":2})).unwrap();
+        if blocked_default {
+            // Force the initial newest page to be inside native I/O before issuing
+            // the actual explicit command; no history page has been loaded yet.
+            app.run("ai.open", json!({})).unwrap();
+            super::poll(&mut app, &egui::Context::default());
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        app.run("ai.history", json!({"photo":photo.0,"record":0,"offset":0})).unwrap();
+        if !blocked_default {
+            // On a completely cold command, cancellation may retire the default
+            // worker before it enters I/O. Dispatch its queued explicit replacement.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if entered_rx.try_recv().is_ok() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "native page never entered I/O");
+                super::poll(&mut app, &egui::Context::default());
+                std::thread::yield_now();
+            }
+        }
+        app.run("ai.open", json!({})).unwrap();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().starts_with("history 0\n") && Instant::now() < deadline {
+            super::poll(&mut app, &egui::Context::default());
+            std::thread::yield_now();
+        }
+        assert!(app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().starts_with("history 0\n"));
+        // Queue several desired pages before accepting any already-completed result.
+        app.run("ai.history", json!({"photo":photo.0,"record":32})).unwrap();
+        app.run("ai.history", json!({"photo":photo.0,"record":64})).unwrap();
+        app.run("ai.history", json!({"photo":photo.0,"record":96})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().starts_with("history 96\n") && Instant::now() < deadline {
+            super::poll(&mut app, &egui::Context::default());
+            let status = app.run("ai.status", json!({})).unwrap();
+            let text = status["text"].as_str().unwrap();
+            assert!(text.starts_with("history 0\n") || text.starts_with("history 96\n"), "obsolete navigation result became visible: {text}");
+            std::thread::yield_now();
+        }
+        assert!(app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().starts_with("history 96\n"));
+    }
+}
+
+#[test]
+fn history_controls_remain_reachable_in_supported_short_floating_and_stacked_tools() {
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        for (stacked, height) in [(false, 120.0), (true, 120.0), (false, 240.0), (true, 240.0)] {
+            let mut app = app(Box::new(MemStore::new()));
+            app.ui.language = language;
+            let photo = app.session.active().unwrap();
+            let messages: Vec<_> = (0..260).map(|n| json!({"role":"assistant","text":format!("historic message {n}")})).collect();
+            app.session.save_companion_tail(photo, None, &messages, &[], &[], &json!({"schema_version":2})).unwrap();
+            let mut h = crate::headless::Headless::new(app, [1000.0, 680.0], 1.0);
+            super::panel_tests::short_tools(&mut h, stacked, height);
+            let timeout = Duration::from_secs(10);
+            super::panel_tests::reachable(&mut h, "button:aiHistoryOlder", -1.0);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryOlder"}), timeout)["ok"], true);
+            for _ in 0..3 {
+                h.step();
+            }
+            assert_eq!(h.app.ai.conversations[&photo].view.as_ref().unwrap().cursor.record, 196);
+            super::panel_tests::reachable(&mut h, "button:aiHistoryNewer", -1.0);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryNewer"}), timeout)["ok"], true);
+            for _ in 0..3 {
+                h.step();
+            }
+            assert_eq!(h.app.ai.conversations[&photo].view.as_ref().unwrap().cursor.record, 228);
+            super::panel_tests::short_snapshot(
+                &mut h,
+                &format!("history-short-{}-{}-{}", if stacked { "stack" } else { "float" }, height as usize, language.code()),
+            );
+        }
+    }
+}
+
+#[test]
+fn public_poll_preserves_initial_correction_feedback_and_stop_before_completed_result_consumption() {
+    fn outgoing(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>, suffix: &str) -> network::Request {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            h.step();
+            if let Ok(request) = requests.try_recv() {
+                assert!(request.path.ends_with(suffix), "unexpected {}", request.path);
+                assert_eq!(h.app.run("ai.status", json!({})).unwrap()["workerBusy"], false, "feedback must wait for its producer to retire");
+                return request;
+            }
+            assert!(Instant::now() < deadline, "{suffix} was never emitted");
+            std::thread::yield_now();
+        }
+    }
+    fn phase(events: &mpsc::SyncSender<network::Event>, request: &network::Request, state: &str) {
+        events.send(network::Event::Server{kind:"round.state".into(),data:json!({"round_id":format!("public-round-{}",request.identity.submission_seq),"payload":{"submission_seq":request.identity.submission_seq,"photo_ref":{"library_generation":request.identity.scope.library_generation,"photo_id":request.identity.scope.photo.0},"state":state}})}).unwrap();
+    }
+    fn plan(events: &mpsc::SyncSender<network::Event>, request: &network::Request, revision: u64, id: &str, exposure: f64) {
+        events.send(network::Event::Server{kind:"message.completed".into(),data:json!({"round_id":format!("public-round-{}",request.identity.submission_seq),"stage":id,"payload":{"message_id":id,"model_call_id":id,"tool_calls":[{"id":id,"name":"apply_edit_plan","arguments":{"operations":[{"type":"set_controls","values":{"light.exposure":exposure}}]}}]}})}).unwrap();
+        events.send(network::Event::Server{kind:"edit.plan".into(),data:json!({"round_id":format!("public-round-{}",request.identity.submission_seq),"payload":{"plan_id":id,"tool_call_id":id,"capability_version":"lightcraft-v2","expected_revision":revision,"operations":[{"type":"set_controls","values":{"light.exposure":exposure}}]}})}).unwrap();
+    }
+    let mut app = app(Box::new(MemStore::new()));
+    let photo = app.session.active().unwrap();
+    let (connection, requests, events) = network::test_connection();
+    app.ai.connection = Some(connection);
+    app.ai.generation = app.session.library_generation();
+    let mut h = crate::headless::Headless::new(app, [1000.0, 680.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    for _ in 0..4 {
+        h.step();
+    }
+    let timeout = Duration::from_secs(10);
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
+    let creation = requests.try_recv().unwrap();
+    assert_eq!(creation.path, "/v1/rounds");
+    phase(&events, &creation, "awaiting_input");
+    outgoing(&mut h, &requests, "/input");
+    for (id, state, exposure) in [("initial", "awaiting_initial_execution", 0.4), ("correction", "awaiting_correction_execution", 0.2)] {
+        phase(&events, &creation, state);
+        plan(&events, &creation, h.app.session.photo_revision(photo), id, exposure);
+        let feedback = outgoing(&mut h, &requests, "/execution");
+        assert_eq!(feedback.body["outcome"], "succeeded");
+        assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, exposure);
+        events
+            .send(network::Event::Response {
+                submission: 0,
+                round: feedback.round.clone(),
+                path: feedback.path,
+                identity: feedback.identity,
+                result: Ok(json!({"accepted":true,"_client_execution_plan_id":id})),
+            })
+            .unwrap();
+    }
+    events
+        .send(network::Event::Server {
+            kind: "round.ended".into(),
+            data: json!({"round_id":format!("public-round-{}",creation.identity.submission_seq),"payload":{"terminal_state":"completed"}}),
+        })
+        .unwrap();
+    for _ in 0..3 {
+        h.step();
+    }
+    h.app.run("ai.start", json!({"prompt":"keep the previous complete result"})).unwrap();
+    let creation = requests.try_recv().unwrap();
+    phase(&events, &creation, "awaiting_input");
+    outgoing(&mut h, &requests, "/input");
+    phase(&events, &creation, "awaiting_initial_execution");
+    plan(&events, &creation, h.app.session.photo_revision(photo), "held", 0.6);
+    super::poll(&mut h.app, &egui::Context::default());
+    assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.2);
+    // Status does not consume completion messages: let the real producer finish
+    // while holding UI consumption, then cancel through the actual command.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while h.app.run("ai.status", json!({})).unwrap()["workerBusy"] == true {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    h.app.run("ai.stop", json!({})).unwrap();
+    for _ in 0..4 {
+        h.step();
+    }
+    assert_eq!(h.app.run("ai.status", json!({})).unwrap()["busy"], false);
+    assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.2);
+    for request in requests.try_iter() {
+        assert!(!request.path.ends_with("/execution"), "cancelled held completion cannot publish feedback");
+    }
+}
+
+#[test]
+fn narrow_tools_paints_complete_paging_labels_and_navigates_a_long_message() {
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        let mut app = app(Box::new(MemStore::new()));
+        app.ui.language = language;
+        let photo = app.session.active().unwrap();
+        app.session
+            .save_companion_tail(
+                photo,
+                None,
+                &[json!({"role":"assistant","text":format!("{}OLD_MESSAGE_END","A".repeat(270_000))}), json!({"role":"user","text":"NEWER_MESSAGE"})],
+                &[],
+                &[],
+                &json!({"schema_version":2}),
+            )
+            .unwrap();
+        let mut h = crate::headless::Headless::new(app, [620.0, 520.0], 1.0);
+        h.app.run("ai.open", json!({})).unwrap();
+        for _ in 0..4 {
+            h.step();
+        }
+        let tools = h.app.widgets.iter().find(|(id, _)| id == "panel:right_panel").unwrap().1;
+        for label in ["Older AI history", "Newer AI history"] {
+            let shape = h
+                .view
+                .painted_shapes()
+                .into_iter()
+                .find_map(|s| match s {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == language.tr(label) => Some(text),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(tools.contains_rect(shape.visual_bounding_rect()), "{label} is clipped outside Tools");
+        }
+        assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryNewer"}), Duration::from_secs(10))["ok"], true);
+        for _ in 0..3 {
+            h.step();
+        }
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        let text = status["text"].as_str().unwrap();
+        assert!(text.find("OLD_MESSAGE_END").unwrap() < text.find("NEWER_MESSAGE").unwrap());
+    }
+}

@@ -15,6 +15,7 @@ fn phase(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, phase: &str
 }
 fn render(state: &mut State, app: &mut LightcraftApp) {
     let msg = state.rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    super::identity_tests::await_producer_retirement(state, &msg);
     state.prepared(app, &egui::Context::default(), msg).unwrap();
 }
 #[test]
