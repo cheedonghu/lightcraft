@@ -798,7 +798,10 @@ impl Session {
     /// preserve these immutable manifests and their graphs until release/close.
     pub fn pin_companion_prefix(&mut self, photo: PhotoId, header: Option<PhotoHeader>) -> Result<()> {
         if let Some(header) = header {
-            if header.photo_id != photo || (!self.companion_archive.prefixes.contains_key(&photo) && self.companion_archive.prefixes.len() >= 32) {
+            if header.photo_id != photo
+                || serialized_length(&header)? > SMALL as usize
+                || (!self.companion_archive.prefixes.contains_key(&photo) && self.companion_archive.prefixes.len() >= 32)
+            {
                 return Err(error("runtime prefix retention capacity exceeded"));
             }
             self.companion_archive.prefixes.insert(photo, header);

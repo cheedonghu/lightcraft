@@ -423,3 +423,29 @@ fn oversized_text_fragments_decode_escapes_without_exposing_record_json_or_losin
     assert!(slices > 128);
     assert_eq!(visible, text);
 }
+
+#[test]
+fn runtime_prefix_roots_have_a_byte_bound_and_release_capacity() {
+    let mut session = Session::new();
+    session
+        .open_library_in(
+            LibraryStores { catalog: Box::new(MemStore::new()), files: Box::new(MemStore::new()), dir: "root-cache".into(), on_disk: false },
+            true,
+        )
+        .unwrap();
+    let photo = session.active().unwrap();
+    let header = session.save_companion_tail(photo, None, &[], &[], &[], &json!({"schema_version":2})).unwrap();
+    let mut oversized = header.clone();
+    oversized.metadata = "x".repeat(40 * 1024);
+    assert!(session.pin_companion_prefix(photo, Some(oversized)).is_err());
+    for n in 0..32 {
+        let mut h = header.clone();
+        h.photo_id = lightcraft_catalog::PhotoId(10_000 + n);
+        session.pin_companion_prefix(h.photo_id, Some(h)).unwrap();
+    }
+    let mut extra = header;
+    extra.photo_id = lightcraft_catalog::PhotoId(20_000);
+    assert!(session.pin_companion_prefix(extra.photo_id, Some(extra.clone())).is_err());
+    session.pin_companion_prefix(lightcraft_catalog::PhotoId(10_000), None).unwrap();
+    session.pin_companion_prefix(extra.photo_id, Some(extra)).unwrap();
+}

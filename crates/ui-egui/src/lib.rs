@@ -959,6 +959,10 @@ impl LightcraftApp {
 
     /// Per-frame logic before layout (control channel, renders, shortcuts, drops).
     pub fn logic(&mut self, ctx: &egui::Context) {
+        // Status/background commands also trigger automatic persistence. Apply
+        // the same frame barrier before any of them; ordinary core writes and
+        // explicit flush/close retain their normal durability.
+        self.session.defer_companion_retry(self.ai.feedback_needs_paint(ctx));
         i18n::set_language(self.ui.language);
         let t0 = now_ms();
         panels::library_problem::logic(self);

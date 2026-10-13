@@ -208,6 +208,80 @@ fn bounded_history_buttons_show_older_and_newer_pages_in_both_languages() {
         if let Ok(dir) = std::env::var("UX08_SCREENSHOT_DIR") {
             let response = h.request("ui.screenshot", json!({"path":format!("{dir}/history-{}.png",language.code()),"headless":true}), timeout);
             assert_eq!(response["ok"], true, "{response}");
+            h.size = egui::vec2(620.0, 520.0);
+            for _ in 0..4 {
+                h.step();
+            }
+            assert!(h.painted_text().iter().any(|s| s == language.tr("Older AI history")));
+            let response =
+                h.request("ui.screenshot", json!({"path":format!("{dir}/history-narrow-{}.png",language.code()),"headless":true}), timeout);
+            assert_eq!(response["ok"], true, "{response}");
         }
     }
+}
+
+#[test]
+fn async_preflight_enqueue_failure_releases_the_local_lease_without_uncertain_admission() {
+    let mut app = app(Box::new(MemStore { background: true, ..MemStore::new() }));
+    let photo = app.session.active().unwrap();
+    app.session
+        .save_companion_tail(photo, None, &[json!({"role":"user","text":"old exact history"})], &[], &[], &json!({"schema_version":2}))
+        .unwrap();
+    let initial = app.session.develop_of(photo).unwrap();
+    let (connection, requests, _) = network::test_connection();
+    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    state.paging.alive.store(true, Ordering::Relaxed);
+    state.start(&mut app).unwrap();
+    let identity = state.jobs[&photo].identity.clone();
+    let cancel = state.jobs[&photo].cancel.clone();
+    assert!(requests.try_recv().is_err());
+    for _ in 0..8 {
+        state
+            .connection
+            .as_ref()
+            .unwrap()
+            .requests
+            .try_send(network::Request {
+                path: "/fixture/full-queue".into(),
+                body: Value::Null,
+                submission: identity.submission_seq,
+                round: String::new(),
+                identity: identity.clone(),
+                cancel: cancel.clone(),
+            })
+            .unwrap();
+    }
+    let message = state.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let error = state.prepared(&mut app, &egui::Context::default(), message).unwrap_err();
+    state.fail_one(&mut app, photo, &error);
+    assert!(state.jobs.is_empty());
+    assert!(app.session.companion_task_photo().is_none());
+    assert!(cancel.load(Ordering::Relaxed));
+    assert_eq!(app.session.develop_of(photo).unwrap(), initial);
+    assert_eq!(state.conversations[&photo].records[0]["local_terminal"], "failed");
+    for request in requests.try_iter() {
+        assert_ne!(request.path, "/v1/rounds");
+    }
+}
+
+#[test]
+fn retired_history_worker_with_lost_completion_releases_the_local_lease() {
+    let mut app = app(Box::new(MemStore { background: true, ..MemStore::new() }));
+    let photo = app.session.active().unwrap();
+    app.session
+        .save_companion_tail(photo, None, &[json!({"role":"user","text":"old exact history"})], &[], &[], &json!({"schema_version":2}))
+        .unwrap();
+    let (connection, requests, _) = network::test_connection();
+    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    state.paging.alive.store(true, Ordering::Relaxed);
+    state.start(&mut app).unwrap();
+    // Model a disconnected/full completion channel after the worker has really retired.
+    let _ = state.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    state.jobs[&photo].cancel.store(true, Ordering::Relaxed);
+    state.workers.insert(photo, Arc::new(AtomicBool::new(false)));
+    state.poll_inner(&mut app, &egui::Context::default());
+    assert!(state.jobs.is_empty());
+    assert!(app.session.companion_task_photo().is_none());
+    assert!(requests.try_recv().is_err());
+    assert_eq!(state.conversations[&photo].records[0]["local_terminal"], "failed");
 }

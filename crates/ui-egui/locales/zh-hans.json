@@ -2036,6 +2036,10 @@
   "Undo AI Round": "撤回本轮",
   "Delete Conversation": "删除对话",
   "Processing this photo…": "正在处理此照片…",
+  "Cancelling… Waiting for the AI connection to close safely.": "正在取消，等待 AI 连接安全结束。",
+  "Stopped generating. Keeping the latest complete result.": "已停止生成，保留最近一次完整结果。",
+  "Stopped generating. Confirming cancellation of the submission…": "已停止生成，正在确认取消提交。",
+  "Cancelling…": "正在取消…",
   "Stop Generating": "停止生成",
   "AI Companion is currently available on desktop only.": "AI 助手目前仅支持桌面版。",
   "Please consent to sending compressed previews first.": "请先同意发送压缩预览。",
@@ -2051,5 +2055,6 @@
   "Older AI history": "较早的 AI 历史",
   "Newer AI history": "较新的 AI 历史",
   "The complete AI history exceeds the service limit. Local history is retained.": "完整 AI 历史超过服务限制。本地历史已保留。",
-  "AI history is waiting to be saved. Retry after saving completes.": "AI 历史正在等待保存。保存完成后请重试。"
+  "AI history is waiting to be saved. Retry after saving completes.": "AI 历史正在等待保存。保存完成后请重试。",
+  "AI history preparation failed. Try again.": "AI 历史准备失败，请重试。"
 }
