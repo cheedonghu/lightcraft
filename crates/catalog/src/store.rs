@@ -53,6 +53,18 @@ pub trait Store: Send {
     fn truncate(&mut self, name: &str, len: u64) -> io::Result<()>;
     /// Human-readable location (diagnostics).
     fn describe(&self) -> String;
+    /// Stable process-local identity for reader retention across close/reopen.
+    /// Native aliases must identify the same physical directory; wrappers forward
+    /// their adapter's identity. Unknown adapters cannot offer retained readers.
+    fn retention_namespace(&self) -> Option<String> {
+        None
+    }
+    /// Require a shared process-wide physical-reclamation pause while any
+    /// conservative reader lives. Ownership/debt still uses retention_namespace;
+    /// wrappers must forward both properties, never use a global owner identity.
+    fn conservative_retention(&self) -> bool {
+        false
+    }
     /// Another handle on the same files that a worker thread can write `catalog.snap` through
     /// while this one keeps appending to the log (background compaction). `None` (the default):
     /// snapshots are written synchronously.
@@ -235,6 +247,33 @@ impl Store for FsStore {
         self.dir.display().to_string()
     }
 
+    fn retention_namespace(&self) -> Option<String> {
+        let metadata = std::fs::metadata(&self.dir).ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(format!("native-directory:{}:{}", metadata.dev(), metadata.ino()))
+        }
+        #[cfg(windows)]
+        {
+            // Safe directory-handle identity routes only this library's debt,
+            // including case/symlink aliases. Unavailable/partial IDs protect GC.
+            let handle = winapi_util::Handle::from_path_any(&self.dir).ok()?;
+            let info = winapi_util::file::information(&handle).ok()?;
+            let (volume, index) = (info.volume_serial_number(), info.file_index());
+            (volume != 0 && index != 0).then(|| format!("native-windows-directory:{volume}:{index}"))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
+    }
+    fn conservative_retention(&self) -> bool {
+        cfg!(windows)
+    }
     #[cfg(not(target_arch = "wasm32"))]
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         Some(Box::new(FsStore { dir: self.dir.clone(), appender: None }))
@@ -301,11 +340,24 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
 }
 
 /// In-memory files. Clones share the same files (so a test can "reopen" or corrupt them).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MemStore {
+    namespace: Option<u64>,
     pub files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     /// Offer a [`Store::background_writer`] (off by default: snapshots stay synchronous).
     pub background: bool,
+}
+
+impl Default for MemStore {
+    fn default() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Never wrap/reuse identity while a retired debt registry may outlive
+        // the backing allocation. Exhaustion returns unknown/protected identity;
+        // clones carry the same namespace and files.
+        let namespace = NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).ok();
+        Self { namespace, files: Arc::default(), background: false }
+    }
 }
 
 impl MemStore {
@@ -371,6 +423,9 @@ impl Store for MemStore {
     }
     fn describe(&self) -> String {
         "memory".into()
+    }
+    fn retention_namespace(&self) -> Option<String> {
+        self.namespace.map(|id| format!("memory-store:{id}"))
     }
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         self.background.then(|| Box::new(self.clone()) as Box<dyn Store>)

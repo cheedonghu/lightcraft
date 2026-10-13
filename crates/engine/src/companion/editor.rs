@@ -92,6 +92,9 @@ fn read(store: &mut dyn Store, photo: PhotoId) -> Result<EditorState> {
     })
 }
 impl Editors {
+    pub(crate) fn dirty_for(&self, photo: PhotoId) -> bool {
+        self.dirty.contains(&photo)
+    }
     pub(crate) fn dirty(&self) -> bool {
         !self.dirty.is_empty()
     }

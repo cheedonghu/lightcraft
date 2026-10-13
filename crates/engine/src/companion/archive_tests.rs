@@ -395,7 +395,12 @@ fn v2_head_error_after_visible_rename_keeps_valid_result_and_retry_is_safe() {
     assert_eq!(s.photo_companion(id).unwrap(), Some(&actual));
     let mut reopened = open(catalog, Box::new(files));
     assert_eq!(reopened.load_companion_conversation(id).unwrap(), Some(actual.clone()));
+    let transaction = s.companion_pending(id).unwrap().unwrap().transaction_id;
+    fail.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(s.persist().is_err(), "visible HEAD is not a durable confirmation after sync failed");
+    assert_eq!(s.companion_pending(id).unwrap().unwrap().transaction_id, transaction);
     s.persist().unwrap();
+    assert_eq!(s.companion_photo_header(id).unwrap().unwrap().transaction_id, transaction);
     assert!(s.unsaved().is_none());
     assert_eq!(reopened.load_companion_conversation(id).unwrap(), Some(actual));
 }

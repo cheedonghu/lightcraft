@@ -9,6 +9,7 @@ struct PageRequest {
     cursor: HistoryCursor,
 }
 struct ReadMessage {
+    retention: lightcraft_engine::companion::storage::HistoryRetention,
     request: u64,
     scope: PhotoScope,
     transaction: String,
@@ -80,6 +81,7 @@ impl State {
                         conversation.notice = notice;
                     }
                     conversation.view = Some(HistoryView {
+                        _retention: message.retention,
                         items: page.items,
                         cursor: message.cursor,
                         next: page.next,
@@ -101,6 +103,7 @@ impl State {
                 Err(error) => {
                     conversation.notice = error;
                     conversation.view = Some(HistoryView {
+                        _retention: message.retention,
                         items: Vec::new(),
                         cursor: message.cursor,
                         next: None,
@@ -211,7 +214,7 @@ impl State {
         // The preceding reader has retired. Drain its obsolete completions before
         // launching the sole next reader so stale pages cannot fill the channel.
         while self.paging.rx.try_recv().is_ok() {}
-        if let Some(mut reader) = app.session.companion_reader(&request.header).map_err(|e| e.to_string())? {
+        if let Some(reader) = app.session.companion_reader(&request.header).map_err(|e| e.to_string())? {
             let tx = self.paging.tx.clone();
             self.paging.cancel = Arc::new(AtomicBool::new(false));
             let cancel = self.paging.cancel.clone();
@@ -221,6 +224,7 @@ impl State {
                 .name("companion-history-page".into())
                 .spawn(move || {
                     let _guard = guard;
+                    let mut reader = reader; // actual reader drops before alive on cancellation
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
@@ -269,6 +273,7 @@ impl State {
                     });
                     if !cancel.load(Ordering::Relaxed) {
                         let _ = tx.try_send(ReadMessage {
+                            retention: reader.into_retention(),
                             request: request.id,
                             scope: request.scope,
                             transaction: request.header.transaction_id,
@@ -287,7 +292,7 @@ impl State {
     }
     pub(super) fn begin_history(
         &mut self,
-        mut reader: HistoryReader,
+        reader: HistoryReader,
         identity: RoundIdentity,
         tail: Vec<Value>,
         prompt: String,
@@ -302,6 +307,7 @@ impl State {
             .name("companion-model-history".into())
             .spawn(move || {
                 let _guard = guard;
+                let mut reader = reader;
                 let result = assemble(&mut reader, tail, &cancel, &prompt, &settings);
                 if !cancel.load(Ordering::Relaxed) && tx.try_send(WorkerMessage::HistoryPrepared { identity, result }).is_err() {
                     cancel.store(true, Ordering::Relaxed);

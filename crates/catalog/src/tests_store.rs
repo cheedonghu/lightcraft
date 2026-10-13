@@ -271,3 +271,17 @@ fn native_case_alias_truncate_reopens_appender_and_checks_parent_sync() {
     assert_eq!(appended.unwrap_err().kind(), io::ErrorKind::PermissionDenied, "truncation through a case alias must close the cached handle");
     assert_eq!(bytes, b"o+new");
 }
+
+#[test]
+fn memory_namespaces_are_shared_by_clones_and_never_reused_after_backing_retirement() {
+    let mut retired = std::collections::BTreeSet::new();
+    for _ in 0..256 {
+        let store = MemStore::new();
+        let namespace = store.retention_namespace().unwrap();
+        let mut clone = store.clone();
+        assert_eq!(clone.retention_namespace().as_ref(), Some(&namespace));
+        clone.write_atomic("shared", b"actual shared backing").unwrap();
+        assert_eq!(store.get("shared").unwrap(), b"actual shared backing");
+        assert!(retired.insert(namespace), "a fresh backing must not inherit a retired process namespace");
+    }
+}
