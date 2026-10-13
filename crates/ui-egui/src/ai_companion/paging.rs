@@ -118,7 +118,7 @@ impl State {
             }
         }
         // One resumable record step per frame, retaining verified graph identity.
-        if let Some(photo) = app.session.active()
+        if let Some(photo) = self.displayed_photo(app)
             && let Some(conversation) = self.conversations.get_mut(&photo)
             && let Some(header) = conversation.prefix.as_ref()
             && let Some(view) = conversation.view.as_mut()

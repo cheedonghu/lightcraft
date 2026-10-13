@@ -2170,5 +2170,7 @@
   "Service reachable (HTTP only)": "服务可达（仅 HTTP）",
   "Service unreachable": "服务不可达",
   "Service not checked": "尚未检测服务",
-  "Connection active; heartbeat acknowledged. Model output is separate.": "连接仍在，心跳已确认；模型文字输出另行观察。"
+  "Connection active; heartbeat acknowledged. Model output is separate.": "连接仍在，心跳已确认；模型文字输出另行观察。",
+  "Return to Current Photo": "返回当前照片",
+  "Return to the selected photo before changing its AI conversation or edits.": "请先返回所选照片，再修改其 AI 会话或编辑效果。"
 }

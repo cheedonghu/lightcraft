@@ -32,7 +32,11 @@ pub(super) fn navigate(state: &mut State, app: &mut LightcraftApp) -> Result<Val
     if scope.library_generation != app.session.library_generation() {
         return Err(tr("This AI task belongs to a closed library.").into());
     }
-    state.sync_editor(app)?;
+    if state.feedback_pending || state.local_save_after_frame.is_some() {
+        state.sync_editor_deferred(app)?;
+    } else {
+        state.sync_editor(app)?;
+    }
     let unavailable = app.session.catalog.photo(scope.photo).is_none_or(|p| {
         p.deleted
             || match &p.source {
@@ -42,11 +46,15 @@ pub(super) fn navigate(state: &mut State, app: &mut LightcraftApp) -> Result<Val
     });
     if unavailable {
         state.readonly_task = Some(scope);
-        if let Err(error) = state.load(app, scope.photo) {
+        state.readonly_selection = Some(app.session.selection.clone());
+        if !state.feedback_pending
+            && state.local_save_after_frame.is_none()
+            && let Err(error) = state.load(app, scope.photo)
+        {
             state.text = error;
         }
     } else {
-        state.readonly_task = None;
+        state.leave_task_view();
         app.session.execute("library.select", &json!({"ids":[scope.photo.0],"active":scope.photo.0})).map_err(|e| e.to_string())?;
     }
     app.ui.right = crate::state::RightPanel::Ai;
@@ -57,6 +65,20 @@ pub(super) fn navigate(state: &mut State, app: &mut LightcraftApp) -> Result<Val
         task.unread = false;
     }
     Ok(json!({"photo":scope.photo.0,"opened":true}))
+}
+/// Return is navigation only: ordinary current photo parameters are never restored/replayed.
+pub(super) fn return_current(state: &mut State, app: &mut LightcraftApp) -> Result<Value, String> {
+    state.leave_task_view();
+    if state.feedback_pending || state.local_save_after_frame.is_some() {
+        state.sync_editor_deferred(app)?;
+    } else {
+        state.sync_editor(app)?;
+    }
+    app.ui.right = crate::state::RightPanel::Ai;
+    app.ui.tool.clear();
+    state.open = true;
+    crate::docking::reveal_command(app, "ai.open")?;
+    Ok(json!({"returnedToCurrent":true,"photo":app.session.active().map(|p|p.0)}))
 }
 pub(super) fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let Some(task) = app.ai.task.as_ref().filter(|t| t.identity.scope.library_generation == app.session.library_generation()) else {

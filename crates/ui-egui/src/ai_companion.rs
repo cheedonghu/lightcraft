@@ -61,6 +61,7 @@ pub struct State {
     telemetry: network::Telemetry,
     task: Option<task_entry::Task>,
     readonly_task: Option<PhotoScope>,
+    readonly_selection: Option<lightcraft_engine::Selection>,
     consent: bool,
     prompt: String,
     editor_photo: Option<PhotoId>,
@@ -96,6 +97,7 @@ impl Default for State {
             telemetry: network::Telemetry::default(),
             task: None,
             readonly_task: None,
+            readonly_selection: None,
             consent: false,
             prompt: String::new(),
             editor_photo: None,
@@ -220,6 +222,23 @@ impl Drop for WorkerAlive {
 }
 
 impl State {
+    fn leave_task_view(&mut self) {
+        if self.readonly_task.take().is_some() {
+            self.paging.cancel();
+        }
+        self.readonly_selection = None;
+    }
+    fn sync_task_selection(&mut self, app: &LightcraftApp) {
+        if self.readonly_task.is_some() && self.readonly_selection.as_ref().is_some_and(|selection| selection != &app.session.selection) {
+            self.leave_task_view();
+        }
+    }
+    fn displayed_photo(&self, app: &LightcraftApp) -> Option<PhotoId> {
+        self.readonly_task
+            .filter(|scope| scope.library_generation == app.session.library_generation())
+            .map(|scope| scope.photo)
+            .or_else(|| app.session.active())
+    }
     pub fn is_busy(&self, photo: PhotoId) -> bool {
         self.jobs.get(&photo).is_some_and(|j| !j.stopped)
     }
@@ -1133,12 +1152,14 @@ impl State {
             self.local_save_retry_at = None;
             self.local_save_after_frame = None;
             self.feedback_pending = false;
+            self.readonly_selection = None;
             self.readonly_task = None;
             self.task = None;
             self.telemetry = network::Telemetry::default();
             self.health = health::Health::default();
             self.generation = generation;
         }
+        self.sync_task_selection(app);
         self.health.poll();
         if self.health.checking() {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -1163,14 +1184,11 @@ impl State {
                 c.dirty_queued = false;
             }
         }
-        if let Some(photo) = self.readonly_task.map(|scope| scope.photo).or_else(|| app.session.active()) {
-            self.prune_cache(app, photo);
-        }
         if self.paging.busy() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         if self.open
-            && let Some(photo) = self.readonly_task.map(|scope| scope.photo).or_else(|| app.session.active())
+            && let Some(photo) = self.displayed_photo(app)
             && let Err(error) = self.load(app, photo)
         {
             self.text = error;
@@ -1555,6 +1573,9 @@ fn close_pending_tools(messages: &mut Vec<Value>, outcome: &str) {
     }
 }
 
+pub(crate) fn selection_intent(app: &mut LightcraftApp) {
+    app.ai.leave_task_view();
+}
 pub fn show_task_entry(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     task_entry::show(app, ui);
 }
@@ -1564,7 +1585,7 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
     state.poll_inner(app, ctx);
     if state.open
         && !state.feedback_needs_paint(ctx)
-        && let Some(photo) = state.readonly_task.map(|scope| scope.photo).or_else(|| app.session.active())
+        && let Some(photo) = state.displayed_photo(app)
         && let Err(e) = state.load(app, photo)
     {
         state.text = e;
@@ -1633,17 +1654,22 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         state.local_save_retry_at = None;
         state.local_save_after_frame = None;
         state.feedback_pending = false;
+        state.readonly_selection = None;
         state.readonly_task = None;
         state.task = None;
         state.telemetry = network::Telemetry::default();
         state.health = health::Health::default();
         state.generation = app.session.library_generation();
     }
+    state.sync_task_selection(app);
     let photo = params.get("photo").and_then(Value::as_u64).map(PhotoId).or_else(|| app.session.active());
     let result = match id {
+        "ai.clear" | "ai.undo" if state.readonly_task.is_some() => {
+            Err(tr("Return to the selected photo before changing its AI conversation or edits.").into())
+        }
         "ai.open" => {
             state.open = true;
-            state.readonly_task = None;
+            state.leave_task_view();
             state.health.first_open(network::service_address(app.services.companion_address.as_deref()));
             app.session.end_interaction().map_err(|e| e.to_string()).and_then(|()| {
                 app.ui.right = crate::state::RightPanel::Ai;
@@ -1653,6 +1679,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             })
         }
         "ai.task" => task_entry::navigate(&mut state, app),
+        "ai.returnCurrent" => task_entry::return_current(&mut state, app),
         "ai.health" => {
             state.health.request(network::service_address(app.services.companion_address.as_deref()));
             Ok(state.health.status())
@@ -1676,7 +1703,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             Ok(Value::Null)
         }),
         "ai.status" => {
-            let viewed_photo = state.readonly_task.map(|scope| scope.photo).or(photo);
+            let viewed_photo = if params.get("photo").is_some() { photo } else { state.displayed_photo(app) };
             if let Some(photo) = viewed_photo
                 && let Err(error) = state.load(app, photo)
             {
@@ -1704,8 +1731,8 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 })).collect::<Vec<_>>(),
                 "round": photo.and_then(|p| state.jobs.get(&p)).map(|j| j.round.clone()),
                 "text": conversation.map(display_text).unwrap_or_else(|| state.text.clone()),
-                "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().map(|card| { let invalidated=c.checkpoint.as_ref().is_some_and(|p|p.local_round_id.as_deref()==Some(card.local_round_id.as_str()) && !p.eligible); card.for_current(photo.and_then(|p|app.session.develop_of(p)).as_deref(),invalidated) }).chain(c.records.iter().filter_map(|r|card::from_record(r,photo.and_then(|p|app.session.develop_of(p)).as_deref()))).collect::<Vec<_>>()).unwrap_or_default(),
-                "historyLoading": state.paging.busy() || photo.is_some_and(|photo| state.paging.awaiting_page(photo)) || conversation.and_then(|c| c.view.as_ref()).is_some_and(|v|v.card_cursor.is_some()),
+                "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().map(|card| { let invalidated=c.checkpoint.as_ref().is_some_and(|p|p.local_round_id.as_deref()==Some(card.local_round_id.as_str()) && !p.eligible); card.for_current(viewed_photo.and_then(|p|app.session.develop_of(p)).as_deref(),invalidated) }).chain(c.records.iter().filter_map(|r|card::from_record(r,viewed_photo.and_then(|p|app.session.develop_of(p)).as_deref()))).collect::<Vec<_>>()).unwrap_or_default(),
+                "historyLoading": state.paging.busy() || viewed_photo.is_some_and(|photo| state.paging.awaiting_page(photo)) || conversation.and_then(|c| c.view.as_ref()).is_some_and(|v|v.card_cursor.is_some()),
                 "activePhotos": state.jobs.keys().map(|p| p.0).collect::<Vec<_>>(),
             }))
         }
@@ -1833,6 +1860,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     }
     app.ai.health.first_open(network::service_address(app.services.companion_address.as_deref()));
     let mut state = std::mem::take(&mut app.ai);
+    state.sync_task_selection(app);
     let result = if state.feedback_needs_paint(ui.ctx()) { state.sync_editor_deferred(app) } else { state.sync_editor(app) };
     if let Err(error) = result {
         state.text = error;
@@ -1841,7 +1869,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     egui::Frame::NONE.inner_margin(egui::Margin::same(12)).show(ui, |ui| {
         ui.horizontal(|ui| {
             let heading = ui.heading(tr("AI Assistant"));
-            if let Some(photo) = app.session.active().and_then(|id| app.session.catalog.photo(id)) {
+            if let Some(photo) = app.ai.displayed_photo(app).and_then(|id| app.session.catalog.photo(id)) {
                 heading.on_hover_text(photo.file_name.as_str());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1854,19 +1882,18 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         });
         ui.separator();
         if let Some(scope) = app.ai.readonly_task.filter(|scope| scope.library_generation == app.session.library_generation()) {
-            if let Some(task) = &mut app.ai.task {
-                task.unread = false;
-                ui.label(&task.name);
+            if ui.available_height() < 200.0 {
+                let height = ui.available_height().max(0.0);
+                let scroll = egui::ScrollArea::vertical()
+                    .id_salt(("ai-readonly-task", scope.library_generation, scope.photo.0))
+                    .auto_shrink([false, false])
+                    .min_scrolled_height(height)
+                    .max_height(height)
+                    .show(ui, |ui| readonly_task_body(app, ui, scope, true));
+                composer_widget(ui, "ai:composer", scroll.inner_rect);
+            } else {
+                readonly_task_body(app, ui, scope, false);
             }
-            let notice = ui.label(tr("The task photo is unavailable. Its saved conversation is kept."));
-            composer_widget(ui, "indicator:aiTaskReadOnly", notice.rect);
-            let back = ui.button(tr("View Selected Photo Conversation"));
-            composer_widget(ui, "button:aiSelectedConversation", back.rect);
-            if back.clicked() {
-                let _ = app.run("ai.open", json!({}));
-            }
-            let height = ui.available_height().max(0.0);
-            message_area(app, ui, scope.photo, height);
             return;
         }
         let selection = &app.session.selection;
@@ -1920,6 +1947,28 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         ui.advance_cursor_after_rect(body);
     });
 }
+fn readonly_task_body(app: &mut LightcraftApp, ui: &mut egui::Ui, scope: PhotoScope, compact: bool) {
+    if let Some(task) = &mut app.ai.task {
+        task.unread = false;
+        ui.label(&task.name);
+    }
+    let notice = ui.label(tr("The task photo is unavailable. Its saved conversation is kept."));
+    composer_widget(ui, "indicator:aiTaskReadOnly", notice.rect);
+    let back = ui.button(tr("View Selected Photo Conversation"));
+    composer_widget(ui, "button:aiSelectedConversation", back.rect);
+    if back.clicked() {
+        let _ = app.run("ai.returnCurrent", json!({}));
+    }
+    if let Some(trace) = app.ai.conversations.get(&scope.photo).and_then(|c| c.records.iter().rev().find_map(errors::trace)).map(str::to_owned) {
+        let copy = ui.button(tr("Copy Diagnostic ID"));
+        composer_widget(ui, "button:aiCopyTrace", copy.rect);
+        if copy.clicked() {
+            ui.ctx().copy_text(trace);
+        }
+    }
+    let height = if compact { 240.0 } else { ui.available_height().max(0.0) };
+    message_area(app, ui, scope.photo, height);
+}
 fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
     let mut locate = false;
     let controls_top = ui.cursor().top();
@@ -1957,11 +2006,15 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
                     .checkpoint
                     .as_ref()
                     .is_some_and(|p| p.local_round_id.as_deref() == Some(card.local_round_id.as_str()) && !p.eligible);
-                locate |= card::show(ui, &card.clone().for_current(app.session.develop_of(photo).as_deref(), invalidated));
+                locate |= card::show(
+                    ui,
+                    &card.clone().for_current(app.session.develop_of(photo).as_deref(), invalidated),
+                    app.ai.readonly_task.is_none() && app.session.active() == Some(photo),
+                );
             }
             for record in &conversation.records {
                 if let Some(card) = card::from_record(record, app.session.develop_of(photo).as_deref()) {
-                    locate |= card::show(ui, &card);
+                    locate |= card::show(ui, &card, app.ai.readonly_task.is_none() && app.session.active() == Some(photo));
                 }
             }
         } else if !app.ai.text.is_empty() {

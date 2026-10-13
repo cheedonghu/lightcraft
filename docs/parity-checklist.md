@@ -574,7 +574,7 @@ visible menu bar yet: the menu model is only exposed through the control channel
 | MENU-PHOTO-DELETE | Delete N photos… | P0 | ✅ | `cmd:photo.delete` | no confirmation; static label |
 | MENU-PHOTO-MOVETOCLOUD | Move/copy to cloud | OOS | 🚫 | | |
 | MENU-WINDOW-MINIMIZE | Minimize / zoom | P1 | ✅ | `apps/lightcraft/src/native_menu.rs` | the system's Minimize (⌘M) and Zoom items at the top of Window |
-| MENU-WINDOW-PANELS | Panel switches | P0 | ✅ | `cmd:panel.edit`, `cmd:panel.crop`, `cmd:panel.remove`, `cmd:panel.masking`, `cmd:panel.presets`, `cmd:panel.versions`, `cmd:panel.ai`, `cmd:ai.open` | AI Assistant shares Tools; its menu opens and reveals hidden/collapsed Tools without changing the photo view. Messages scroll independently of stage/input/actions (`crates/ui-egui/src/ai_companion/panel_tests.rs`). |
+| MENU-WINDOW-PANELS | Panel switches | P0 | ✅ | `cmd:panel.edit`, `cmd:panel.crop`, `cmd:panel.remove`, `cmd:panel.masking`, `cmd:panel.presets`, `cmd:panel.versions`, `cmd:panel.ai`, `cmd:ai.open` | AI Assistant shares Tools; its menu opens and reveals hidden/collapsed Tools without changing the photo view. Messages scroll independently of stage/input/actions (`crates/ui-egui/src/ai_companion/panel_tests.rs`). UX-20: explicit asynchronous HTTP-only health/retry, scoped global task entry outside Tools, original-photo read-only fallback and return-to-current navigation, independent acknowledged heartbeat diagnostics, truthful retained-result errors and trace copy (`health_task_tests.rs`). |
 | MENU-WINDOW-BRINGFRONT | Bring all to front | P2 | ✅ | `apps/lightcraft/src/native_menu.rs` | the system's item at the end of Window |
 | MENU-HELP-HELP | Help | P2 | ✅ | `cmd:app.help` | opens the documentation |
 | MENU-HELP-TUTORIALS | Tutorials | OOS | 🚫 | | |
@@ -809,3 +809,5 @@ Latin stays upright. Advanced Japanese composition remains open. Regression cove
 | 2026-10-13 | patch | UX-11: PC-01 records complete legal history projection and pre-create service budget checks; status and summary counts unchanged. |
 
 | 2026-10-13 | patch | UX-16: PC-01 records historical round result cards and immutable effective parameter display; status and summary counts unchanged. |
+
+| 2026-10-14 | patch | UX-20: MENU-WINDOW-PANELS documents service checks, scoped global task access, readonly navigation and truthful transport/error feedback. Statuses and summary counts unchanged. |

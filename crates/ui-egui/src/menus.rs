@@ -59,6 +59,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("ai.status", "AI Status", None, ""),
     ("ai.health", "Check AI Service", None, ""),
     ("ai.task", "View AI Task", None, ""),
+    ("ai.returnCurrent", "Return to Current Photo", None, ""),
     ("ai.clear", "Delete AI Conversation", None, ""),
     ("ui.dock", "Arrange Panel", None, ""),
     ("ui.dock.reset", "Reset Panel Layout", None, "Window"),

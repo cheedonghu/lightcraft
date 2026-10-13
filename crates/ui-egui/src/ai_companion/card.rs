@@ -163,7 +163,7 @@ pub(super) fn from_record(record: &Value, current: Option<&DevelopSettings>) -> 
             .collect(),
     })
 }
-pub(super) fn show(ui: &mut egui::Ui, card: &Card) -> bool {
+pub(super) fn show(ui: &mut egui::Ui, card: &Card, navigation_available: bool) -> bool {
     let mut history = false;
     let frame = egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.strong(tr("Round result"));
@@ -222,7 +222,7 @@ pub(super) fn show(ui: &mut egui::Ui, card: &Card) -> bool {
             }
         });
         super::composer_widget(ui, &format!("button:aiParameters:{}", card.local_round_id), details.header_response.rect);
-        let locate = ui.button(tr("Open ordinary History"));
+        let locate = ui.add_enabled(navigation_available, egui::Button::new(tr("Open ordinary History")));
         super::composer_widget(ui, &format!("button:aiHistory:{}", card.local_round_id), locate.rect);
         history = locate.clicked();
     });
