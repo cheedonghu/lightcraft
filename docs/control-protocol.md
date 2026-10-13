@@ -59,18 +59,18 @@ non-deleted photo must be selected, and explicit `photo` must match it. Every de
 permits one task across submitting, queued and processing. The task photo is protected from
 local identity creation before enqueue; edits to other photos remain available. Final mutation
 batches, Auto Sync and Undo/Redo are checked atomically before any side effects.
-It sends only a compressed preview and the current photo's context. Opening the independent window (Window ▸ AI Photo Companion) sends nothing. `ai.status
-{photo?}` reports `busy`, `workerBusy`, `photo`, `round`, `activePhotos`, and streamed `text`;
+It sends only a compressed preview and the current photo's context. Opening the shared Tools AI panel (Window ▸ AI Photo Companion / `ai.open`) sends nothing. The menu always opens and reveals Tools, including hidden or collapsed custom layouts, without changing the photo view. `panel.ai` / `icon:ai` toggles the AI panel; `button:aiCollapse` closes it. AI and Edit use the same Tools area. With no selection or multiple selected photos the panel explains the single-photo requirement.
+`ai.status {photo?}` reports `busy`, `workerBusy`, `photo`, `round`, `activePhotos`, and streamed `text`;
 `ai.stop`, `ai.undo`, and `ai.clear` also accept `photo?` (otherwise the active photo).
-Conversations use independent versioned storage in the library’s `companion/` folder (`state.json` and preview attachments); the upstream catalog format is unchanged. Predevelopment AI archives from earlier builds are discarded.
+Conversations use independent versioned storage in the library’s `companion/` folder (`state.json` and preview attachments); the upstream catalog format is unchanged. Existing readable AI archives are retained.
 The desktop uses one SSE connection to the loopback backend at `PHOTO_COMPANION_ADDR`
 (default `127.0.0.1:18080`); model credentials belong to that backend. Full native edit plans are
 validated and rendered before a photo-specific commit. Normal libraries preserve conversations
 and preview attachments; `ai.clear` removes that context without changing edits. Undo refuses
 to overwrite subsequent manual edits. Accounts, budgets, and browser support remain later work.
 See the adjacent backend's `.scratch/photo-companion-v1/validation.md`. Widgets are
-`button:aiOpen`, `field:aiPrompt`, `checkbox:aiConsent`, `button:aiStart`, `button:aiStop`, and
-`button:aiUndo`.
+`button:aiOpen`, `icon:ai`, `button:aiCollapse`, `field:aiPrompt`, `checkbox:aiConsent`, `button:aiStart`, `button:aiStop`,
+`button:aiUndo`, and `button:aiClear`. `ai:messages` identifies the independently scrolling message viewport; `ai:stage` identifies the fixed status area. Input and consent remain outside message scrolling, and the checkbox remains reachable during an active task.
 
 | Method | Params | Result |
 |---|---|---|

@@ -2046,5 +2046,9 @@
   "Checking photo availability. Please try again.": "正在检查照片是否可用，请稍后重试。",
   "AI task ownership has ended.": "AI 任务保护已结束。",
   "AI result is stale; the photo was not changed.": "AI 结果已过期，照片尚未改变。",
-  "AI publication may only update its task photo.": "AI 发布只能更新本轮任务照片。"
+  "AI publication may only update its task photo.": "AI 发布只能更新本轮任务照片。",
+  "AI Assistant": "AI 助手",
+  "Ready for your request": "可以输入要求",
+  "AI Photo Companion": "AI 照片助手",
+  "Please review this photo and optimize it naturally.": "请点评这张照片，并自然优化。"
 }

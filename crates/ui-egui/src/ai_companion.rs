@@ -13,6 +13,9 @@ mod identity_tests;
 #[path = "ai_companion/library_tests.rs"]
 mod library_tests;
 mod network;
+#[cfg(test)]
+#[path = "ai_companion/panel_tests.rs"]
+mod panel_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -123,6 +126,24 @@ impl Drop for WorkerAlive {
 }
 
 impl State {
+    /// The UI changes consent through one seam; re-consent never revives jobs.
+    fn set_consent(&mut self, consent: bool) -> Result<(), String> {
+        self.consent = consent;
+        if !consent {
+            let photos: Vec<_> = self.jobs.keys().copied().collect();
+            let mut error = None;
+            for photo in photos {
+                if let Err(e) = self.stop(photo) {
+                    error.get_or_insert(e);
+                }
+            }
+            if let Some(error) = error {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_busy(&self, photo: PhotoId) -> bool {
         self.jobs.get(&photo).is_some_and(|j| !j.stopped)
     }
@@ -220,7 +241,8 @@ impl State {
         app.session.end_interaction().map_err(|e| e.to_string())?;
         let original = app.session.develop_of(photo).ok_or("照片不存在。")?;
         let content = app.session.catalog.photo(photo).map(|p| lightcraft_engine::media::content_key(p)).ok_or("照片不存在。")?;
-        let prompt = if self.prompt.trim().is_empty() { "请点评这张照片，并自然优化。".into() } else { self.prompt.clone() };
+        let prompt =
+            if self.prompt.trim().is_empty() { tr("Please review this photo and optimize it naturally.").into() } else { self.prompt.clone() };
         if prompt.len() > 4096 {
             return Err("请求过长。".into());
         }
@@ -851,7 +873,12 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
     let result = match id {
         "ai.open" => {
             state.open = true;
-            Ok(Value::Null)
+            app.session.end_interaction().map_err(|e| e.to_string()).and_then(|()| {
+                app.ui.right = crate::state::RightPanel::Ai;
+                app.ui.tool.clear();
+                crate::docking::reveal_command(app, "ai.open")?;
+                Ok(Value::Null)
+            })
         }
         "ai.start" => {
             if let Some(prompt) = params.get("prompt").and_then(Value::as_str) {
@@ -970,82 +997,128 @@ fn display_text(conversation: &Conversation) -> String {
     text.push_str(&conversation.notice);
     text
 }
-pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
-    if !app.ai.open {
-        return;
-    }
-    let mut open = true;
-    egui::Window::new("AI Photo Companion").id(egui::Id::new("photo-companion-window")).open(&mut open).default_width(420.0).show(ctx, |ui| {
-        if let Some(photo) = app.session.active() {
-            panel(app, ui, photo);
-        } else {
-            ui.label(tr("Select exactly one photo to start an AI task."));
-        }
-    });
-    app.ai.open = open;
-}
-fn panel(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
-    egui::Frame::NONE.inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+/// Shared Tools body; the host supplies its viewport, so only messages scroll.
+pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
+    app.ai.open = true;
+    egui::Frame::NONE.inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.heading(tr("AI Assistant"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let close = ui.button(tr("Collapse"));
+                crate::widgets::register(ui.ctx(), "button:aiCollapse", close.rect);
+                if close.clicked() {
+                    let _ = app.run("panel.close", json!({}));
+                }
+            });
+        });
+        ui.separator();
+        let selection = &app.session.selection;
+        let Some(photo) = app.session.active().filter(|_| selection.ids.len() == 1) else {
+            let notice = ui.label(tr("Select exactly one photo to start an AI task."));
+            crate::widgets::register(ui.ctx(), "ai:selectionNotice", notice.rect);
+            return;
+        };
         if let Some(p) = app.session.catalog.photo(photo) {
             ui.label(p.file_name.as_str());
         }
-        ui.label(tr("Understand and naturally optimize your photo. Originals stay on this computer."));
-        let busy = app.ai.jobs.contains_key(&photo);
-        if app.session.companion_task_photo() == Some(photo) {
-            ui.label(tr("Manual editing is paused while AI processes this photo; stop it or wait for completion."));
+        if ui.available_height() >= 500.0 {
+            ui.label(tr("Understand and naturally optimize your photo. Originals stay on this computer."));
         }
-        let worker = app.ai.worker_busy(photo);
-        let input = ui.add_enabled(
-            !busy,
-            egui::TextEdit::multiline(&mut app.ai.prompt).desired_rows(2).hint_text(tr("For example: review this photo, then naturally optimize it")),
-        );
-        crate::widgets::register(ui.ctx(), "field:aiPrompt", input.rect);
-        if !busy {
-            let consent = ui.checkbox(&mut app.ai.consent, tr("Allow compressed previews to be sent to the cloud model"));
-            crate::widgets::register(ui.ctx(), "checkbox:aiConsent", consent.rect);
-            let admission = app.ai.admission(app, None);
-            if let Err(message) = &admission {
-                ui.label(message);
-            }
-            let start = ui.add_enabled(admission.is_ok(), egui::Button::new(tr("Analyze and Optimize")));
-            crate::widgets::register(ui.ctx(), "button:aiStart", start.rect);
-            if start.clicked()
-                && let Err(e) = app.run("ai.start", json!({}))
+        let body = ui.available_rect_before_wrap();
+        // Retain the measured footer height between frames. The content is rendered
+        // once, so sizing never dispatches a second click or consent transition.
+        let height_key = ui.id().with(("ai-composer-height", photo.0));
+        let height = ui.ctx().data(|data| data.get_temp::<f32>(height_key)).unwrap_or(250.0).min(body.height());
+        let footer_rect = egui::Rect::from_min_max(egui::pos2(body.left(), body.bottom() - height), body.max);
+        let mut footer = ui.new_child(egui::UiBuilder::new().id_salt("ai-composer").max_rect(footer_rect));
+        composer(app, &mut footer, photo);
+        ui.ctx().data_mut(|data| data.insert_temp(height_key, footer.min_rect().height()));
+        let bottom = (footer_rect.top() - 8.0).max(body.top());
+        let messages = egui::Rect::from_min_max(body.min, egui::pos2(body.right(), bottom));
+        let mut messages_ui = ui.new_child(egui::UiBuilder::new().id_salt("ai-message-viewport").max_rect(messages));
+        messages_ui.set_clip_rect(messages.intersect(ui.clip_rect()));
+        let scroll = egui::ScrollArea::vertical()
+            .id_salt(("ai-messages", photo.0))
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .max_height(messages.height())
+            .min_scrolled_height(0.0)
+            .show(&mut messages_ui, |ui| {
+                if let Some(conversation) = app.ai.conversations.get(&photo) {
+                    ui.label(display_text(conversation));
+                } else if !app.ai.text.is_empty() {
+                    ui.label(&app.ai.text);
+                }
+            });
+        crate::widgets::register(ui.ctx(), "ai:messages", scroll.inner_rect);
+        ui.advance_cursor_after_rect(body);
+    });
+}
+fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
+    let busy = app.ai.jobs.contains_key(&photo);
+    let worker = app.ai.worker_busy(photo);
+    let stage = ui.horizontal_wrapped(|ui| {
+        if busy {
+            ui.spinner();
+            ui.label(tr("Processing this photo…"));
+            let stop = ui.button(tr("Stop Generating"));
+            crate::widgets::register(ui.ctx(), "button:aiStop", stop.rect);
+            if stop.clicked()
+                && let Err(error) = app.run("ai.stop", json!({}))
             {
-                app.ai.text = e.clone();
-                app.ai.conversations.entry(photo).or_default().notice = e;
+                app.ai.text = error;
             }
-            if worker {
-                ui.label(tr("Finishing processing for this photo…"));
-            }
+        } else if worker {
+            ui.label(tr("Finishing processing for this photo…"));
+        } else {
+            ui.label(tr("Ready for your request"));
+        }
+    });
+    crate::widgets::register(ui.ctx(), "ai:stage", stage.response.rect);
+    if app.session.companion_task_photo() == Some(photo) {
+        ui.label(tr("Manual editing is paused while AI processes this photo; stop it or wait for completion."));
+    }
+    let input = ui.add_enabled(
+        !busy,
+        egui::TextEdit::multiline(&mut app.ai.prompt)
+            .desired_width(f32::INFINITY)
+            .desired_rows(2)
+            .hint_text(tr("For example: review this photo, then naturally optimize it")),
+    );
+    crate::widgets::register(ui.ctx(), "field:aiPrompt", input.rect);
+    let mut consent = app.ai.consent;
+    let checkbox = ui.checkbox(&mut consent, tr("Allow compressed previews to be sent to the cloud model"));
+    crate::widgets::register(ui.ctx(), "checkbox:aiConsent", checkbox.rect);
+    if checkbox.changed()
+        && let Err(error) = app.ai.set_consent(consent)
+    {
+        app.ai.text = error;
+    }
+    if !busy {
+        let admission = app.ai.admission(app, None);
+        if let Err(message) = &admission {
+            ui.label(message);
+        }
+        let start = ui.add_enabled(admission.is_ok(), egui::Button::new(tr("Analyze and Optimize")));
+        crate::widgets::register(ui.ctx(), "button:aiStart", start.rect);
+        if start.clicked()
+            && let Err(error) = app.run("ai.start", json!({}))
+        {
+            app.ai.text = error.clone();
+            app.ai.conversations.entry(photo).or_default().notice = error;
+        }
+        ui.horizontal_wrapped(|ui| {
             for (label, widget, command) in
                 [(tr("Undo AI Round"), "button:aiUndo", "ai.undo"), (tr("Delete Conversation"), "button:aiClear", "ai.clear")]
             {
                 let button = ui.add_enabled(!worker, egui::Button::new(label));
                 crate::widgets::register(ui.ctx(), widget, button.rect);
                 if button.clicked()
-                    && let Err(e) = app.run(command, json!({}))
+                    && let Err(error) = app.run(command, json!({}))
                 {
-                    app.ai.conversations.entry(photo).or_default().notice = e;
+                    app.ai.conversations.entry(photo).or_default().notice = error;
                 }
             }
-        } else {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(tr("Processing this photo…"));
-                let stop = ui.button(tr("Stop Generating"));
-                crate::widgets::register(ui.ctx(), "button:aiStop", stop.rect);
-                if stop.clicked() {
-                    let _ = app.run("ai.stop", json!({}));
-                }
-            });
-        }
-        if let Some(conversation) = app.ai.conversations.get(&photo) {
-            egui::ScrollArea::vertical().id_salt(("ai-messages", photo.0)).max_height(240.0).stick_to_bottom(true).show(ui, |ui| {
-                ui.label(display_text(conversation));
-            });
-        } else if !app.ai.text.is_empty() {
-            ui.label(&app.ai.text);
-        }
-    });
+        });
+    }
 }

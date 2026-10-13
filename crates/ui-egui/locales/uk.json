@@ -2178,5 +2178,9 @@
   "Face recognition is on": "Face recognition is on",
   "Set up face recognition": "Set up face recognition",
   "Already installed. Installing again is harmless.": "Already installed. Installing again is harmless.",
-  "Add a model file…": "Add a model file…"
+  "Add a model file…": "Add a model file…",
+  "AI Assistant": "AI Assistant",
+  "Ready for your request": "Ready for your request",
+  "AI Photo Companion": "AI Photo Companion",
+  "Please review this photo and optimize it naturally.": "Please review this photo and optimize it naturally."
 }
