@@ -6,6 +6,10 @@ mod archive;
 #[cfg(test)]
 #[path = "ai_companion/cancellation_tests.rs"]
 mod cancellation_tests;
+mod card;
+#[cfg(test)]
+#[path = "ai_companion/card_tests.rs"]
+mod card_tests;
 #[cfg(test)]
 #[path = "ai_companion/disconnect_tests.rs"]
 mod disconnect_tests;
@@ -577,6 +581,8 @@ impl State {
                 let local_round_id = job.identity.local_round_id.clone();
                 let stage = if job.plans.is_empty() { "initial" } else { "correction" };
                 let before = job.checkpoint.expected.clone();
+                let display_before = card::capture(&before, &snapshot.context.info);
+                let display_target = candidate.as_ref().ok().map(|s| card::capture(s, &snapshot.context.info));
                 let model_call = self
                     .conversations
                     .get(&photo)
@@ -593,7 +599,7 @@ impl State {
                     self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == local_round_id.as_str()))
                     && let Some(stages) = record.get_mut("stages").and_then(Value::as_array_mut)
                 {
-                    stages.push(json!({"stage":stage,"backend_stage":data.get("stage"),"model_call_id":model_call,"plan_id":plan_id,"tool_call_id":payload.get("tool_call_id"),"reason":payload.get("reason"),"operations":payload.get("operations"),"before_state":before,"proposed_state":candidate.as_ref().ok(),"execution_outcome":if candidate.is_ok() {"not_executed"} else {"validation_failed"}}));
+                    stages.push(json!({"stage":stage,"backend_stage":data.get("stage"),"model_call_id":model_call,"plan_id":plan_id,"tool_call_id":payload.get("tool_call_id"),"reason":payload.get("reason"),"operations":payload.get("operations"),"before_state":before,"display_before":display_before,"display_target":display_target,"proposed_state":candidate.as_ref().ok(),"execution_outcome":if candidate.is_ok() {"not_executed"} else {"validation_failed"}}));
                 }
                 let candidate = candidate?;
                 self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?.inflight_plan = Some(plan_id.into());
@@ -817,6 +823,8 @@ impl State {
                 {
                     step["before_state"] = json!(before);
                     step["applied_state"] = json!(settings);
+                    step["display_before"] = card::capture(&before, &snapshot.context.info);
+                    step["display_actual"] = card::capture(&settings, &snapshot.context.info);
                     step["effective_control_values"] = lightcraft_engine::companion::control_list(&settings, &snapshot.context.info);
                     step["execution_outcome"] = json!("succeeded");
                     step["delivery_state"] = json!("not_sent");
@@ -1296,6 +1304,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 })).collect::<Vec<_>>(),
                 "round": photo.and_then(|p| state.jobs.get(&p)).map(|j| j.round.clone()),
                 "text": conversation.map(display_text).unwrap_or_else(|| state.text.clone()),
+                "resultCards": conversation.map(|c| c.records.iter().filter_map(|r| card::from_record(r, photo.and_then(|p| app.session.develop_of(p)).as_deref())).collect::<Vec<_>>()).unwrap_or_default(),
                 "activePhotos": state.jobs.keys().map(|p| p.0).collect::<Vec<_>>(),
             }))
         }
@@ -1447,7 +1456,8 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         ui.advance_cursor_after_rect(body);
     });
 }
-fn message_area(app: &LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
+fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
+    let mut locate = false;
     let scroll = egui::ScrollArea::vertical()
         .id_salt(("ai-messages", photo.0))
         .auto_shrink([false, false])
@@ -1457,11 +1467,19 @@ fn message_area(app: &LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: 
         .show(ui, |ui| {
             if let Some(conversation) = app.ai.conversations.get(&photo) {
                 ui.label(display_text(conversation));
+                for record in &conversation.records {
+                    if let Some(card) = card::from_record(record, app.session.develop_of(photo).as_deref()) {
+                        locate |= card::show(ui, &card);
+                    }
+                }
             } else if !app.ai.text.is_empty() {
                 ui.label(&app.ai.text);
             }
         });
     composer_widget(ui, "ai:messages", scroll.inner_rect);
+    if locate {
+        let _ = app.run("panel.activity", json!({}));
+    }
 }
 
 fn phase_text(phase: &str) -> &'static str {

@@ -2064,5 +2064,22 @@
   "Applying the correction…": "正在应用修正…",
   "Stopping generation…": "正在停止生成…",
   "Generation stopped; confirming submission cancellation…": "已停止生成，正在确认取消提交…",
-  "Generation stopped; keeping the latest complete result.": "已停止生成，保留最近一次完整结果。"
+  "Generation stopped; keeping the latest complete result.": "已停止生成，保留最近一次完整结果。",
+  "Actual retained value": "实际保留值",
+  "Applied": "已应用",
+  "Applied result retained; feedback was not confirmed.": "已应用的结果已保留，反馈尚未得到确认。",
+  "Crop bottom": "裁剪下边界",
+  "Crop left": "裁剪左边界",
+  "Crop right": "裁剪右边界",
+  "Crop top": "裁剪上边界",
+  "EV": "档",
+  "Initial optimization": "初次优化",
+  "Not applied": "未应用",
+  "Open ordinary History": "打开普通历史",
+  "Proposed target": "拟议目标",
+  "Review correction": "复看修正",
+  "Round result": "本轮结果",
+  "The current photo has later edits.": "当前照片已有后续编辑。",
+  "This card records the round; the editor shows the current photo.": "此卡片记录本轮执行事实，编辑器显示当前照片。",
+  "View parameter changes": "查看参数变化"
 }
