@@ -82,6 +82,8 @@ fn newer_or_corrupt_ai_storage_does_not_block_photos_and_is_never_overwritten() 
         s.execute("develop.set", &json!({"ids":[id.0],"values":{"light.exposure":0.5}})).unwrap();
         assert!(s.set_photo_companion(id, Some(json!({}))).is_err());
         assert_eq!(files.get(STATE_FILE).unwrap(), bytes);
+        s.close_library().unwrap();
+        assert_eq!(files.get(STATE_FILE).unwrap(), bytes, "a protected AI root does not trap ordinary photos in the library");
     }
 }
 
@@ -407,4 +409,21 @@ fn v2_large_record_splits_by_bytes_instead_of_imposing_a_local_history_quota() {
     s.save_companion_conversation(id, value.clone()).unwrap();
     assert!(files.files.lock().unwrap().iter().filter(|(k, _)| k.contains("blocks/")).all(|(_, b)| b.len() <= 4 * 1024 * 1024));
     assert_eq!(s.load_companion_conversation(id).unwrap(), Some(value));
+}
+
+#[test]
+fn v2_tampered_pending_cannot_overwrite_an_old_committed_manifest() {
+    let files = MemStore::new();
+    let mut s = open(MemStore::new(), Box::new(files.clone()));
+    let id = s.catalog.photos().next().unwrap().id;
+    let old = json!({"schema_version":2,"messages":[{"role":"user","text":"protected old"}],"rounds":[]});
+    s.save_companion_conversation(id, old.clone()).unwrap();
+    let base = format!("companion/v2/photos/{}", id.0);
+    let head: Value = serde_json::from_slice(&files.get(&format!("{base}/HEAD.json")).unwrap()).unwrap();
+    s.companion_stage(id, 0, &json!({"schema_version":2,"messages":[],"rounds":[]})).unwrap();
+    let mut pending: Value = serde_json::from_slice(&files.get(&format!("{base}/pending.json")).unwrap()).unwrap();
+    pending["head"]["manifest"] = head["manifest"].clone();
+    files.set(&format!("{base}/pending.json"), serde_json::to_vec(&pending).unwrap());
+    assert!(s.companion_stage(id, 0, &json!({"schema_version":2,"messages":[],"rounds":[]})).is_err());
+    assert_eq!(s.load_companion_conversation(id).unwrap(), Some(old));
 }

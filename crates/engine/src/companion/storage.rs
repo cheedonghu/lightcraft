@@ -43,7 +43,7 @@ pub struct CommitReceipt {
     pub conversation_epoch: u64,
     pub transaction_id: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Head {
     manifest: String,
     transaction_id: String,
@@ -105,6 +105,9 @@ fn header(store: &mut dyn Store, photo: PhotoId) -> Result<Option<PhotoHeader>> 
         return Err(error("invalid HEAD transaction"));
     }
     validate_key(photo, &head.manifest, "manifest-")?;
+    if head.manifest != format!("{}/manifest-{}.json", base(photo), head.transaction_id) {
+        return Err(error("manifest does not belong to HEAD transaction"));
+    }
     let bytes = store.read_limited(&head.manifest, SMALL).map_err(error)?.ok_or_else(|| error("manifest missing"))?;
     if digest(&bytes) != head.manifest_digest {
         return Err(error("manifest digest mismatch"));
@@ -280,9 +283,10 @@ pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, expected_epoch: u64, 
     let pending = if let Some(p) = reusable {
         if !valid_transaction(&p.transaction_id)
             || p.head.transaction_id != p.transaction_id
+            || p.head.manifest != format!("{}/manifest-{}.json", base(photo), p.transaction_id)
             || p.photo != photo
             || p.expected_epoch != expected_epoch
-            || p.old_head.as_ref().map(|h| &h.transaction_id) != actual.as_ref().map(|h| &h.transaction_id)
+            || p.old_head != actual
         {
             return Err(error("unresolved archive transaction; recovery required"));
         }
@@ -400,7 +404,10 @@ pub(crate) fn stored_epoch(store: &mut dyn Store, photo: PhotoId) -> Result<u64>
     Ok(header(store, photo)?.map(|h| h.conversation_epoch).unwrap_or(0))
 }
 pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<()> {
-    if !valid_transaction(&pending.transaction_id) || pending.head.transaction_id != pending.transaction_id {
+    if !valid_transaction(&pending.transaction_id)
+        || pending.head.transaction_id != pending.transaction_id
+        || pending.head.manifest != format!("{}/manifest-{}.json", base(pending.photo), pending.transaction_id)
+    {
         return Err(error("invalid pending transaction"));
     }
     validate_key(pending.photo, &pending.head.manifest, "manifest-")?;
@@ -416,8 +423,8 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
     let head_key = format!("{}/HEAD.json", base(pending.photo));
     // Retrying the same transaction after an ambiguous fsync is idempotent.
     let visible: Option<Head> = read(store, &head_key, SMALL)?;
-    if visible.as_ref().map(|h| &h.transaction_id) != Some(&pending.transaction_id) {
-        if visible.as_ref().map(|h| &h.transaction_id) != pending.old_head.as_ref().map(|h| &h.transaction_id) {
+    if visible.as_ref() != Some(&pending.head) {
+        if visible != pending.old_head {
             return Err(error("HEAD changed before commit"));
         }
         write(store, &head_key, &pending.head)?;
@@ -610,6 +617,9 @@ fn validate_preview(bytes: &[u8]) -> Result<(u32, u32)> {
 }
 
 pub(super) fn read_preview_reference(store: &mut dyn Store, image: &Value) -> Result<Vec<u8>> {
+    if image.get("mime_type").and_then(Value::as_str) != Some("image/jpeg") {
+        return Err(error("preview MIME does not match JPEG encoding"));
+    }
     let key = image.get("attachment").and_then(Value::as_str).ok_or_else(|| error("preview reference missing"))?;
     let bytes = read_preview(store, key)?;
     let (width, height) = validate_preview(&bytes)?;

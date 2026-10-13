@@ -88,7 +88,10 @@ impl Archive {
     }
     fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {
         if let Some(e) = &self.blocked {
-            return Err(error(e));
+            if self.dirty || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() {
+                return Err(error(e));
+            }
+            return Ok(());
         }
         if self.v2 || !self.dirty_photos.is_empty() {
             if !self.revert_dirty.is_empty() {
