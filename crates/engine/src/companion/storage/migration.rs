@@ -431,6 +431,28 @@ pub(super) fn protocol_record(store: &mut dyn Store, photo: PhotoId, entry: &Ent
     Ok(Value::Object(fields))
 }
 
+/// Small display records already passed their immutable logical digest. Select
+/// only known image fields after serde rejects additive nesting, without keeping
+/// the additive descendants in a Value. The caller's record buffer is bounded.
+pub(super) fn display_images(bytes: &[u8]) -> Result<Option<Value>> {
+    let mut memory = lightcraft_catalog::MemStore::new();
+    memory.set("record.json", bytes.to_vec());
+    let mut source = memory.source_snapshot("record.json").map_err(error)?.ok_or_else(|| error("display record missing"))?;
+    let mut scanner = Json::new(source.as_mut(), 0);
+    scanner.expect(b'{')?;
+    let mut first = true;
+    let mut images = None;
+    while let Some((_, name, span)) = scanner.member(&mut first)? {
+        if name.as_deref() == Some("images") {
+            if images.is_some() {
+                return Err(error("ambiguous original image references"));
+            }
+            images = Some(protocol_images(scanner.source, span, bytes.len())?);
+        }
+    }
+    Ok(images)
+}
+
 fn protocol_images(source: &mut dyn SourceSnapshot, span: Span, max_bytes: usize) -> Result<Value> {
     let mut scanner = Json::new(source, span.start);
     scanner.space()?;

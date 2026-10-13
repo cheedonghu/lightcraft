@@ -290,7 +290,7 @@ impl Fields {
                                 (self.display
                                     && matches!(
                                         self.name.as_str(),
-                                        "role" | "text" | "images" | "tool_calls" | "tool_call_id" | "complete_state" | "display_kind"
+                                        "role" | "text" | "tool_calls" | "tool_call_id" | "complete_state" | "display_kind"
                                     ))
                                     || matches!(
                                         self.name.as_str(),
@@ -402,7 +402,11 @@ pub(super) fn selected(bytes: &[u8]) -> Result<Value> {
         Err(_) => {
             let mut fields = Fields { display: true, ..Default::default() };
             fields.push(bytes)?;
-            fields.finish()
+            let mut value = fields.finish()?;
+            if let Some(images) = migration::display_images(bytes)? {
+                value["images"] = images;
+            }
+            Ok(value)
         }
     }
 }

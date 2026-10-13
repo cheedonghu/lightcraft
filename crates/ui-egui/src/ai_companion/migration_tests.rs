@@ -1456,3 +1456,75 @@ fn corrupted_giant_legacy_text_is_not_exposed_as_original_visible_history() {
         assert!(!visible.contains(corrupted), "actual visible history must reject corrupted original bytes");
     }
 }
+
+#[test]
+fn small_legacy_png_with_deep_additive_image_metadata_keeps_visible_text_and_image() {
+    for native in [true, false] {
+        let directory = std::env::temp_dir().join(format!("lc-ux10-small-image-{}", LocalRoundId::new().unwrap().as_str()));
+        let catalog = MemStore::new();
+        let memory = MemStore::new();
+        let files = || -> Box<dyn Store> { if native { Box::new(FsStore::open(&directory).unwrap()) } else { Box::new(memory.clone()) } };
+        let mut initial = lightcraft_engine::Session::new();
+        initial
+            .open_library_in(LibraryStores { catalog: Box::new(catalog.clone()), files: files(), dir: directory.clone(), on_disk: false }, true)
+            .unwrap();
+        let photo = initial.active().unwrap();
+        let png = lightcraft_engine::export::encode_image(
+            &lightcraft_raster::Rgba8::from_fn(32, 32, |_, _| [24, 196, 212, 255]),
+            &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+        )
+        .unwrap();
+        let attachment = initial.library.as_mut().unwrap().companion_attachment(photo, &png).unwrap();
+        initial.close_library().unwrap();
+        let deep = format!("{}true{}", "[".repeat(300), "]".repeat(300));
+        let source = format!(
+            r#"{{"format":"lightcraft-companion","version":1,"photos":{{"{}":{{"schema_version":1,"messages":[{{"role":"user","text":"Original small valid history","images":[{{"mime_type":"image/png","attachment":"{}","additive":{}}}]}}],"rounds":[]}}}}}}"#,
+            photo.0, attachment, deep
+        );
+        files().write_atomic("companion/state.json", source.as_bytes()).unwrap();
+        drop(initial);
+        let mut session = lightcraft_engine::Session::new();
+        session.open_library_in(LibraryStores { catalog: Box::new(catalog), files: files(), dir: directory.clone(), on_disk: false }, true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.companion_migration_pending() && Instant::now() < deadline {
+            let _ = session.persist();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!session.companion_migration_pending(), "{:?}", session.companion_migration_error());
+        assert_eq!(files().read("companion/state.v1.backup.json").unwrap().unwrap(), source.as_bytes());
+        let header = session.companion_photo_header(photo).unwrap().unwrap();
+        if let Some(mut reader) = session.companion_reader(&header).unwrap() {
+            let protocol = reader.protocol_messages(0, 1, 32 * 1024 * 1024).unwrap();
+            assert_eq!(protocol.records[0]["text"], "Original small valid history");
+            assert_eq!(protocol.records[0]["images"][0]["attachment"], attachment);
+            assert!(protocol.records[0]["images"][0].get("additive").is_none());
+        }
+        let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1100., 750.], 1.);
+        h.app.ui.settings.gpu = false;
+        h.app.run("ai.open", json!({})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            h.step();
+            let status = h.app.run("ai.status", json!({})).unwrap();
+            if status["historyLoading"] == false {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "{status}");
+            std::thread::yield_now();
+        };
+        assert!(status["text"].as_str().unwrap().contains("Original small valid history"), "{native}: {status}");
+        assert_eq!(status["historicalPreview"]["available"], true, "{native}: {status}");
+        h.step();
+        h.step();
+        let rect = h.app.widgets.iter().find(|(id, _)| id == "image:aiHistoricalPreview").unwrap().1;
+        let image = h.paint();
+        let center = rect.center();
+        assert_eq!(image.pixels[center.y as usize * image.size[0] + center.x as usize], egui::Color32::from_rgb(24, 196, 212));
+        assert!(h.settle(Duration::from_secs(10)));
+        h.app.session.close_library().unwrap();
+        drop(h);
+        if native {
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+}
