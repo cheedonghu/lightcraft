@@ -168,6 +168,9 @@ pub type SystemThemeFn = Box<dyn Fn(&egui::Context) -> Option<egui::Theme>>;
 /// Platform services injected by the host app (desktop or web).
 #[derive(Default)]
 pub struct Services {
+    /// Host-selected loopback endpoint for both companion health and round transport.
+    /// None preserves PHOTO_COMPANION_ADDR and the native development default.
+    pub companion_address: Option<String>,
     /// Native file dialogs for commands, shown off the UI thread and answered later
     /// (`pick`; #191). With it, the synchronous pickers below serve only the buttons inside
     /// dialogs; without it (the web, tests) they answer the commands too.
@@ -1316,6 +1319,7 @@ impl LightcraftApp {
         // Order matters: earlier panels take the full edge (top bar spans the window; the tool strip,
         // right panels and left panel run to the bottom; the bottom bar sits between them).
         panels::topbar::show(self, ui);
+        ai_companion::show_task_entry(self, ui);
         panels::library_problem::banner(self, ui);
         panels::strip::show(self, ui);
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| docking::show(self, ui));

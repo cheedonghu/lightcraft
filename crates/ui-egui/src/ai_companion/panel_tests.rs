@@ -347,11 +347,13 @@ fn supported_short_floating_and_stacked_tools_keep_active_controls_on_their_own_
             short_tools(&mut h, stacked, height);
             let zoom = h.app.ui.zoom;
             let tools = rect(&h, "panel:right_panel");
-            for (id, target) in
-                h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:ai") || id.starts_with("checkbox:ai") || id == "field:aiPrompt")
-            {
+            for (id, target) in h.app.widgets.iter().filter(|(id, _)| {
+                id != "button:aiTaskEntry" && (id.starts_with("button:ai") || id.starts_with("checkbox:ai") || id == "field:aiPrompt")
+            }) {
                 assert!(tools.contains_rect(*target), "{id} clips outside {tools:?}: {target:?}");
             }
+            let global_entry = rect(&h, "button:aiTaskEntry");
+            assert!(!global_entry.intersects(tools), "global task entry remains outside short Tools");
             reachable(&mut h, "checkbox:aiConsent", -1.0);
             short_snapshot(&mut h, &format!("short-active-{}-{}-{}", if stacked { "stack" } else { "float" }, height as usize, language.code()));
             assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);

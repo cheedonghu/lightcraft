@@ -189,6 +189,8 @@ fn backend_photo_busy_has_only_an_explicit_fresh_manual_retry() {
     let previous = state.jobs.get(&photo).unwrap().identity.clone();
     let mut error: network::RequestFailure = "photo_busy; traceId=local-fixture".into();
     error.rejected = true;
+    error.code = Some("photo_busy".into());
+    error.trace = Some("local-fixture".into());
     events
         .try_send(network::Event::Response {
             submission: previous.submission_seq,
@@ -201,7 +203,8 @@ fn backend_photo_busy_has_only_an_explicit_fresh_manual_retry() {
     state.poll_inner(&mut app, &egui::Context::default());
     assert!(!state.jobs.contains_key(&photo));
     assert!(state.connection.as_ref().is_some_and(|c| !c.is_closing()));
-    assert!(state.conversations.get(&photo).unwrap().notice.contains("photo_busy"));
+    assert!(state.conversations.get(&photo).unwrap().notice.contains("previous task is still finishing"));
+    assert!(!state.conversations.get(&photo).unwrap().notice.contains("photo_busy"));
     assert!(requests.try_recv().is_err(), "no automatic retry or resume");
     state.poll_inner(&mut app, &egui::Context::default());
     assert!(requests.try_recv().is_err());
