@@ -2183,5 +2183,19 @@
   "This round was reverted. The conversation was kept.": "已撤回本轮，保留对话。",
   "This round's edits were reverted. The photo was restored to its round starting state.": "本轮修改已撤回，照片已恢复到本轮起点。",
   "Revert unavailable; use ordinary History.": "无法撤回本轮，请使用普通历史恢复。",
-  "Choose a valid photo to revert.": "请选择有效照片以撤回本轮。"
+  "Choose a valid photo to revert.": "请选择有效照片以撤回本轮。",
+  "You": "你",
+  "Assistant": "助手",
+  "Execution feedback": "执行反馈",
+  "Tool process": "工具过程",
+  "Tool": "工具",
+  "Edits applied.": "修改已应用。",
+  "Edits were not executed: cancelled.": "修改未执行：已取消。",
+  "The edit failed. The last complete result was kept.": "修改失败，已保留最近一次完整结果。",
+  "Recorded execution feedback is available in this round's result.": "本轮结果中保留了执行反馈。",
+  "Back to bottom": "回到底部",
+  "Historical preview unavailable": "历史预览不可用",
+  "Loading historical preview…": "正在加载历史预览…",
+  "Message details unavailable": "消息详情暂不可用",
+  "Read AI history": "回看 AI 历史"
 }

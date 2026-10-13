@@ -221,7 +221,7 @@ struct GatedFiles {
 }
 impl GatedFiles {
     fn observe(&self, name: &str, length: usize) {
-        if !self.background {
+        if !self.background || std::thread::current().name() != Some("companion-model-history") {
             return;
         }
         self.gate.reads.lock().unwrap().push((name.into(), length));

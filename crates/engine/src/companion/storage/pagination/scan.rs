@@ -67,7 +67,11 @@ impl Session {
         if e.length <= 256 * 1024 {
             return serde_json::from_slice(&scan.small).map(Some).map_err(error);
         }
-        scan.fields.finish().map(Some)
+        let mut value = scan.fields.finish()?;
+        if matches!(scan.target, DisplayRecord::Message(_)) {
+            super::mark_old_hidden_text(&mut value, e);
+        }
+        Ok(Some(value))
     }
 }
 
@@ -273,6 +277,11 @@ impl Fields {
                                 matches!(
                                     self.name.as_str(),
                                     "local_round_id"
+                                        | "role"
+                                        | "display_kind"
+                                        | "authored_text_bytes"
+                                        | "local_message_id"
+                                        | "images"
                                         | "photo_id"
                                         | "local_terminal"
                                         | "trace_id"

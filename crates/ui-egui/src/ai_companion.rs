@@ -3,6 +3,7 @@
 #[path = "ai_companion/admission_tests.rs"]
 mod admission_tests;
 mod archive;
+mod attachments;
 #[cfg(test)]
 #[path = "ai_companion/cancellation_tests.rs"]
 mod cancellation_tests;
@@ -38,6 +39,9 @@ mod panel_tests;
 #[cfg(test)]
 mod persistence_tests;
 mod projection;
+mod reading;
+#[cfg(test)]
+mod reading_tests;
 #[cfg(test)]
 mod recovery_tests;
 #[cfg(test)]
@@ -82,6 +86,8 @@ pub struct State {
     pending_confirmations: Vec<(RoundIdentity, Option<String>)>,
     confirmation_retry_at: Option<Instant>,
     paging: paging::Paging,
+    bottom_reading: BTreeSet<PhotoId>,
+    attachments: attachments::Attachments,
     conversations: BTreeMap<PhotoId, Conversation>,
     pending_local_saves: BTreeSet<PhotoId>,
     local_save_retry_at: Option<Instant>,
@@ -118,6 +124,8 @@ impl Default for State {
             pending_confirmations: Vec::new(),
             confirmation_retry_at: None,
             paging: paging::Paging::default(),
+            bottom_reading: BTreeSet::new(),
+            attachments: attachments::Attachments::default(),
             conversations: BTreeMap::new(),
             pending_local_saves: BTreeSet::new(),
             local_save_retry_at: None,
@@ -132,12 +140,14 @@ impl Default for State {
     }
 }
 struct HistoryView {
+    captured_header: lightcraft_engine::companion::storage::PhotoHeader,
     _retention: lightcraft_engine::companion::storage::HistoryRetention,
     items: Vec<lightcraft_engine::companion::storage::HistoryItem>,
     cursor: lightcraft_engine::companion::storage::HistoryCursor,
     next: Option<lightcraft_engine::companion::storage::HistoryCursor>,
     messages: Vec<Value>,
     fragments: Vec<String>,
+    fragment_messages: BTreeMap<u64, Value>,
     bytes: usize,
     cards: Vec<card::Card>,
     diagnostic: Option<String>,
@@ -1120,7 +1130,7 @@ impl State {
             let input = json!({"input_id":format!("input-{seq}"),"photo_revision":revision,"prompt":job.prompt,"current_state":settings,"preview":snapshot.preview,"history":job.history,"capabilities":capabilities(&settings)});
             let message =
                 self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?.messages.get_mut(job.user_message).ok_or("AI 用户请求缺失。")?;
-            *message = json!({"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request","role":"user","text":format!("{}\nActual photo state: {}",job.prompt,settings.to_json()),"images":[{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]});
+            *message = json!({"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request","role":"user","authored_text_bytes":job.prompt.len(),"text":format!("{}\nActual photo state: {}",job.prompt,settings.to_json()),"images":[{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]});
             if let Some(record) = self
                 .conversations
                 .get_mut(&photo)
@@ -1626,6 +1636,14 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
     {
         state.text = e;
     }
+    if !state.feedback_needs_paint(ctx) {
+        let mut attachments = std::mem::take(&mut state.attachments);
+        // The captured request needs caller-owned photo headers, temporarily available here.
+        app.ai = state;
+        attachments.poll(app, ctx);
+        state = std::mem::take(&mut app.ai);
+        state.attachments = attachments;
+    }
     app.ai = state;
 }
 pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
@@ -1658,6 +1676,7 @@ pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
             return Err(error);
         }
         state.paging.cancel();
+        state.attachments.cancel();
         state.connection = None;
         Ok(())
     })();
@@ -1678,6 +1697,8 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         }
         state.connection = None;
         state.paging.cancel();
+        state.attachments.cancel();
+        state.bottom_reading.clear();
         state.pending_confirmations.clear();
         state.confirmation_retry_at = None;
         state.conversations.clear();
@@ -1774,6 +1795,14 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 "cleanupPending": photo.is_some_and(|p| app.session.companion_photo_cleanup_pending(p)),
                 "cleanupError": photo.and_then(|p| app.session.companion_cleanup_error(p)),
             }))
+        }
+        "ai.bottom" => {
+            let viewed = if params.get("photo").is_some() { photo } else { state.displayed_photo(app) };
+            viewed.ok_or_else(|| tr("Select exactly one photo to start an AI task.").to_owned()).and_then(|photo| {
+                state.load(app, photo)?;
+                state.ensure_bottom(app, photo)?;
+                Ok(json!({"following":true}))
+            })
         }
         "ai.history" => {
             let viewed_photo = if params.get("photo").is_some() { photo } else { state.displayed_photo(app) };
@@ -1892,8 +1921,12 @@ fn display_text(conversation: &Conversation) -> String {
                         append_visible_message(&mut text, message);
                     }
                 }
-                lightcraft_engine::companion::storage::HistoryItem::Fragment { index, .. } => {
-                    if let Some(fragment) = view.fragments.get(index) {
+                lightcraft_engine::companion::storage::HistoryItem::Fragment { record, index, .. } => {
+                    if let Some(fragment) = view.fragments.get(index)
+                        && view.fragment_messages.get(&record).is_some_and(|message| {
+                            matches!(message["role"].as_str(), Some("user" | "assistant" | "system")) && !reading::execution_feedback(message)
+                        })
+                    {
                         text.push_str(fragment);
                         text.push('\n');
                     }
@@ -1912,14 +1945,11 @@ fn display_text(conversation: &Conversation) -> String {
 }
 /// Shared Tools body; the host supplies its viewport, so only messages scroll.
 fn append_visible_message(text: &mut String, message: &Value) {
-    if matches!(message.get("role").and_then(Value::as_str), Some("user" | "assistant")) {
-        let value = message.get("text").and_then(Value::as_str).unwrap_or_default();
-        if !value.starts_with("Actual execution feedback:") {
-            let visible = value.split("\nActual photo state:").next().unwrap_or(value);
-            if !visible.is_empty() {
-                text.push_str(if message["display_kind"] == "round_reverted" { tr(visible) } else { visible });
-                text.push_str("\n\n");
-            }
+    if matches!(message.get("role").and_then(Value::as_str), Some("user" | "assistant")) && !reading::execution_feedback(message) {
+        let visible = reading::user_text(message);
+        if !visible.is_empty() {
+            text.push_str(if message["display_kind"] == "round_reverted" { tr(visible) } else { visible });
+            text.push_str("\n\n");
         }
     }
 }
@@ -2060,6 +2090,13 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
     let mut revert = None;
     let controls_top = ui.cursor().top();
     history_controls(app, ui, photo);
+    if app.ai.editors.get(&photo).is_some_and(|e| !e.data.follow_tail) {
+        let bottom = ui.button(tr("Back to bottom"));
+        composer_widget(ui, "button:aiBackToBottom", bottom.rect);
+        if bottom.clicked() {
+            let _ = app.run("ai.bottom", json!({"photo":photo.0}));
+        }
+    }
     let controls_height = (ui.cursor().top() - controls_top).max(0.0);
     let height = (height - controls_height).max(0.0);
     let expected = app.ai.editors.get(&photo).and_then(|e| e.data.reading_cursor);
@@ -2072,7 +2109,6 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
                         && (view.bytes > 0 || c.prefix.as_ref().is_some_and(|h| h.message_count == 0))
                 })
         });
-    let final_page = app.ai.conversations.get(&photo).is_none_or(|c| c.view.as_ref().is_none_or(|view| view.next.is_none()));
     let editor = app.ai.editors.get_mut(&photo);
     let tail = editor.as_ref().is_none_or(|e| e.data.follow_tail);
     let restore = editor.and_then(|e| (ready && std::mem::replace(&mut e.restore_scroll, false)).then_some(e.data.scroll_offset));
@@ -2082,12 +2118,15 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
         .stick_to_bottom(tail)
         .max_height(height)
         .min_scrolled_height(height);
-    if let Some(offset) = restore {
+    if let Some(offset) = restore
+        && !tail
+    {
         area = area.vertical_scroll_offset(offset);
     }
     let scroll = area.show(ui, |ui| {
         if let Some(conversation) = app.ai.conversations.get(&photo) {
-            ui.label(display_text(conversation));
+            app.ai.attachments.sync(app.session.library_generation(), photo, conversation);
+            reading::show(ui, conversation, &mut app.ai.attachments);
             for card in conversation
                 .view
                 .iter()
@@ -2105,11 +2144,29 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
         } else if !app.ai.text.is_empty() {
             ui.label(&app.ai.text);
         }
+        if restore.is_some() && tail {
+            ui.scroll_to_cursor_animation(Some(egui::Align::BOTTOM), egui::style::ScrollAnimation::none());
+        }
     });
     composer_widget(ui, "ai:messages", scroll.inner_rect);
-    let at_bottom = scroll.state.offset.y + scroll.inner_rect.height() >= scroll.content_size.y - 2.0;
-    if ready {
-        drafts::scroll_position(app, photo, scroll.state.offset.y, at_bottom && final_page);
+    // The scroll area consumes its smooth delta. The delivered raw wheel event
+    // still expresses user intent in this frame; consider only the visible layer.
+    let history_rect = egui::Rect::from_min_max(scroll.inner_rect.min, egui::pos2(scroll.inner_rect.right() + 16.0, scroll.inner_rect.bottom()))
+        .intersect(ui.clip_rect());
+    let over_history = ui.rect_contains_pointer(history_rect);
+    let upward_intent = over_history
+        && ui.input(|input| {
+            input.raw.events.iter().any(|event| matches!(event,egui::Event::MouseWheel{delta,..} if delta.y>0.0))
+                || input.smooth_scroll_delta.y > 0.0
+                || (input.pointer.any_down() && app.ai.editors.get(&photo).is_some_and(|e| scroll.state.offset.y + 0.5 < e.data.scroll_offset))
+        });
+    if upward_intent {
+        if app.ai.bottom_reading.remove(&photo) {
+            app.ai.paging.cancel();
+        }
+        drafts::scroll_position(app, photo, scroll.state.offset.y, false);
+    } else if ready {
+        drafts::scroll_position(app, photo, scroll.state.offset.y, tail);
     }
     if locate {
         let _ = app.run("panel.activity", json!({}));

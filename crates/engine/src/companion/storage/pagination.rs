@@ -128,12 +128,12 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
                 return Err(error("invalid message text range"));
             }
             cursor.offset = cursor.offset.max(start);
-            if cursor.offset >= end {
+            if entry.text_range_version == Some(1) && cursor.offset >= end {
                 cursor.record += 1;
                 cursor.offset = 0;
                 continue;
             }
-            Some(end)
+            Some(if entry.text_range_version == Some(1) { end } else { entry.length as u64 })
         } else {
             None
         };
@@ -144,6 +144,19 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
         }
         let length = usize::try_from(remaining.min(available as u64)).map_err(error)?;
         let mut bytes = range(store, h.photo_id, &entry, cursor.offset, length)?;
+        // Old hints encoded a content heuristic, not the complete authored span.
+        // Keep the known string start and discover its closing quote within this
+        // one bounded slice. Never hydrate or rewrite the giant model record.
+        let old_string_end = text_end.is_some() && entry.text_range_version != Some(1);
+        let quote = old_string_end.then(|| string_end(&bytes)).flatten();
+        if let Some(end) = quote {
+            bytes.truncate(end);
+        }
+        if old_string_end && quote == Some(0) {
+            cursor.record += 1;
+            cursor.offset = 0;
+            continue;
+        }
         if cursor.offset > 0 {
             let skip = bytes.iter().take(3).take_while(|b| **b & 0xc0 == 0x80).count();
             if skip > 0 {
@@ -179,7 +192,7 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
         }
         result.bytes += bytes.len();
         cursor.offset = cursor.offset.checked_add(bytes.len() as u64).ok_or_else(|| error("fragment cursor overflow"))?;
-        if cursor.offset == text_end.unwrap_or(entry.length as u64) {
+        if quote.is_some() || cursor.offset == text_end.unwrap_or(entry.length as u64) {
             cursor.record += 1;
             cursor.offset = 0;
         }
@@ -292,6 +305,7 @@ pub(super) fn tail(
             let length = serialized_length(&record)?;
             let mut entry = stream_record(&mut writer, &record, length)?;
             entry.text_range = text_range(record.source, record.images.as_ref())?;
+            entry.text_range_version = Some(1);
             entry.preview_refs =
                 record.images.as_ref().map(|images| preview_inventory(&json!({"images":images}))).unwrap_or_else(|| preview_inventory(record.source));
             let jumps = writer.jumps(root.as_ref(), count)?;
@@ -334,6 +348,7 @@ pub(super) fn tail(
             digest: digest(&bytes),
             chunk_payload: None,
             text_range: None,
+            text_range_version: None,
             preview_refs: Some(Vec::new()),
         }
     };
@@ -474,6 +489,7 @@ pub(super) fn stream_record<T: Serialize + ?Sized>(writer: &mut Writer<'_>, valu
         digest: sink.hash.finish().to_string(),
         chunk_payload: Some(BLOCK - 32),
         text_range: None,
+        text_range_version: None,
         preview_refs: None,
     })
 }
@@ -644,6 +660,7 @@ pub(super) fn metadata_entry(header: &PhotoHeader) -> Result<Entry> {
         digest: header.metadata_digest.clone(),
         chunk_payload: header.metadata_chunk_payload,
         text_range: None,
+        text_range_version: None,
         preview_refs: None,
     })
 }
@@ -715,6 +732,7 @@ fn replace_recent(writer: &mut Writer<'_>, root: Option<IndexRoot>, count: u64, 
                 digest: digest(&bytes),
                 chunk_payload: None,
                 text_range: None,
+                text_range_version: None,
                 preview_refs: Some(Vec::new()),
             }
         };
@@ -943,14 +961,11 @@ pub(super) fn text_range(value: &Value, images: Option<&Value>) -> Result<Option
         offset = offset.checked_add(serialized_length(key)? as u64).and_then(|v| v.checked_add(1)).ok_or_else(|| error("text span overflow"))?;
         let field = if key == "images" { images.unwrap_or(field) } else { field };
         let length = serialized_length(field)? as u64;
-        if key == "text"
-            && let Some(text) = field.as_str()
-        {
+        if key == "text" && field.is_string() {
             let start = offset.checked_add(1).ok_or_else(|| error("text span overflow"))?;
             // Match the normal message view: execution feedback and appended
             // machine photo-state JSON remain local records, not prose in the panel.
-            let visible =
-                if text.starts_with("Actual execution feedback:") { "" } else { text.split("\nActual photo state:").next().unwrap_or(text) };
+            let visible = if crate::companion::execution_feedback(value) { "" } else { crate::companion::authored_message_text(value) };
             let visible_length = serialized_length(visible)? as u64;
             let end = start.checked_add(visible_length.saturating_sub(2)).ok_or_else(|| error("text span overflow"))?;
             return Ok(Some([start, end]));
@@ -1034,7 +1049,7 @@ impl Session {
         rounds_display(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, cursor, count)
     }
 }
-fn message_round_id(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Option<String>> {
+fn message_display(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Value> {
     let entry = entry(store, header.photo_id, header.message_root.as_ref(), header.message_count, index)?;
     let source = RecordReader {
         store,
@@ -1045,7 +1060,7 @@ fn message_round_id(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> 
         cached: Vec::new(),
         cached_start: 0,
     };
-    let (owner, source) = projection::read(source)?;
+    let (mut owner, source) = projection::read(source)?;
     if source.offset != entry.length as u64 || source.hash.finish().to_string() != entry.digest {
         return Err(error("message owner digest mismatch"));
     }
@@ -1053,9 +1068,17 @@ fn message_round_id(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> 
     if id.is_some_and(|id| id.is_empty() || id.len() > 128) {
         return Err(error("invalid local round identity"));
     }
-    Ok(id.map(str::to_owned))
+    mark_old_hidden_text(&mut owner, &entry);
+    Ok(owner)
+}
+fn message_round_id(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Option<String>> {
+    Ok(message_display(store, header, index)?["local_round_id"].as_str().map(str::to_owned))
 }
 impl HistoryReader {
+    /// Bounded selected presentation fields, verified against the complete captured record digest.
+    pub fn message_display(&mut self, index: u64) -> Result<Value> {
+        message_display(self.store.as_mut(), &self.header, index)
+    }
     pub fn message_round_id(&mut self, index: u64) -> Result<Option<String>> {
         message_round_id(self.store.as_mut(), &self.header, index)
     }
@@ -1063,5 +1086,34 @@ impl HistoryReader {
 impl Session {
     pub fn companion_message_round_id_at(&mut self, header: &PhotoHeader, index: u64) -> Result<Option<String>> {
         message_round_id(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, index)
+    }
+}
+
+fn string_end(bytes: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(&byte) = bytes.get(offset) {
+        if byte == b'"' {
+            return Some(offset);
+        }
+        if byte == b'\\' {
+            let length = if *bytes.get(offset + 1)? == b'u' { 6 } else { 2 };
+            if offset + length > bytes.len() {
+                return None;
+            }
+            offset += length;
+        } else {
+            offset += 1;
+        }
+    }
+    None
+}
+fn mark_old_hidden_text(value: &mut Value, entry: &Entry) {
+    if entry.text_range_version != Some(1)
+        && entry.text_range.is_some_and(|[start, end]| start == end)
+        && value["role"] == "user"
+        && value.get("display_kind").is_none()
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("legacy_hidden_text".into(), Value::Bool(true));
     }
 }
