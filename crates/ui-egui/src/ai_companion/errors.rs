@@ -39,3 +39,8 @@ pub(super) fn published(record: &serde_json::Value) -> bool {
 pub(super) fn trace(record: &serde_json::Value) -> Option<&str> {
     record.get("trace_id").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control))
 }
+
+/// Only the displayed photo's captured, verified history can supply a cold diagnostic.
+pub(super) fn diagnostic(conversation: &super::Conversation) -> Option<&str> {
+    conversation.records.iter().rev().find_map(trace).or_else(|| conversation.view.as_ref().and_then(|view| view.diagnostic.as_deref()))
+}

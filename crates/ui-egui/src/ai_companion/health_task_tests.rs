@@ -168,10 +168,8 @@ fn deleted_task_photo_opens_its_readonly_conversation_without_selecting_another_
     frames(&mut h);
     h.app.session.execute("photo.delete", &json!({"ids":[photo.0]})).unwrap();
     h.app.session.execute("develop.set", &json!({"ids":[other.0],"values":{"light.exposure":0.7}})).unwrap();
-    let mut editor = lightcraft_engine::companion::EditorState::default();
-    editor.draft = "B_SAVED_DRAFT".into();
-    editor.scroll_offset = 30.0;
-    editor.follow_tail = false;
+    let editor =
+        lightcraft_engine::companion::EditorState { draft: "B_SAVED_DRAFT".into(), scroll_offset: 30.0, follow_tail: false, ..Default::default() };
     h.app.session.set_companion_editor(other, editor).unwrap();
     h.app.session.set_photo_companion(other, Some(json!({"schema_version":2,"messages":[{"role":"assistant","text":(0..60).map(|n|format!("B saved history line {n}\n")).collect::<String>()}]}))).unwrap();
     h.app.run("library.select", json!({"ids":[other.0],"active":other.0})).unwrap();
@@ -729,13 +727,13 @@ fn health_and_global_entry_are_readable_in_bilingual_normal_narrow_and_short_too
             request(&mut h, "ui.clickWidget", json!({"id":"button:aiTaskEntry"}));
             frames(&mut h);
             assert_eq!(h.app.session.active(), Some(photo));
-            events.send(network::Event::Closed(None)).unwrap();
+            events.send(network::Event::Closed("layout verification connection closed".into())).unwrap();
             frames(&mut h);
             h.app.session.execute("photo.delete", &json!({"ids":[photo.0]})).unwrap();
             h.app.run("library.select", json!({"ids":[other.0]})).unwrap();
             h.app.run("ai.task", json!({})).unwrap();
             frames(&mut h);
-            super::panel_tests::reachable(&mut h, "button:aiSelectedConversation", 1.0);
+            super::panel_tests::reachable(&mut h, "button:aiSelectedConversation", -1.0);
             if let Ok(dir) = std::env::var("UX20_SCREENSHOT_DIR") {
                 assert_eq!(
                     h.request(
@@ -751,5 +749,190 @@ fn health_and_global_entry_are_readable_in_bilingual_normal_narrow_and_short_too
             assert_eq!(h.app.session.active(), Some(other));
             assert_eq!(h.app.run("ai.status", json!({})).unwrap()["readonlyPhoto"], Value::Null);
         }
+    }
+}
+
+// Catches losing Stop when a real task source disappears while B stays selected;
+// misses OS pointer delivery and a live model. Only this owned procedural file is removed.
+#[test]
+fn unavailable_active_original_task_still_has_scoped_stop_after_real_input() {
+    let path = format!(
+        "/tmp/lightcraft-ux-execution-20261013/20/missing-active-{}.png",
+        lightcraft_engine::companion::LocalRoundId::new().unwrap().as_str()
+    );
+    let bytes = lightcraft_engine::export::encode_image(
+        &lightcraft_raster::Rgba8::filled(32, 24, [96, 128, 160, 255]),
+        &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+    )
+    .unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    let mut session = Session::with_demo();
+    let (loader, probe) = lightcraft_engine::files::fs_hooks();
+    session.media.file_loader = Some(loader);
+    session.media.file_probe = Some(probe);
+    lightcraft_engine::import::import(&mut session, std::slice::from_ref(&path), lightcraft_engine::import::ImportMode::Add).unwrap();
+    let photo = session.catalog.photos().find(|p| p.source == lightcraft_catalog::Source::File { path: path.clone() }).unwrap().id;
+    session.execute("library.select", &json!({"ids":[photo.0]})).unwrap();
+    let other = session.catalog.photos().find(|p| p.id != photo).unwrap().id;
+    let before = session.develop_of(other).unwrap();
+    let mut app = LightcraftApp::new(session, Services::default());
+    app.ui.settings.gpu = false;
+    let (connection, requests, events) = network::test_connection();
+    app.ai.connection = Some(connection);
+    app.ai.generation = app.session.library_generation();
+    let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(&mut h);
+    request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.app.session.media.availability.exists(&path) != Some(true) {
+        h.step();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.app.run("ai.start", json!({"prompt":"Improve my photo"})).unwrap();
+    let create = outgoing(&mut h, &requests, "/v1/rounds");
+    events.send(network::Event::Server{kind:"round.state".into(),data:json!({"round_id":"missing-active","payload":{"submission_seq":create.submission,"photo_ref":create.body["photo_ref"],"state":"awaiting_input"}})}).unwrap();
+    outgoing(&mut h, &requests, "/input");
+    events.send(network::Event::Server{kind:"round.state".into(),data:json!({"round_id":"missing-active","payload":{"submission_seq":create.submission,"photo_ref":create.body["photo_ref"],"state":"analyzing_initial"}})}).unwrap();
+    frames(&mut h);
+    std::fs::remove_file(&path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while h.app.session.media.availability.exists(&path) != Some(false) {
+        h.step();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.app.run("library.select", json!({"ids":[other.0]})).unwrap();
+    h.app.run("panel.close", json!({})).unwrap();
+    frames(&mut h);
+    request(&mut h, "ui.clickWidget", json!({"id":"button:aiTaskEntry"}));
+    frames(&mut h);
+    let status = h.app.run("ai.status", json!({})).unwrap();
+    assert_eq!(
+        status["readonlyPhoto"],
+        photo.0,
+        "{status} inspect:{} source:{:?}",
+        request(&mut h, "ui.inspect", json!({})),
+        h.app.session.catalog.photo(photo).unwrap().source
+    );
+    assert_eq!(h.app.session.active(), Some(other));
+    assert_eq!(status["task"]["phase"], "analyzing_initial");
+    assert_eq!(status["task"]["terminal"], Value::Null);
+    request(&mut h, "ui.clickWidget", json!({"id":"button:aiStop"}));
+    frames(&mut h);
+    let cancel = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(cancel.path, "/v1/rounds/missing-active/stop");
+    assert_eq!(*h.app.session.develop_of(other).unwrap(), *before);
+    assert_eq!(h.app.session.active(), Some(other));
+    assert!(requests.try_recv().is_err(), "stopping A sends no new photo input or round");
+}
+
+// Catches losing persisted trace IDs on real cold scoped history reads, including pure answers;
+// misses physical OS clipboard integration and model/provider diagnostics quality.
+#[test]
+fn cold_verified_history_keeps_trace_and_consent_controls_scoped_while_loading() {
+    use lightcraft_catalog::MemStore;
+    use lightcraft_engine::library::LibraryStores;
+    for background in [false, true] {
+        let catalog = MemStore::new();
+        let mut files = MemStore::new();
+        files.background = background;
+        let open = |catalog: MemStore, files: MemStore| {
+            let mut session = Session::new();
+            session
+                .open_library_in(LibraryStores { catalog: Box::new(catalog), files: Box::new(files), dir: "cold-trace".into(), on_disk: false }, true)
+                .unwrap();
+            session
+        };
+        let mut session = open(catalog.clone(), files.clone());
+        let photo = session.active().unwrap();
+        let other = session.catalog.photos().find(|p| p.id != photo).unwrap().id;
+        session.save_companion_conversation(photo,json!({"schema_version":2,"messages":[{"role":"assistant","text":"Saved failure remains readable.","local_round_id":"cold-trace-round"}],"round_records":[{"photo_id":photo.0,"local_round_id":"cold-trace-round","local_terminal":"failed","trace_id":"abcdef012345-cold","stages":[],"request":"ignored large source context".repeat(120_000)}],"rounds":[]})).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.companion_history_unsaved(photo) {
+            session.persist().unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        session.persist().unwrap();
+        drop(session);
+        let mut h = Headless::new(
+            LightcraftApp::new(open(catalog, files), Services { companion_address: Some("192.0.2.1:18080".into()), ..Default::default() }),
+            [1100.0, 750.0],
+            1.0,
+        );
+        h.app.run("ai.open", json!({})).unwrap();
+        // Catches asynchronous diagnostic completion invalidating a held consent click;
+        // misses physical OS input. Fallback continuation gives a deterministic pending read.
+        let held = if !background {
+            frames(&mut h);
+            assert_eq!(h.app.run("ai.status", json!({})).unwrap()["historyLoading"], true);
+            let rect = h.app.widgets.iter().find(|(id, _)| id == "checkbox:aiConsent").unwrap().1;
+            let point = rect.center();
+            h.app.synthetic.extend([
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+            ]);
+            h.step();
+            Some((rect, point))
+        } else {
+            None
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            frames(&mut h);
+            let status = h.app.run("ai.status", json!({})).unwrap();
+            if status["historyLoading"] == false {
+                assert_eq!(status["resultCards"], json!([]), "a pure answer does not gain an editing card");
+                assert!(status["text"].as_str().unwrap().contains("Saved failure remains readable."));
+                break;
+            }
+            assert!(Instant::now() < deadline, "{status}");
+            std::thread::yield_now();
+        }
+        let mut owned = None;
+        if let Some((before, point)) = held {
+            assert_eq!(
+                h.app.widgets.iter().find(|(id, _)| id == "checkbox:aiConsent").unwrap().1,
+                before,
+                "cold trace completion must not move a held consent control"
+            );
+            h.app.synthetic.push(egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            frames(&mut h);
+            let (connection, requests, events) = network::test_connection();
+            h.app.ai.connection = Some(connection);
+            h.app.ai.generation = h.app.session.library_generation();
+            owned = Some((requests, events));
+        }
+        request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
+        assert_eq!(h.view.clipboard, "abcdef012345-cold");
+        if let Some((requests, _events)) = owned.as_ref() {
+            assert_eq!(h.app.run("ai.start", json!({"prompt":"new explicit request"})).unwrap()["started"], true);
+            assert_eq!(requests.recv_timeout(Duration::from_secs(1)).unwrap().path, "/v1/rounds");
+        }
+        h.app.run("library.select", json!({"ids":[other.0]})).unwrap();
+        frames(&mut h);
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"), "B cannot copy A's diagnostic");
+        h.app
+            .session
+            .open_library_in(
+                LibraryStores {
+                    catalog: Box::new(MemStore::new()),
+                    files: Box::new(MemStore::new()),
+                    dir: "other-cold-library".into(),
+                    on_disk: false,
+                },
+                true,
+            )
+            .unwrap();
+        h.app.run("ai.open", json!({})).unwrap();
+        frames(&mut h);
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"), "same photo IDs in a new library cannot reuse old diagnostics");
     }
 }

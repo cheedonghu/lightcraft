@@ -137,6 +137,7 @@ struct HistoryView {
     fragments: Vec<String>,
     bytes: usize,
     cards: Vec<card::Card>,
+    diagnostic: Option<String>,
     cards_bytes: usize,
     card_cursor: Option<u64>,
     card_pending: BTreeSet<String>,
@@ -1973,6 +1974,17 @@ fn readonly_task_body(app: &mut LightcraftApp, ui: &mut egui::Ui, scope: PhotoSc
         task.unread = false;
         ui.label(&task.name);
     }
+    if app.ai.jobs.contains_key(&scope.photo) {
+        let stop = ui.button(tr("Stop Generating"));
+        composer_widget(ui, "button:aiStop", stop.rect);
+        if stop.clicked() {
+            if let Err(error) = app.run("ai.stop", json!({"photo":scope.photo.0})) {
+                app.ai.text = error;
+            }
+            app.ai.defer_local_saves_for_feedback(ui.ctx());
+            app.session.defer_companion_retry(true);
+        }
+    }
     let notice = ui.label(tr("The task photo is unavailable. Its saved conversation is kept."));
     composer_widget(ui, "indicator:aiTaskReadOnly", notice.rect);
     let back = ui.button(tr("View Selected Photo Conversation"));
@@ -1980,7 +1992,7 @@ fn readonly_task_body(app: &mut LightcraftApp, ui: &mut egui::Ui, scope: PhotoSc
     if back.clicked() {
         let _ = app.run("ai.returnCurrent", json!({}));
     }
-    if let Some(trace) = app.ai.conversations.get(&scope.photo).and_then(|c| c.records.iter().rev().find_map(errors::trace)).map(str::to_owned) {
+    if let Some(trace) = app.ai.conversations.get(&scope.photo).and_then(errors::diagnostic).map(str::to_owned) {
         let copy = ui.button(tr("Copy Diagnostic ID"));
         composer_widget(ui, "button:aiCopyTrace", copy.rect);
         if copy.clicked() {
@@ -2140,8 +2152,24 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
         consent_control(app, ui, photo);
     }
     health::show(app, ui, compact);
-    if let Some(trace) = app.ai.conversations.get(&photo).and_then(|c| c.records.iter().rev().find_map(errors::trace)).map(str::to_owned) {
-        let copy = ui.button(tr("Copy Diagnostic ID"));
+    // Reserve the optional diagnostic control before a cold history read completes,
+    // so its arrival cannot invalidate a held consent/submit gesture.
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui.painter().layout_no_wrap(tr("Copy Diagnostic ID").into(), font, ui.visuals().text_color());
+    let size = egui::vec2(
+        (galley.size().x + 2.0 * ui.spacing().button_padding.x).min(ui.available_width()),
+        ui.spacing().interact_size.y.max(galley.size().y + 2.0 * ui.spacing().button_padding.y),
+    );
+    let (slot, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    // Allocate the child in both states so later buttons retain their egui identities.
+    let mut diagnostic_row = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("ai-diagnostic", app.session.library_generation(), photo.0))
+            .max_rect(slot)
+            .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)),
+    );
+    if let Some(trace) = app.ai.conversations.get(&photo).and_then(errors::diagnostic).map(str::to_owned) {
+        let copy = diagnostic_row.add(egui::Button::new(tr("Copy Diagnostic ID")));
         composer_widget(ui, "button:aiCopyTrace", copy.rect);
         if !sizing && copy.clicked() {
             ui.ctx().copy_text(trace);

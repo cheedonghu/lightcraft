@@ -64,7 +64,7 @@ impl eframe::App for App {
             // Quit from the menu bar: save exactly what closing the window saves (settings and
             // library, after the unsaved-changes check; otherwise its prompt shows), then end the
             // process instead of closing the viewport while AppKit is terminating (PR #444).
-            eframe::App::on_exit(self);
+            eframe::App::on_exit(self, None);
             std::process::exit(0);
         }
         self.0.logic(ctx);

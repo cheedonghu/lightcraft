@@ -14,7 +14,7 @@ struct ReadMessage {
     scope: PhotoScope,
     transaction: String,
     cursor: HistoryCursor,
-    result: Result<(HistorySlice, Vec<card::Card>, Option<String>), String>,
+    result: Result<(HistorySlice, Vec<card::Card>, Option<String>, Option<String>), String>,
 }
 pub(super) struct Paging {
     tx: mpsc::SyncSender<ReadMessage>,
@@ -76,7 +76,7 @@ impl State {
             }
             self.paging.completed = message.request;
             match message.result {
-                Ok((page, cards, notice)) => {
+                Ok((page, cards, notice, diagnostic)) => {
                     if let Some(notice) = notice {
                         conversation.notice = notice;
                     }
@@ -93,6 +93,7 @@ impl State {
                             .map(|c| serde_json::to_vec(c).map_or(usize::MAX, |bytes| bytes.len()))
                             .fold(0, usize::saturating_add),
                         cards,
+                        diagnostic,
                         card_cursor: None,
                         card_pending: BTreeSet::new(),
                         card_owners: VecDeque::new(),
@@ -111,6 +112,7 @@ impl State {
                         fragments: Vec::new(),
                         bytes: 0,
                         cards: Vec::new(),
+                        diagnostic: None,
                         cards_bytes: 0,
                         card_cursor: None,
                         card_pending: BTreeSet::new(),
@@ -144,13 +146,17 @@ impl State {
                             DisplayRecord::Round(index) => {
                                 let total = if header.record_count > 0 { header.record_count } else { header.round_count };
                                 view.card_cursor = (index + 1 < total).then_some(index + 1);
-                                if record["local_round_id"].as_str().is_some_and(|id| view.card_pending.remove(id))
-                                    && let Some(card) = card::from_record(&record, None)
-                                    && !view.cards.iter().any(|c| c.local_round_id == card.local_round_id)
-                                {
-                                    view.cards_bytes =
-                                        view.cards_bytes.saturating_add(serde_json::to_vec(&card).map_or(usize::MAX, |bytes| bytes.len()));
-                                    view.cards.push(card);
+                                if record["local_round_id"].as_str().is_some_and(|id| view.card_pending.remove(id)) {
+                                    if let Some(trace) = errors::trace(&record) {
+                                        view.diagnostic = Some(trace.to_owned());
+                                    }
+                                    if let Some(card) = card::from_record(&record, None)
+                                        && !view.cards.iter().any(|c| c.local_round_id == card.local_round_id)
+                                    {
+                                        view.cards_bytes =
+                                            view.cards_bytes.saturating_add(serde_json::to_vec(&card).map_or(usize::MAX, |bytes| bytes.len()));
+                                        view.cards.push(card);
+                                    }
                                 }
                             }
                         }
@@ -232,6 +238,7 @@ impl State {
                         let mut cursor = 0;
                         let mut cards = Vec::new();
                         let mut notice = None;
+                        let mut diagnostic = None;
                         // Exact recorded ids, never inferred from neighbouring rounds.
                         let mut wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
                         for item in &page.items {
@@ -257,10 +264,13 @@ impl State {
                                 }
                             };
                             for record in rounds.records {
-                                if record["local_round_id"].as_str().is_some_and(|id| wanted.remove(id))
-                                    && let Some(card) = card::from_record(&record, None)
-                                {
-                                    cards.push(card);
+                                if record["local_round_id"].as_str().is_some_and(|id| wanted.remove(id)) {
+                                    if let Some(trace) = errors::trace(&record) {
+                                        diagnostic = Some(trace.to_owned());
+                                    }
+                                    if let Some(card) = card::from_record(&record, None) {
+                                        cards.push(card);
+                                    }
                                 }
                             }
                             if wanted.is_empty() {
@@ -269,7 +279,7 @@ impl State {
                             let Some(next) = rounds.next_cursor else { break };
                             cursor = next;
                         }
-                        (page, cards, notice)
+                        (page, cards, notice, diagnostic)
                     });
                     if !cancel.load(Ordering::Relaxed) {
                         let _ = tx.try_send(ReadMessage {

@@ -114,19 +114,19 @@ pub(super) fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             crate::widgets::register(ui.ctx(), "button:aiTaskEntry", rect.intersect(ui.clip_rect()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if unread {
-                    ui.label(egui::RichText::new(tr("New result")).color(t.accent));
+                    ui.add(egui::Label::new(egui::RichText::new(tr("New result")).color(t.accent)).selectable(false));
                 }
                 if let Some(terminal) = &terminal {
-                    ui.label(terminal);
+                    ui.add(egui::Label::new(terminal).selectable(false));
                 }
-                ui.label(&stage);
-                ui.add(egui::Label::new(&name).truncate());
-                ui.label(tr("AI Task"));
+                ui.add(egui::Label::new(&stage).selectable(false));
+                ui.add(egui::Label::new(&name).selectable(false).truncate());
+                ui.add(egui::Label::new(tr("AI Task")).selectable(false));
             });
-            if response.on_hover_text(crate::i18n::tr_format!("View AI task for {photo}", photo = name)).clicked() {
-                if let Err(error) = app.run("ai.task", json!({})) {
-                    app.ai.text = error;
-                }
+            if response.on_hover_text(crate::i18n::tr_format!("View AI task for {photo}", photo = name)).clicked()
+                && let Err(error) = app.run("ai.task", json!({}))
+            {
+                app.ai.text = error;
             }
         },
     );
