@@ -125,6 +125,9 @@ fn cancelling_blocked_native_style_history_preflight_never_enqueues_creation_or_
         fn describe(&self) -> String {
             "native-style reader barrier".into()
         }
+        fn retention_namespace(&self) -> Option<String> {
+            self.files.retention_namespace()
+        }
         fn background_writer(&self) -> Option<Box<dyn Store>> {
             Some(Box::new(Self { files: self.files.clone(), gate: self.gate.clone(), reader: true }))
         }
@@ -398,6 +401,9 @@ fn cold_native_history_command_and_rapid_requests_keep_the_latest_explicit_curso
         }
         fn describe(&self) -> String {
             "blocked native page".into()
+        }
+        fn retention_namespace(&self) -> Option<String> {
+            self.files.retention_namespace()
         }
         fn background_writer(&self) -> Option<Box<dyn Store>> {
             Some(Box::new(Self { files: self.files.clone(), gate: self.gate.clone(), reader: true }))

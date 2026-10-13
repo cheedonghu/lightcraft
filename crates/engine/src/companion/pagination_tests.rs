@@ -371,9 +371,14 @@ fn retrying_a_staged_late_receipt_cannot_restore_eligibility_after_a_manual_edit
     assert!(session.confirm_companion_execution(&identity, "plan").is_err());
     let pending = session.companion_pending(photo).unwrap().unwrap();
     assert_ne!(session.companion_round(photo, identity.local_round_id.as_str()).unwrap().unwrap()["backend_confirmed_plan"], "plan");
-    session.execute("develop.set", &json!({"ids":[photo.0],"values":{"light.exposure":0.5}})).unwrap();
+    assert!(
+        matches!(session.execute("develop.set", &json!({"ids":[photo.0],"values":{"light.exposure":0.5}})), Err(crate::EngineError::NotSaved(_))),
+        "receipt storage debt must remain visible after the ordinary edit"
+    );
+    assert_eq!(session.develop_of(photo).unwrap().light.exposure, 0.5);
     fail.store(false, Ordering::Relaxed);
-    session.companion_commit(&pending).unwrap();
+    assert!(session.confirm_companion_execution(&identity, "plan").unwrap());
+    assert_eq!(session.companion_photo_header(photo).unwrap().unwrap().transaction_id, pending.transaction_id);
     assert_eq!(session.companion_round(photo, identity.local_round_id.as_str()).unwrap().unwrap()["backend_confirmed_plan"], "plan");
     assert_eq!(session.companion_metadata(photo).unwrap().unwrap()["checkpoint"]["eligible"], false);
     assert_eq!(session.develop_of(photo).unwrap().light.exposure, 0.5);

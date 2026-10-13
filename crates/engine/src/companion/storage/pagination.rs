@@ -246,27 +246,15 @@ pub(super) fn tail(
             return Err(error("immutable prefix changed"));
         }
     }
-    let old_head: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
     let epoch = header(store, photo)?.map(|h| h.conversation_epoch).unwrap_or(0);
     if prefix.is_some_and(|h| h.conversation_epoch != epoch) {
         return Err(error("conversation epoch changed"));
     }
-    let existing: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
-    let mut pending = if let Some(pending) = existing.filter(|p| old_head.as_ref() != Some(&p.head)) {
-        if pending.photo != photo
-            || pending.old_head != old_head
-            || pending.expected_epoch != epoch
-            || !valid_transaction(&pending.transaction_id)
-            || pending.head.manifest != format!("{}/manifest-{}.json", base(photo), pending.transaction_id)
-        {
-            return Err(error("unresolved tail transaction"));
-        }
-        pending
-    } else {
-        let tx = super::super::LocalRoundId::new().map_err(error)?.as_str().to_owned();
-        let head = Head { manifest: format!("{}/manifest-{tx}.json", base(photo)), transaction_id: tx.clone(), manifest_digest: String::new() };
-        PendingCommit { photo, transaction_id: tx, expected_epoch: epoch, old_head, head, reserved_files: 0, reuse: None, revert_override: None }
-    };
+    let fingerprint = recovery::fingerprint(&(prefix, messages, rounds, records, metadata))?;
+    let (mut pending, complete) = recovery::prepare(store, photo, epoch, &fingerprint)?;
+    if complete {
+        return Ok(pending);
+    }
     pending.reuse = prefix.cloned();
     pending.revert_override = None;
     write(store, &format!("{}/pending.json", base(photo)), &pending)?;
@@ -300,6 +288,8 @@ pub(super) fn tail(
             let length = serialized_length(&record)?;
             let mut entry = stream_record(&mut writer, &record, length)?;
             entry.text_range = text_range(record.source, record.images.as_ref())?;
+            entry.preview_refs =
+                record.images.as_ref().map(|images| preview_inventory(&json!({"images":images}))).unwrap_or_else(|| preview_inventory(record.source));
             let jumps = writer.jumps(root.as_ref(), count)?;
             let index = Index { start: count, entries: vec![entry], previous: root, jumps };
             let bytes = serde_json::to_vec(&index).map_err(error)?;
@@ -333,7 +323,15 @@ pub(super) fn tail(
         stream_record(&mut writer, metadata, length)?
     } else {
         let bytes = serde_json::to_vec(metadata).map_err(error)?;
-        Entry { block: writer.blob(&bytes)?, offset: 0, length, digest: digest(&bytes), chunk_payload: None, text_range: None }
+        Entry {
+            block: writer.blob(&bytes)?,
+            offset: 0,
+            length,
+            digest: digest(&bytes),
+            chunk_payload: None,
+            text_range: None,
+            preview_refs: Some(Vec::new()),
+        }
     };
     let manifest = PhotoHeader {
         photo_id: photo,
@@ -388,6 +386,7 @@ impl Session {
                 if self.companion_archive.tails.is_empty()
                     && self.companion_archive.dirty_photos.is_empty()
                     && self.companion_archive.revert_dirty.is_empty()
+                    && self.companion_archive.receipts.is_empty()
                 {
                     self.companion_archive.error = None;
                 }
@@ -471,6 +470,7 @@ pub(super) fn stream_record<T: Serialize + ?Sized>(writer: &mut Writer<'_>, valu
         digest: sink.hash.finish().to_string(),
         chunk_payload: Some(BLOCK - 32),
         text_range: None,
+        preview_refs: None,
     })
 }
 struct RecordReader<'a> {
@@ -532,6 +532,7 @@ pub(super) fn verify_record(store: &mut dyn Store, photo: PhotoId, entry: &Entry
 /// Read-only worker view of a captured immutable graph. It owns at most one
 /// native range handle at a time; each call has an explicit work/byte budget.
 pub struct HistoryReader {
+    _pin: reader_pins::HistoryRetention,
     store: Box<dyn Store>,
     header: PhotoHeader,
 }
@@ -573,7 +574,12 @@ fn bounded_messages(store: &mut dyn Store, header: &PhotoHeader, cursor: u64, bu
 impl Session {
     pub fn companion_reader(&self, header: &PhotoHeader) -> Result<Option<HistoryReader>> {
         let library = self.library.as_ref().ok_or_else(|| error("library closed"))?;
-        Ok(library.files.background_writer().map(|store| HistoryReader { store, header: header.clone() }))
+        let Some(mut store) = library.files.background_writer() else { return Ok(None) };
+        if library.files.retention_namespace().is_none() {
+            return Err(error("background history reader requires stable Store retention namespace"));
+        }
+        let pin = reader_pins::capture(&self.companion_archive.readers, store.as_mut(), header)?;
+        Ok(Some(HistoryReader { store, header: header.clone(), _pin: pin }))
     }
     pub fn companion_messages_bounded(&mut self, header: &PhotoHeader, cursor: u64, count: usize, bytes: usize) -> Result<RecordPage> {
         bounded_messages(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, cursor, count, bytes)
@@ -629,6 +635,7 @@ pub(super) fn metadata_entry(header: &PhotoHeader) -> Result<Entry> {
         digest: header.metadata_digest.clone(),
         chunk_payload: header.metadata_chunk_payload,
         text_range: None,
+        preview_refs: None,
     })
 }
 
@@ -692,7 +699,15 @@ fn replace_recent(writer: &mut Writer<'_>, root: Option<IndexRoot>, count: u64, 
             stream_record(writer, value, length)?
         } else {
             let bytes = serde_json::to_vec(value).map_err(error)?;
-            Entry { block: writer.blob(&bytes)?, offset: 0, length, digest: digest(&bytes), chunk_payload: None, text_range: None }
+            Entry {
+                block: writer.blob(&bytes)?,
+                offset: 0,
+                length,
+                digest: digest(&bytes),
+                chunk_payload: None,
+                text_range: None,
+                preview_refs: Some(Vec::new()),
+            }
         };
         *index.entries.get_mut(usize::try_from(ordinal - index.start).map_err(error)?).ok_or_else(|| error("round record absent"))? = replacement;
         index.jumps = writer.jumps(index.previous.as_ref(), index.start)?;
@@ -723,83 +738,146 @@ impl Session {
             return Ok(false);
         }
         let photo = identity.scope.photo;
-        let Some(h) = self.companion_photo_header(photo)? else { return Ok(false) };
-        let store = self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut();
-        let existing: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
-        let visible: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
-        if existing.is_some_and(|p| visible.as_ref() != Some(&p.head)) {
+        let receipt = json!({"local_round_id":identity.local_round_id,"submission_seq":identity.submission_seq,"connection_generation":identity.connection_generation,"runtime_library_generation":identity.scope.library_generation,"plan":plan});
+        let result = confirm_receipt(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), photo, &receipt);
+        match &result {
+            Ok(_) => {
+                if let Some(queued) = self.companion_archive.receipts.get_mut(&photo) {
+                    queued.retain(|r| r != &receipt);
+                    if queued.is_empty() {
+                        self.companion_archive.receipts.remove(&photo);
+                    }
+                }
+                if self.companion_archive.receipts.is_empty()
+                    && self.companion_archive.tails.is_empty()
+                    && self.companion_archive.dirty_photos.is_empty()
+                    && self.companion_archive.revert_dirty.is_empty()
+                {
+                    self.companion_archive.error = None;
+                }
+            }
+            Err(e) => {
+                let queued = self.companion_archive.receipts.entry(photo).or_default();
+                if !queued.contains(&receipt) {
+                    queued.push(receipt);
+                }
+                self.companion_archive.error = Some(e.to_string());
+            }
+        }
+        result
+    }
+}
+/// A stored operation is replayed only into the archive. Runtime library identity
+/// still gates external confirmations in Session, while recovery preserves the
+/// original stored identity and cannot edit a photo or contact the backend.
+pub(super) fn recover_receipt(store: &mut dyn Store, photo: PhotoId) -> Result<bool> {
+    let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    if let Some(receipt) = p.and_then(|p| p.receipt) { confirm_receipt(store, photo, &receipt) } else { Ok(false) }
+}
+pub(crate) fn retry_receipt(store: &mut dyn Store, photo: PhotoId, receipt: &Value) -> Result<bool> {
+    confirm_receipt(store, photo, receipt)
+}
+fn confirm_receipt(store: &mut dyn Store, photo: PhotoId, receipt: &Value) -> Result<bool> {
+    if serialized_length(receipt)? > SMALL as usize {
+        return Err(error("receipt operation exceeds bounded identity"));
+    }
+    let local_round_id =
+        receipt["local_round_id"].as_str().filter(|id| valid_transaction(id)).ok_or_else(|| error("invalid stored receipt round"))?;
+    let submission_seq = receipt["submission_seq"].as_u64().ok_or_else(|| error("invalid stored receipt sequence"))?;
+    let connection_generation = receipt["connection_generation"].as_u64().ok_or_else(|| error("invalid stored receipt connection"))?;
+    let library_generation = receipt["runtime_library_generation"].as_u64().ok_or_else(|| error("invalid stored receipt scope"))?;
+    let plan = if receipt["plan"].is_null() { None } else { Some(receipt["plan"].as_str().ok_or_else(|| error("invalid stored receipt plan"))?) };
+    let existing: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    let mut resumed = None;
+    if let Some(pending) = existing {
+        let visible = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
+        recovery::validate(&pending, photo, &visible)?;
+        if pending.revert_override.is_none() {
             return Err(error("uncommitted tail retains its reservation; retry receipt later"));
         }
-        let mut found = None;
-        for ordinal in (h.record_count.saturating_sub(128)..h.record_count).rev() {
-            let entry = entry(store, photo, h.record_root.as_ref(), h.record_count, ordinal)?;
-            if entry.length > 32 * 1024 * 1024 {
-                return Err(error("receipt record requires streaming update"));
+        if pending.head.manifest_digest.is_empty() {
+            if pending.receipt.as_ref() != Some(receipt) {
+                return Err(error("another incomplete receipt retains its reservation"));
             }
-            let bytes = range(store, photo, &entry, 0, entry.length)?;
-            if digest(&bytes) != entry.digest {
-                return Err(error("record digest mismatch"));
-            }
-            let value: Value = serde_json::from_slice(&bytes).map_err(error)?;
-            if value["local_round_id"] == identity.local_round_id.as_str()
-                && value["submission_seq"] == identity.submission_seq
-                && value["connection_generation"] == identity.connection_generation
-                && value["runtime_library_generation"] == identity.scope.library_generation
-            {
-                found = Some((ordinal, value));
-                break;
-            }
-        }
-        let Some((ordinal, mut value)) = found else { return Ok(false) };
-        if let Some(plan) = plan {
-            let Some(stage) = value.get_mut("stages").and_then(Value::as_array_mut).and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan)) else {
-                return Ok(false);
-            };
-            let succeeded = stage["execution_outcome"] == "succeeded";
-            let confirmed = stage["delivery_state"] == "confirmed";
-            if confirmed && (!succeeded || value["backend_confirmed_plan"] == plan) {
-                return Ok(true);
-            }
-            let Some(stage) = value.get_mut("stages").and_then(Value::as_array_mut).and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan)) else {
-                return Ok(false);
-            };
-            stage["delivery_state"] = json!("confirmed");
-            if succeeded {
-                value["backend_confirmed_plan"] = json!(plan);
-            }
+            resumed = Some(pending);
         } else {
-            if value["input_delivery_state"] == "confirmed" {
-                return Ok(true);
-            }
-            value["input_delivery_state"] = json!("confirmed");
+            commit(store, &pending)?;
+            finish_pending(store, photo);
         }
-        let old_head: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
-        let revert: Option<Value> = read(store, &format!("{}/revert.json", base(photo)), SMALL)?;
-        let revert = revert.filter(|r| r["transaction_id"] == h.transaction_id).unwrap_or_else(|| json!({"eligible":false}));
-        let tx = super::super::LocalRoundId::new().map_err(error)?.as_str().to_owned();
-        let pending = PendingCommit {
-            photo,
-            transaction_id: tx.clone(),
-            expected_epoch: h.conversation_epoch,
-            old_head,
-            head: Head { manifest: format!("{}/manifest-{tx}.json", base(photo)), transaction_id: tx, manifest_digest: String::new() },
-            reserved_files: 0,
-            reuse: Some(h.clone()),
-            revert_override: Some(revert),
-        };
-        write(store, &format!("{}/pending.json", base(photo)), &pending)?;
-        let mut writer = Writer { store, pending, sequence: 0 };
-        let root = replace_recent(&mut writer, h.record_root.clone(), h.record_count, ordinal, &value)?;
-        let mut manifest = h;
-        manifest.transaction_id = writer.pending.transaction_id.clone();
-        manifest.record_root = Some(root);
-        manifest.record_patch = Some(ordinal);
-        write(writer.store, &writer.pending.head.manifest, &manifest)?;
-        writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
-        write(writer.store, &format!("{}/pending.json", base(photo)), &writer.pending)?;
-        commit(writer.store, &writer.pending)?;
-        Ok(true)
     }
+    let Some(h) = header(store, photo)? else { return Ok(false) };
+    let mut found = None;
+    for ordinal in (h.record_count.saturating_sub(128)..h.record_count).rev() {
+        let entry = entry(store, photo, h.record_root.as_ref(), h.record_count, ordinal)?;
+        if entry.length > 32 * 1024 * 1024 {
+            return Err(error("receipt record requires streaming update"));
+        }
+        let bytes = range(store, photo, &entry, 0, entry.length)?;
+        if digest(&bytes) != entry.digest {
+            return Err(error("record digest mismatch"));
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(error)?;
+        if value["local_round_id"] == local_round_id
+            && value["submission_seq"] == submission_seq
+            && value["connection_generation"] == connection_generation
+            && value["runtime_library_generation"] == library_generation
+        {
+            found = Some((ordinal, value));
+            break;
+        }
+    }
+    let Some((ordinal, mut value)) = found else { return Ok(false) };
+    if let Some(plan) = plan {
+        let Some(stage) = value.get_mut("stages").and_then(Value::as_array_mut).and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan)) else {
+            return Ok(false);
+        };
+        let succeeded = stage["execution_outcome"] == "succeeded";
+        let confirmed = stage["delivery_state"] == "confirmed";
+        if confirmed && (!succeeded || value["backend_confirmed_plan"] == plan) {
+            return Ok(true);
+        }
+        let Some(stage) = value.get_mut("stages").and_then(Value::as_array_mut).and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan)) else {
+            return Ok(false);
+        };
+        stage["delivery_state"] = json!("confirmed");
+        if succeeded {
+            value["backend_confirmed_plan"] = json!(plan);
+        }
+    } else {
+        if value["input_delivery_state"] == "confirmed" {
+            return Ok(true);
+        }
+        value["input_delivery_state"] = json!("confirmed");
+    }
+    let old_head: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
+    let revert: Option<Value> = read(store, &format!("{}/revert.json", base(photo)), SMALL)?;
+    let revert = revert.filter(|r| r["transaction_id"] == h.transaction_id).unwrap_or_else(|| json!({"eligible":false}));
+    let tx = super::super::LocalRoundId::new().map_err(error)?.as_str().to_owned();
+    let pending = resumed.unwrap_or(PendingCommit {
+        photo,
+        transaction_id: tx.clone(),
+        expected_epoch: h.conversation_epoch,
+        old_head,
+        head: Head { manifest: format!("{}/manifest-{tx}.json", base(photo)), transaction_id: tx, manifest_digest: String::new() },
+        reserved_files: 0,
+        reuse: Some(h.clone()),
+        revert_override: Some(revert),
+        content_digest: None,
+        receipt: Some(receipt.clone()),
+    });
+    write(store, &format!("{}/pending.json", base(photo)), &pending)?;
+    let mut writer = Writer { store, pending, sequence: 0 };
+    let root = replace_recent(&mut writer, h.record_root.clone(), h.record_count, ordinal, &value)?;
+    let mut manifest = h;
+    manifest.transaction_id = writer.pending.transaction_id.clone();
+    manifest.record_root = Some(root);
+    manifest.record_patch = Some(ordinal);
+    write(writer.store, &writer.pending.head.manifest, &manifest)?;
+    writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
+    write(writer.store, &format!("{}/pending.json", base(photo)), &writer.pending)?;
+    commit(writer.store, &writer.pending)?;
+    finish_pending(writer.store, photo);
+    Ok(true)
 }
 
 impl Session {

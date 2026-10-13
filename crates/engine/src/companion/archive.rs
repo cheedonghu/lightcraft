@@ -23,6 +23,12 @@ pub(crate) struct Archive {
     pub(super) v2: bool,
     pub(super) tails: BTreeMap<PhotoId, super::storage::TailUpdate>,
     pub(super) prefixes: BTreeMap<PhotoId, super::storage::PhotoHeader>,
+    pub(super) cleanup_photos: BTreeSet<PhotoId>,
+    pub(super) cleanup_errors: BTreeMap<PhotoId, String>,
+    cleanup_at: Option<web_time::Instant>,
+    cleanup_after: Option<PhotoId>,
+    pub(super) receipts: BTreeMap<PhotoId, Vec<Value>>,
+    pub(super) readers: std::sync::Arc<super::storage::reader_pins::Pins>,
     pub(super) dirty_photos: BTreeSet<PhotoId>,
     pub(super) revert_dirty: BTreeSet<PhotoId>,
     dirty: bool,
@@ -35,6 +41,7 @@ pub(super) fn error(e: impl std::fmt::Display) -> EngineError {
 }
 impl Archive {
     pub(crate) fn load(store: &mut dyn Store, _dir: &Path, _on_disk: bool) -> Self {
+        let pins = super::storage::reader_pins::for_store(store);
         let mut read = || -> Result<Self> {
             let Some(bytes) = store.read_limited(STATE_FILE, MAX_ARCHIVE).map_err(error)? else { return Ok(Self::default()) };
             let root: Value = serde_json::from_slice(&bytes).map_err(error)?;
@@ -48,10 +55,13 @@ impl Archive {
             Ok(Self { photos: saved.photos, legacy: true, ..Default::default() })
         };
         match read() {
-            Ok(a) => a,
+            Ok(mut a) => {
+                a.readers = pins;
+                a
+            }
             Err(e) => {
                 log::error!("{e}");
-                Self { blocked: Some(e.to_string()), ..Default::default() }
+                Self { blocked: Some(e.to_string()), readers: pins, ..Default::default() }
             }
         }
     }
@@ -88,26 +98,87 @@ impl Archive {
         }
     }
     pub(crate) fn needs_retry(&self) -> bool {
-        (self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty())
-            && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t)
+        let data =
+            self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() || !self.receipts.is_empty();
+        (data && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t))
+            || (!data && !self.cleanup_photos.is_empty() && self.cleanup_at.is_none_or(|t| web_time::Instant::now() >= t))
+    }
+    fn cleanup_step(&mut self, store: &mut dyn Store) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let photo = self
+            .cleanup_after
+            .and_then(|p| self.cleanup_photos.range((Excluded(p), Unbounded)).next().copied())
+            .or_else(|| self.cleanup_photos.first().copied());
+        let Some(photo) = photo else { return };
+        self.cleanup_after = Some(photo);
+        if !self.tails.contains_key(&photo)
+            && !self.dirty_photos.contains(&photo)
+            && !self.receipts.contains_key(&photo)
+            && let Err(e) = super::storage::reconcile_visible_pending(store, photo)
+        {
+            self.cleanup_errors.insert(photo, e.to_string());
+            self.cleanup_at = web_time::Instant::now().checked_add(std::time::Duration::from_millis(250));
+            return;
+        }
+        let mut retained: Vec<_> =
+            self.prefixes.get(&photo).into_iter().cloned().chain(self.tails.get(&photo).and_then(|t| t.prefix.as_ref()).cloned()).collect();
+        let readers = self.readers.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = if self.readers.conservative && !readers.headers.is_empty() {
+            // Windows uses a shared native protection domain. Do not mix other
+            // libraries' headers into this photo's graph or report them unsaved.
+            Ok(super::storage::CleanupReport { pending: true, removed: 0 })
+        } else {
+            retained.extend(readers.headers.values().filter(|h| h.photo_id == photo).cloned());
+            super::storage::collect(store, photo, retained, 2)
+        };
+        match result {
+            Ok(report) => {
+                if !report.pending {
+                    self.cleanup_photos.remove(&photo);
+                }
+                self.cleanup_errors.remove(&photo);
+            }
+            Err(e) => {
+                self.cleanup_errors.insert(photo, e.to_string());
+            }
+        }
+        self.cleanup_at = web_time::Instant::now().checked_add(std::time::Duration::from_millis(250));
     }
     pub(crate) fn unsaved(&self) -> Option<&str> {
-        self.error.as_deref().filter(|_| self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty())
+        self.error.as_deref().filter(|_| {
+            self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() || !self.receipts.is_empty()
+        })
     }
     fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {
         if let Some(e) = &self.blocked {
-            if self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() {
+            if self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() || !self.receipts.is_empty() {
                 return Err(error(e));
             }
             return Ok(());
         }
         if self.v2 || !self.tails.is_empty() || !self.dirty_photos.is_empty() {
             let mut tail_failed = None;
+            for photo in self.receipts.keys().copied().collect::<Vec<_>>() {
+                let queued = self.receipts.get(&photo).cloned().unwrap_or_default();
+                let mut left = Vec::new();
+                for receipt in queued {
+                    if let Err(e) = super::storage::retry_receipt(library.files.as_mut(), photo, &receipt) {
+                        tail_failed = Some(e.to_string());
+                        left.push(receipt);
+                    }
+                }
+                if left.is_empty() {
+                    self.receipts.remove(&photo);
+                } else {
+                    self.receipts.insert(photo, left);
+                }
+            }
+            let mut finished = BTreeSet::new();
             for photo in self.tails.keys().copied().collect::<Vec<_>>() {
                 let Some(update) = self.tails.get(&photo) else { continue };
                 match super::storage::persist_tail(library.files.as_mut(), photo, update) {
                     Ok(()) => {
-                        self.tails.remove(&photo);
+                        finished.insert(photo);
                     }
                     Err(error) => {
                         tail_failed = Some(error.to_string());
@@ -132,7 +203,7 @@ impl Archive {
                         .and_then(|p| super::storage::commit(library.files.as_mut(), &p))
                     {
                         Ok(()) => {
-                            self.dirty_photos.remove(&photo);
+                            finished.insert(photo);
                         }
                         Err(e) => {
                             failed = Some(e.to_string());
@@ -151,9 +222,19 @@ impl Archive {
                     }
                 }
             }
+            if self.v2 {
+                for photo in finished {
+                    self.tails.remove(&photo);
+                    self.dirty_photos.remove(&photo);
+                    self.photos.remove(&photo);
+                    self.cleanup_photos.insert(photo);
+                    super::storage::finish_pending(library.files.as_mut(), photo);
+                }
+            }
             self.dirty = !self.tails.is_empty() || !self.dirty_photos.is_empty();
             self.error = failed.clone();
             self.retry_at = failed.as_ref().map(|_| web_time::Instant::now() + std::time::Duration::from_secs(2));
+            self.cleanup_step(library.files.as_mut());
             return failed.map_or(Ok(()), |e| Err(EngineError::NotSaved(e)));
         }
         if !self.dirty {

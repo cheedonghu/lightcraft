@@ -24,6 +24,8 @@ mod paging_tests;
 mod panel_tests;
 #[cfg(test)]
 mod persistence_tests;
+#[cfg(test)]
+mod recovery_tests;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,6 +112,7 @@ struct Conversation {
     view: Option<HistoryView>,
     dirty: bool,
     dirty_queued: bool,
+    storage_notice: bool,
     records: Vec<Value>,
     messages: Vec<Value>,
     rounds: Vec<Value>,
@@ -126,6 +129,7 @@ impl Default for Conversation {
             view: None,
             dirty: false,
             dirty_queued: false,
+            storage_notice: false,
             records: Vec::new(),
             messages: Vec::new(),
             rounds: Vec::new(),
@@ -389,6 +393,7 @@ impl State {
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
         conversation.records.push(json!({"local_round_id":identity.local_round_id,"photo_id":photo.0,"request_text":prompt,"submission_seq":identity.submission_seq,"connection_generation":identity.connection_generation,"runtime_library_generation":identity.scope.library_generation,"original":self.jobs.get(&photo).map(|j| &j.checkpoint.original),"stages":[],"phase":"submitting"}));
         conversation.messages.push(json!({"role":"user","text":prompt,"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request"}));
+        conversation.storage_notice = false;
         conversation.notice = tr("Submitting…").into();
         if let Err(error) = self.save(app, photo) {
             if reader.is_some() {
@@ -1024,6 +1029,10 @@ impl State {
         self.workers.retain(|_, alive| alive.load(Ordering::Relaxed));
         self.poll_pages(app);
         for (photo, c) in &mut self.conversations {
+            if c.storage_notice && !app.session.companion_photo_unsaved(*photo) && !self.pending_local_saves.contains(photo) {
+                c.notice = tr("AI history saved. Photo changes are kept.").into();
+                c.storage_notice = false;
+            }
             if c.schema_version == 2 && c.dirty && c.dirty_queued && !app.session.companion_tail_unsaved(*photo) {
                 c.dirty = false;
                 c.dirty_queued = false;
@@ -1283,6 +1292,9 @@ impl State {
         if !self.pending_local_saves.is_empty() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+        if app.session.companion_cleanup_pending() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         if !self.jobs.is_empty() || !self.workers.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -1305,7 +1317,12 @@ impl State {
         self.mark_failure(photo, error);
         let _ = self.stop(photo);
         if let Some(c) = self.conversations.get_mut(&photo) {
-            c.notice = format!("处理未完成：{error}。保留最近完整结果。");
+            c.storage_notice = app.session.companion_photo_unsaved(photo);
+            c.notice = if c.storage_notice {
+                tr("Photo changes are kept. AI history is not saved; saving will retry.").into()
+            } else {
+                format!("处理未完成：{error}。保留最近完整结果。")
+            };
         }
         let _ = self.save(app, photo);
     }
@@ -1519,6 +1536,9 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 "round": photo.and_then(|p| state.jobs.get(&p)).map(|j| j.round.clone()),
                 "text": conversation.map(display_text).unwrap_or_else(|| state.text.clone()),
                 "activePhotos": state.jobs.keys().map(|p| p.0).collect::<Vec<_>>(),
+                "saveState": photo.map(|p| if app.session.companion_photo_unsaved(p) || state.pending_local_saves.contains(&p) { "unsaved" } else { "saved" }),
+                "cleanupPending": photo.is_some_and(|p| app.session.companion_photo_cleanup_pending(p)),
+                "cleanupError": photo.and_then(|p| app.session.companion_cleanup_error(p)),
             }))
         }
         "ai.history" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {

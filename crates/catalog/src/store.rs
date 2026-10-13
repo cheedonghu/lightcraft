@@ -53,6 +53,12 @@ pub trait Store: Send {
     fn truncate(&mut self, name: &str, len: u64) -> io::Result<()>;
     /// Human-readable location (diagnostics).
     fn describe(&self) -> String;
+    /// Stable process-local identity for reader retention across close/reopen.
+    /// Native aliases must identify the same physical directory; wrappers forward
+    /// their adapter's identity. Unknown adapters cannot offer retained readers.
+    fn retention_namespace(&self) -> Option<String> {
+        None
+    }
     /// Another handle on the same files that a worker thread can write `catalog.snap` through
     /// while this one keeps appending to the log (background compaction). `None` (the default):
     /// snapshots are written synchronously.
@@ -235,6 +241,28 @@ impl Store for FsStore {
         self.dir.display().to_string()
     }
 
+    fn retention_namespace(&self) -> Option<String> {
+        let metadata = std::fs::metadata(&self.dir).ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(format!("native-directory:{}:{}", metadata.dev(), metadata.ino()))
+        }
+        #[cfg(windows)]
+        {
+            // Stable std file IDs are unavailable. Share a conservative process
+            // domain: physical reclamation waits until every native reader drops.
+            // This handles directory aliases without guessing path identity.
+            Some("native-windows-protected".into())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
+    }
     #[cfg(not(target_arch = "wasm32"))]
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         Some(Box::new(FsStore { dir: self.dir.clone(), appender: None }))
@@ -371,6 +399,9 @@ impl Store for MemStore {
     }
     fn describe(&self) -> String {
         "memory".into()
+    }
+    fn retention_namespace(&self) -> Option<String> {
+        Some(format!("memory-store:{:p}", Arc::as_ptr(&self.files)))
     }
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         self.background.then(|| Box::new(self.clone()) as Box<dyn Store>)
