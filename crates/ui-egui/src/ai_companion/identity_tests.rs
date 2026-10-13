@@ -31,7 +31,19 @@ fn state_event(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, phase
 
 fn publish_worker(state: &mut State, app: &mut LightcraftApp) {
     let message = state.rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    await_producer_retirement(state, &message);
     state.prepared(app, &egui::Context::default(), message).unwrap();
+}
+
+pub(super) fn await_producer_retirement(state: &State, message: &WorkerMessage) {
+    let identity = match message {
+        WorkerMessage::Prepared { identity, .. } | WorkerMessage::HistoryPrepared { identity, .. } => identity,
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while state.worker_busy(identity.scope.photo) {
+        assert!(Instant::now() < deadline, "producer never retired before fixture delivery");
+        std::thread::yield_now();
+    }
 }
 
 #[test]
