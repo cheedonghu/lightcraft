@@ -27,7 +27,12 @@ fn invalid_library_keeps_the_round_and_new_library_archives_it() {
     app.ai.jobs.insert(
         photo,
         Job {
-            seq: 1,
+            identity: RoundIdentity {
+                scope: PhotoScope { library_generation: generation, photo },
+                local_round_id: LocalRoundId::new().unwrap(),
+                submission_seq: 1,
+                connection_generation: 0,
+            },
             round: "round".into(),
             state: "awaiting_initial_execution".into(),
             prompt: "brighten".into(),
