@@ -2195,7 +2195,7 @@ pub(crate) fn filmstrip(app: &mut LightcraftApp, ui: &mut egui::Ui, r: Rect) {
                 if app.ui.settings.film_badges
                     && let Some(ph) = app.session.catalog.photo(*id)
                 {
-                    film_badges(p, &t, fr, ph);
+                    film_badges(ui, p, &t, fr, ph);
                 }
                 if let Some(st) = app.session.catalog.stack_of(*id) {
                     let text =
@@ -2230,7 +2230,7 @@ pub(crate) fn filmstrip(app: &mut LightcraftApp, ui: &mut egui::Ui, r: Rect) {
 }
 
 /// Rating, flag and edited badges along a filmstrip thumbnail's bottom edge (Settings → Interface).
-fn film_badges(p: &egui::Painter, t: &Tokens, fr: Rect, ph: &lightcraft_catalog::Photo) {
+fn film_badges(ui: &egui::Ui, p: &egui::Painter, t: &Tokens, fr: Rect, ph: &lightcraft_catalog::Photo) {
     use crate::icons::{Icon, paint};
     use lightcraft_catalog::Flag;
     let edited = ph.is_edited();
@@ -2251,7 +2251,10 @@ fn film_badges(p: &egui::Painter, t: &Tokens, fr: Rect, ph: &lightcraft_catalog:
         Flag::None => {}
     }
     if edited {
-        paint(p, Rect::from_min_size(pos2(bar.right() - 13.0, y - 5.0), vec2(10.0, 10.0)), Icon::Sliders, t.text_label);
+        let br = Rect::from_min_size(pos2(bar.right() - 13.0, y - 5.0), vec2(10.0, 10.0));
+        paint(p, br, Icon::Sliders, t.text_label);
+        register(ui.ctx(), format!("badge:modified:film:{}", ph.id.0), br);
+        ui.interact(br, egui::Id::new(("modified-film-badge", ph.id.0)), Sense::hover()).on_hover_text(crate::i18n::tr("Has Edits"));
     }
 }
 

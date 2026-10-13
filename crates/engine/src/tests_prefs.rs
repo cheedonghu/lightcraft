@@ -317,3 +317,51 @@ fn reopening_a_library_retires_the_old_cache_so_its_jobs_cannot_write_after_a_cl
     drop(s);
     let _ = std::fs::remove_dir_all(&lib);
 }
+
+#[test]
+fn modification_badges_follow_source_reset_copy_filters_and_history() {
+    let src = temp_dir("modified-state");
+    dng(&src, "raw.dng", "Nikon", "Z 9");
+    png(&src.join("plain.png"));
+    let mut s = Session::new().with_fs();
+    with_presets(&mut s);
+    s.execute("library.preferences", &json!({"import": {"rawPreset": "user.rawlook"}})).unwrap();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let raw = photo_named(&s, "raw.dng").id;
+    let plain = photo_named(&s, "plain.png").id;
+    for id in [raw, plain] {
+        s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+        s.execute("develop.set", &json!({"control": "wb.temp", "value": 5800.0})).unwrap();
+        assert!(s.catalog.photo(id).unwrap().is_edited(), "WB-only modification on {id:?}");
+        let copy = lightcraft_catalog::PhotoId(s.execute("photo.virtualCopy", &json!({})).unwrap()["ids"][0].as_u64().unwrap());
+        assert!(s.catalog.photo(copy).unwrap().is_edited(), "copy inherits the original baseline");
+        let query = s.execute("catalog.query", &json!({"filter": {"edited": true}})).unwrap();
+        assert!(query["photos"].as_array().unwrap().iter().any(|p| p["id"] == copy.0), "{query}");
+        let query = s.execute("catalog.query", &json!({"filter": {"text": "edited:yes"}})).unwrap();
+        assert!(query["photos"].as_array().unwrap().iter().any(|p| p["id"] == copy.0), "{query}");
+        let query = s.execute("catalog.query", &json!({"filter": {"ruleSet": {"rules": [{"field": "edited", "op": "is", "value": true}]}}})).unwrap();
+        assert!(query["photos"].as_array().unwrap().iter().any(|p| p["id"] == copy.0), "smart album rule: {query}");
+        s.execute("develop.reset", &json!({"ids": [copy.0]})).unwrap();
+        assert!(!s.catalog.photo(copy).unwrap().is_edited());
+        assert_eq!(s.catalog.photo(copy).unwrap().develop.light.exposure, if id == raw { 0.5 } else { 0.0 });
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(s.catalog.photo(copy).unwrap().is_edited());
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert!(!s.catalog.photo(copy).unwrap().is_edited());
+        assert!(s.catalog.photo(id).unwrap().is_edited(), "Reset of copy leaves original edited");
+        s.execute("develop.reset", &json!({"ids": [id.0]})).unwrap();
+        assert!(!s.catalog.photo(id).unwrap().is_edited());
+        s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+        s.execute("develop.merge", &json!({"settings": {"wb": {"mode": "custom", "temp": 5800.0, "tint": 3.0}}})).unwrap();
+        s.execute("develop.copy", &json!({"groups": ["whiteBalance"]})).unwrap();
+        s.execute("develop.paste", &json!({"ids": [copy.0], "groups": ["whiteBalance"]})).unwrap();
+        assert!(s.catalog.photo(copy).unwrap().is_edited(), "pasted WB recomputes modification state");
+        s.execute("develop.reset", &json!({"ids": [copy.0]})).unwrap();
+        s.execute("library.select", &json!({"ids": [id.0, copy.0]})).unwrap();
+        s.execute("develop.sync", &json!({"groups": ["whiteBalance"]})).unwrap();
+        assert!(s.catalog.photo(copy).unwrap().is_edited(), "synced WB recomputes modification state");
+        s.execute("develop.reset", &json!({"ids": [id.0, copy.0]})).unwrap();
+        assert!(!s.catalog.photo(id).unwrap().is_edited() && !s.catalog.photo(copy).unwrap().is_edited());
+    }
+    let _ = std::fs::remove_dir_all(&src);
+}
