@@ -621,3 +621,106 @@ fn narrow_tools_paints_complete_paging_labels_and_navigates_a_long_message() {
         assert!(text.find("OLD_MESSAGE_END").unwrap() < text.find("NEWER_MESSAGE").unwrap());
     }
 }
+
+#[test]
+fn compact_tools_history_is_visibly_readable_after_scrolling_and_older_newer_navigation() {
+    fn visible_literal(h: &crate::headless::Headless, literal: &str) -> bool {
+        let Some((_, viewport)) = h.app.widgets.iter().find(|(id, _)| id == "ai:messages") else { return false };
+        let tools = h.app.widgets.iter().find(|(id, _)| id == "panel:right_panel").unwrap().1;
+        if viewport.height() < 14.0 || !tools.contains_rect(*viewport) {
+            return false;
+        }
+        h.view.painted_shapes().iter().any(|shape| match shape {
+            egui::epaint::Shape::Text(text) if text.opacity_factor > 0.0 => {
+                text.galley.rows.iter().any(|row| row.text() == literal && viewport.contains_rect(row.rect().translate(text.pos.to_vec2())))
+            }
+            _ => false,
+        })
+    }
+    fn scroll_to_literal(h: &mut crate::headless::Headless, literal: &str) -> bool {
+        for _ in 0..60 {
+            if visible_literal(h, literal) {
+                return true;
+            }
+            let composer = h.app.widgets.iter().find(|(id, _)| id == "ai:composer").unwrap().1;
+            h.app.synthetic.push(egui::Event::PointerMoved(egui::pos2(composer.right() - 2.0, composer.center().y)));
+            h.app.synthetic.push(egui::Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -35.0),
+                modifiers: egui::Modifiers::NONE,
+            });
+            for _ in 0..5 {
+                h.step();
+            }
+        }
+        visible_literal(h, literal)
+    }
+    fn scroll_to_control(h: &mut crate::headless::Headless, id: &str) {
+        // Readable nested history now participates in wheel scrolling too;
+        // traverse both the message and outer compact content to its controls.
+        for _ in 0..60 {
+            if let Some((_, target)) = h.app.widgets.iter().find(|(key, _)| key == id)
+                && target.height() >= 12.0
+            {
+                let tools = h.app.widgets.iter().find(|(key, _)| key == "panel:right_panel").unwrap().1;
+                assert!(tools.contains_rect(*target));
+                return;
+            }
+            let composer = h.app.widgets.iter().find(|(key, _)| key == "ai:composer").unwrap().1;
+            h.app.synthetic.push(egui::Event::PointerMoved(egui::pos2(composer.right() - 2.0, composer.center().y)));
+            h.app.synthetic.push(egui::Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 35.0),
+                modifiers: egui::Modifiers::NONE,
+            });
+            for _ in 0..5 {
+                h.step();
+            }
+        }
+        panic!("{id} is not visibly reachable after scrolling compact history");
+    }
+    let mut failures = Vec::new();
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        for (stacked, height) in [(false, 120.0), (true, 120.0), (false, 240.0), (true, 240.0)] {
+            let mut app = app(Box::new(MemStore::new()));
+            app.ui.language = language;
+            let photo = app.session.active().unwrap();
+            let messages: Vec<_> = (0..260).map(|n| json!({"role":"assistant","text":format!("VISIBLE_HISTORY_{n}")})).collect();
+            app.session.save_companion_tail(photo, None, &messages, &[], &[], &json!({"schema_version":2})).unwrap();
+            let mut h = crate::headless::Headless::new(app, [1000.0, 680.0], 1.0);
+            super::panel_tests::short_tools(&mut h, stacked, height);
+            if !scroll_to_literal(&mut h, "VISIBLE_HISTORY_259") {
+                failures.push(format!("{} stacked={stacked} height={height}: newest text never visible", language.code()));
+                continue;
+            }
+            let timeout = Duration::from_secs(10);
+            scroll_to_control(&mut h, "button:aiHistoryOlder");
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryOlder"}), timeout)["ok"], true);
+            for _ in 0..3 {
+                h.step();
+            }
+            assert!(h.app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().starts_with("VISIBLE_HISTORY_196\n"));
+            if !scroll_to_literal(&mut h, "VISIBLE_HISTORY_227") {
+                failures.push(format!("{} stacked={stacked} height={height}: older text never visible", language.code()));
+                continue;
+            }
+            scroll_to_control(&mut h, "button:aiHistoryNewer");
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryNewer"}), timeout)["ok"], true);
+            for _ in 0..3 {
+                h.step();
+            }
+            assert!(h.app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().starts_with("VISIBLE_HISTORY_228\n"));
+            if !scroll_to_literal(&mut h, "VISIBLE_HISTORY_259") {
+                failures.push(format!("{} stacked={stacked} height={height}: newer text never visible", language.code()));
+                continue;
+            }
+            super::panel_tests::short_snapshot(
+                &mut h,
+                &format!("compact-readable-{}-{}-{}", language.code(), if stacked { "stack" } else { "float" }, height as usize),
+            );
+        }
+    }
+    assert!(failures.is_empty(), "Compact history is not readable: {failures:?}");
+}

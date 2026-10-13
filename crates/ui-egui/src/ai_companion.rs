@@ -1702,13 +1702,15 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
     let controls_top = ui.cursor().top();
     history_controls(app, ui, photo);
     let controls_height = (ui.cursor().top() - controls_top).max(0.0);
-    let height = (height - controls_height).min(ui.available_height()).max(0.0);
+    // The caller bounds this region: an allocated rect in the normal host,
+    // or scrollable content in the compact host whose remainder may be zero.
+    let height = (height - controls_height).max(0.0);
     let scroll = egui::ScrollArea::vertical()
         .id_salt(("ai-messages", photo.0))
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .max_height(height)
-        .min_scrolled_height(0.0)
+        .min_scrolled_height(height)
         .show(ui, |ui| {
             if let Some(conversation) = app.ai.conversations.get(&photo) {
                 ui.label(display_text(conversation));
