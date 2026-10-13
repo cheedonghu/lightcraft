@@ -161,9 +161,7 @@ fn fragment_row(ui: &mut egui::Ui, metadata: &Value, text: &str, fallback: &str,
 
 // Explicit saved kinds take precedence over legacy text markers.
 pub(super) fn execution_feedback(message: &Value) -> bool {
-    message["display_kind"] == "execution_feedback"
-        || (message.get("display_kind").is_none()
-            && (message["legacy_hidden_text"] == true || message["text"].as_str().is_some_and(|text| text.starts_with("Actual execution feedback:"))))
+    lightcraft_engine::companion::execution_feedback(message)
 }
 pub(super) fn user_text(message: &Value) -> &str {
     lightcraft_engine::companion::authored_message_text(message)

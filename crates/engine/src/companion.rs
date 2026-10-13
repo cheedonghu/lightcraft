@@ -410,3 +410,11 @@ pub fn authored_message_text(message: &serde_json::Value) -> &str {
         text
     }
 }
+
+/// Explicit kinds take precedence; legacy execution feedback was generated as a user message.
+pub fn execution_feedback(message: &serde_json::Value) -> bool {
+    message["display_kind"] == "execution_feedback"
+        || (message["role"] == "user"
+            && message.get("display_kind").is_none()
+            && (message["legacy_hidden_text"] == true || message["text"].as_str().is_some_and(|text| text.starts_with("Actual execution feedback:"))))
+}

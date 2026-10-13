@@ -961,19 +961,11 @@ pub(super) fn text_range(value: &Value, images: Option<&Value>) -> Result<Option
         offset = offset.checked_add(serialized_length(key)? as u64).and_then(|v| v.checked_add(1)).ok_or_else(|| error("text span overflow"))?;
         let field = if key == "images" { images.unwrap_or(field) } else { field };
         let length = serialized_length(field)? as u64;
-        if key == "text"
-            && let Some(text) = field.as_str()
-        {
+        if key == "text" && field.is_string() {
             let start = offset.checked_add(1).ok_or_else(|| error("text span overflow"))?;
             // Match the normal message view: execution feedback and appended
             // machine photo-state JSON remain local records, not prose in the panel.
-            let visible = if value["display_kind"] == "execution_feedback"
-                || (value.get("display_kind").is_none() && text.starts_with("Actual execution feedback:"))
-            {
-                ""
-            } else {
-                crate::companion::authored_message_text(value)
-            };
+            let visible = if crate::companion::execution_feedback(value) { "" } else { crate::companion::authored_message_text(value) };
             let visible_length = serialized_length(visible)? as u64;
             let end = start.checked_add(visible_length.saturating_sub(2)).ok_or_else(|| error("text span overflow"))?;
             return Ok(Some([start, end]));
@@ -1118,6 +1110,8 @@ fn string_end(bytes: &[u8]) -> Option<usize> {
 fn mark_old_hidden_text(value: &mut Value, entry: &Entry) {
     if entry.text_range_version != Some(1)
         && entry.text_range.is_some_and(|[start, end]| start == end)
+        && value["role"] == "user"
+        && value.get("display_kind").is_none()
         && let Some(object) = value.as_object_mut()
     {
         object.insert("legacy_hidden_text".into(), Value::Bool(true));

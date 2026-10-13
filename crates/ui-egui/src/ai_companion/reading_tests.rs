@@ -770,7 +770,8 @@ fn old_v2_empty_and_cropped_hints_reopen_without_losing_typed_text_or_exposing_f
         }
     }
     for native in [false, true] {
-        for case in ["empty-request", "empty-assistant", "cropped-assistant", "legacy-feedback"] {
+        for case in ["empty-request", "empty-assistant", "cropped-assistant", "legacy-feedback", "empty-legacy-assistant", "cropped-legacy-assistant"]
+        {
             let seed = std::env::temp_dir().join(format!("lightcraft-21-old-seed-{}", LocalRoundId::new().unwrap().as_str()));
             let dir = std::env::temp_dir().join(format!("lightcraft-21-old-read-{}", LocalRoundId::new().unwrap().as_str()));
             let mut session = lightcraft_engine::Session::new();
@@ -791,12 +792,16 @@ fn old_v2_empty_and_cropped_hints_reopen_without_losing_typed_text_or_exposing_f
             } else {
                 format!(
                     "{}\nActual photo state: {{\"exposure\":0}}\nOLD_AUTHORED_AFTER_MARKER\n{}OLD_AUTHORED_FINAL",
-                    if case == "cropped-assistant" { "A saved typed answer" } else { "Actual execution feedback: this is quoted by the user." },
+                    if matches!(case, "cropped-assistant" | "cropped-legacy-assistant") {
+                        "A saved typed answer"
+                    } else {
+                        "Actual execution feedback: this is quoted by the user."
+                    },
                     "An authored old sentence α🙂.\n".repeat(18000)
                 )
             };
             let mut message = json!({"role":if case=="empty-request"||case=="legacy-feedback"{"user"}else{"assistant"},"local_message_id":"old-hint-message","text":text});
-            if case != "legacy-feedback" {
+            if !matches!(case, "legacy-feedback" | "empty-legacy-assistant" | "cropped-legacy-assistant") {
                 message["display_kind"] = json!(if case == "empty-request" { "request" } else { "assistant" });
             }
             let messages = vec![message];
@@ -812,7 +817,7 @@ fn old_v2_empty_and_cropped_hints_reopen_without_losing_typed_text_or_exposing_f
             let original_block = files.read(&block).unwrap().unwrap();
             entry.as_object_mut().unwrap().remove("text_range_version");
             let start = entry["text_range"][0].as_u64().unwrap();
-            entry["text_range"][1] = json!(start + if case == "cropped-assistant" { 20 } else { 0 }); // old ASCII prefix length, independently specified
+            entry["text_range"][1] = json!(start + if matches!(case, "cropped-assistant" | "cropped-legacy-assistant") { 20 } else { 0 }); // old ASCII prefix length, independently specified
             let bytes = serde_json::to_vec(&index).unwrap();
             files.write_atomic(&key, &bytes).unwrap();
             let head_key = format!("companion/v2/photos/{}/HEAD.json", photo.0);
@@ -879,6 +884,71 @@ fn old_v2_empty_and_cropped_hints_reopen_without_losing_typed_text_or_exposing_f
             drop(h);
             std::fs::remove_dir_all(seed).unwrap();
             std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn known_assistant_without_display_kind_remains_prose_for_small_and_giant_messages() {
+    for native in [false, true] {
+        for giant in [false, true] {
+            let dir = std::env::temp_dir().join(format!("lightcraft-21-assistant-{}", LocalRoundId::new().unwrap().as_str()));
+            let mut session = lightcraft_engine::Session::new();
+            let files: Box<dyn lightcraft_catalog::Store> = if native {
+                Box::new(lightcraft_catalog::FsStore::open(&dir).unwrap())
+            } else {
+                Box::new(ObservedFiles {
+                    files: Box::new(MemStore::new()),
+                    reads: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                    owned: false,
+                    gate: None,
+                })
+            };
+            session.open_library_in(LibraryStores { catalog: Box::new(MemStore::new()), files, dir: dir.clone(), on_disk: false }, true).unwrap();
+            let photo = session.active().unwrap();
+            let text = format!(
+                "Actual execution feedback: this is quoted by the user.\nActual photo state: {{\"exposure\":0}}\nKNOWN_ASSISTANT_FIRST\n{}KNOWN_ASSISTANT_FINAL",
+                "Keep this assistant sentence α🙂.\n".repeat(if giant { 18000 } else { 1 })
+            );
+            let messages = vec![json!({"role":"assistant","local_message_id":"known-assistant","text":text})];
+            session.save_companion_tail(photo, None, &messages, &[], &[], &json!({"schema_version":2})).unwrap();
+            let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1400.0, 1000.0], 1.0);
+            h.app.run("ai.open", json!({})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                h.step();
+                if h.app.run("ai.status", json!({})).unwrap()["historyLoading"] == false {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let status = h.app.run("ai.status", json!({})).unwrap();
+            for literal in ["Actual execution feedback: this is quoted by the user.", "{\"exposure\":0}", "KNOWN_ASSISTANT_FIRST"] {
+                assert!(status["text"].as_str().unwrap().contains(literal), "{native}/{giant} lost known assistant {literal}: {status}");
+            }
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !h.painted_text().join("\n").contains("KNOWN_ASSISTANT_FIRST") {
+                h.step();
+                assert!(Instant::now() < deadline, "known assistant first literal must paint after page delivery");
+                std::thread::yield_now();
+            }
+            assert!(!h.painted_text().iter().any(|text| text == "Execution feedback"));
+            h.app.run("ai.bottom", json!({})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                h.step();
+                if h.painted_text().iter().any(|text| text.contains("KNOWN_ASSISTANT_FINAL")) {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert_eq!(h.app.session.companion_messages_page(photo, 0, 1).unwrap().records, messages);
+            drop(h);
+            if native {
+                std::fs::remove_dir_all(dir).unwrap();
+            }
         }
     }
 }
