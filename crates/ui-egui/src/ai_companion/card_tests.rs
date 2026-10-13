@@ -15,7 +15,7 @@ fn headless(records: Vec<Value>) -> (Headless, lightcraft_catalog::PhotoId) {
     session
         .save_companion_conversation(
             photo,
-            json!({"schema_version":2,"messages":[{"role":"assistant","text":"A natural result."}],"round_records":records,"rounds":[]}),
+            json!({"schema_version":2,"messages":records.iter().map(|r|json!({"role":"assistant","text":"A natural result.","local_round_id":r["local_round_id"]})).collect::<Vec<_>>(),"round_records":records,"rounds":[]}),
         )
         .unwrap();
     session.persist().unwrap();
@@ -68,6 +68,7 @@ fn result_card_distinguishes_failed_target_from_retained_and_unconfirmed_actual_
     let result = h.app.run("ai.status", json!({})).unwrap();
     let c = &result["resultCards"][0]["stages"][1];
     assert_eq!(c["status"], "not_applied");
+    assert_eq!(result["resultCards"][0]["retainedResult"], "The initial complete result was retained.");
     assert_eq!(c["changes"][0]["target"], "+0.20");
     assert_eq!(c["changes"][0]["actual"], "+0.35");
     let c = &result["resultCards"][1]["stages"][1];
@@ -117,7 +118,7 @@ fn actual_wb(relative: bool) {
         let (loader, probe) = lightcraft_engine::files::fs_hooks();
         session.media.file_loader = Some(loader);
         session.media.file_probe = Some(probe);
-        lightcraft_engine::import::import(&mut session, &[path.clone()], lightcraft_engine::import::ImportMode::Add).unwrap();
+        lightcraft_engine::import::import(&mut session, std::slice::from_ref(&path), lightcraft_engine::import::ImportMode::Add).unwrap();
         let id = session.catalog.photos().find(|p| p.source == lightcraft_catalog::Source::File { path: path.clone() }).unwrap().id;
         session.execute("library.select", &json!({"ids":[id.0],"active":id.0})).unwrap();
         Some(path)
@@ -242,4 +243,259 @@ fn card_parameter_control_shows_readable_absolute_values_in_both_languages() {
         assert!(texts.iter().any(|text| text == "0.00 → +0.35"));
         assert!(texts.iter().any(|text| text == "+0.35 → +0.20"));
     }
+}
+#[test]
+fn published_mask_result_displays_its_local_parameter_and_name() {
+    let mut s = stage("initial", 0.0, 0.0);
+    let mut before: lightcraft_develop::DevelopSettings = serde_json::from_value(s["before_state"].clone()).unwrap();
+    before.masks.push(lightcraft_develop::Mask { id: 12, name: "Foreground".into(), ..Default::default() });
+    let mut after = before.clone();
+    after.masks[0].adjust.exposure = 0.5;
+    s["before_state"] = json!(before);
+    s["proposed_state"] = json!(after);
+    s["applied_state"] = json!(after);
+    let (mut h, _) = headless(vec![json!({"local_round_id":"mask-card","stages":[s]})]);
+    let status = h.app.run("ai.status", json!({})).unwrap();
+    let rows = status["resultCards"][0]["stages"][0]["changes"].as_array().unwrap();
+    assert!(rows.iter().any(|v| v["control"] == "mask.12.exposure"
+        && v["context"] == "Foreground"
+        && v["before"] == "0.00"
+        && v["actual"] == "+0.50"
+        && v["unit"] == "EV"));
+}
+#[test]
+fn cold_background_page_reads_old_card_from_large_round_record() {
+    let mut files = MemStore::new();
+    files.background = true;
+    let mut session = Session::new();
+    session
+        .open_library_in(LibraryStores { catalog: Box::new(MemStore::new()), files: Box::new(files), dir: "memory".into(), on_disk: false }, true)
+        .unwrap();
+    let photo = session.active().unwrap();
+    let display = |value: &str| json!({"values":[{"control":"light.exposure","label":"Exposure","value":value,"unit":"EV"}]});
+    let mut first = stage("initial", 0.0, 0.35);
+    first["display_before"] = display("0.00");
+    first["display_target"] = display("+0.35");
+    first["display_actual"] = display("+0.35");
+    let mut records =
+        vec![json!({"local_round_id":"old-large-card","request_text":"A".repeat(6*1024*1024),"stages":[first],"local_terminal":"completed"})];
+    let mut messages = vec![json!({"role":"assistant","text":format!("OLD_ROUND_VISIBLE{}","A".repeat(270_000)),"local_round_id":"old-large-card"})];
+    for i in 1..200 {
+        let id = format!("later-{i}");
+        records.push(json!({"local_round_id":id,"stages":[],"local_terminal":"completed"}));
+        messages.push(json!({"role":"assistant","text":format!("Later {i}"),"local_round_id":id}));
+    }
+    session.save_companion_conversation(photo, json!({"schema_version":2,"messages":messages,"round_records":records,"rounds":[]})).unwrap();
+    session.persist().unwrap();
+    let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1400.0, 1000.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    h.app.run("ai.history", json!({"record":0})).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        h.step();
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["historyLoading"] == false && status["text"].as_str().unwrap().contains("OLD_ROUND_VISIBLE") {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "{status}");
+        std::thread::yield_now();
+    };
+    assert_eq!(status["resultCards"][0]["localRoundId"], "old-large-card");
+    assert_eq!(status["resultCards"][0]["stages"][0]["changes"][0]["actual"], "+0.35");
+    for _ in 0..4 {
+        h.step();
+    }
+    let viewport = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").unwrap().1;
+    for _ in 0..5 {
+        h.app.synthetic.push(egui::Event::PointerMoved(viewport.center()));
+        h.app.synthetic.push(egui::Event::MouseWheel {
+            phase: egui::TouchPhase::Move,
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -100_000.0),
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    }
+    assert!(h.painted_text().iter().any(|text| text == "Round result"));
+}
+#[test]
+fn published_non_slider_plan_exposes_its_actual_structural_parameters() {
+    let mut s = stage("initial", 0.0, 0.0);
+    let mut after: lightcraft_develop::DevelopSettings = serde_json::from_value(s["applied_state"].clone()).unwrap();
+    after.treatment = lightcraft_develop::Treatment::Bw;
+    after.curve.master = vec![lightcraft_geom::Point::new(0.0, 0.0), lightcraft_geom::Point::new(0.5, 0.6), lightcraft_geom::Point::new(1.0, 1.0)];
+    after.point_colors.push(lightcraft_develop::PointColor::default());
+    after.masks.push(lightcraft_develop::Mask {
+        id: 12,
+        name: "Sky".into(),
+        components: vec![lightcraft_develop::MaskComponent {
+            name: None,
+            op: Default::default(),
+            invert: false,
+            shape: lightcraft_develop::MaskShape::Linear { start: lightcraft_geom::Point::new(0.1, 0.2), end: lightcraft_geom::Point::new(0.8, 0.9) },
+        }],
+        ..Default::default()
+    });
+    s["proposed_state"] = json!(after);
+    s["applied_state"] = json!(after);
+    let (mut h, _) = headless(vec![json!({"local_round_id":"structure-card","stages":[s]})]);
+    let status = h.app.run("ai.status", json!({})).unwrap();
+    let rows = status["resultCards"][0]["stages"][0]["changes"].as_array().unwrap();
+    for (id, expected) in [
+        ("treatment", "B&W"),
+        ("curve.master", "(0.0, 0.0), (50.0, 60.0), (100.0, 100.0)"),
+        ("pointColor.count", "1"),
+        ("mask.count", "1"),
+        ("mask.12.component.0.start", "(10.0, 20.0)"),
+    ] {
+        assert!(rows.iter().any(|v| v["control"] == id && v["actual"] == expected), "missing actual {id}: {rows:?}");
+    }
+}
+#[test]
+fn result_cards_are_readable_and_clipped_in_normal_narrow_and_short_tools() {
+    use std::time::Duration;
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        for layout in ["normal", "narrow", "float120", "float240", "stack120", "stack240"] {
+            let mut correction = stage("correction", 0.35, 0.2);
+            correction["delivery_state"] = json!("not_sent");
+            let (mut h, _) =
+                headless(vec![json!({"local_round_id":"layout-card","stages":[stage("initial",0.0,0.35),correction],"local_terminal":"failed"})]);
+            h.app.ui.language = language;
+            let t = Duration::from_secs(10);
+            let size = if layout == "normal" {
+                [1400, 1000]
+            } else if layout == "narrow" {
+                [620, 520]
+            } else {
+                [1000, 680]
+            };
+            assert_eq!(h.request("ui.resize", json!({"width":size[0],"height":size[1]}), t)["ok"], true);
+            for _ in 0..4 {
+                h.step();
+            }
+            if layout.starts_with("float") || layout.starts_with("stack") {
+                super::panel_tests::short_tools(&mut h, layout.starts_with("stack"), if layout.ends_with("120") { 120.0 } else { 240.0 });
+            }
+            let zoom = h.app.ui.zoom;
+            let id = "button:aiParameters:layout-card";
+            for _ in 0..80 {
+                if h.app.widgets.iter().any(|(name, rect)| name == id && rect.height() >= 12.0) {
+                    break;
+                }
+                let viewport = h.app.widgets.iter().find(|(id, _)| id == "ai:composer").unwrap().1;
+                h.app.synthetic.push(egui::Event::PointerMoved(egui::pos2(viewport.right() - 2.0, viewport.center().y)));
+                h.app.synthetic.push(egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -35.0),
+                    modifiers: egui::Modifiers::NONE,
+                });
+                for _ in 0..4 {
+                    h.step();
+                }
+            }
+            assert_eq!(h.request("ui.clickWidget", json!({"id":id}), t)["ok"], true, "{layout}");
+            for _ in 0..4 {
+                h.step();
+            }
+            let tools = h.app.widgets.iter().find(|(id, _)| id == "panel:right_panel").unwrap().1;
+            for (id, rect) in &h.app.widgets {
+                if id.starts_with("ai:card:")
+                    || id.starts_with("ai:stage:")
+                    || id.starts_with("button:aiParameters:")
+                    || id.starts_with("button:aiHistory:")
+                {
+                    assert!(tools.contains_rect(*rect), "{layout}: {id} {rect:?}");
+                }
+            }
+            for literal in ["0.00 → +0.35", "+0.35 → +0.20"] {
+                let mut visible = false;
+                for index in 0..160 {
+                    let viewport = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").map(|(_, r)| *r);
+                    visible=viewport.is_some_and(|v|h.view.painted_shapes().iter().any(|shape|matches!(shape,egui::epaint::Shape::Text(t) if t.opacity_factor>0.0 && t.galley.rows.iter().any(|row|row.text()==literal && v.contains_rect(row.rect().translate(t.pos.to_vec2()))))));
+                    if visible {
+                        break;
+                    }
+                    let target = viewport.filter(|r| r.height() >= 18.0).map(|r| r.center()).unwrap_or_else(|| {
+                        let r = h.app.widgets.iter().find(|(id, _)| id == "ai:composer").unwrap().1;
+                        egui::pos2(r.right() - 2.0, r.center().y)
+                    });
+                    h.app.synthetic.push(egui::Event::PointerMoved(target));
+                    h.app.synthetic.push(egui::Event::MouseWheel {
+                        phase: egui::TouchPhase::Move,
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, if index == 0 { 10000.0 } else { -12.0 }),
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    for _ in 0..3 {
+                        h.step();
+                    }
+                }
+                assert!(visible, "{layout}/{}: actual parameter literal {literal} is not visibly readable", language.code());
+            }
+            assert_eq!(h.app.ui.zoom, zoom, "card clicks must not hit the canvas");
+            if let Ok(dir) = std::env::var("UX16_SCREENSHOT_DIR") {
+                h.app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+                h.app.services.png = Some(Box::new(|image| {
+                    lightcraft_engine::export::encode_image(
+                        image,
+                        &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+                    )
+                    .unwrap()
+                }));
+                assert_eq!(
+                    h.request(
+                        "ui.screenshot",
+                        json!({"path":format!("{dir}/card-{layout}-{}.png",language.code()),"headless":true}),
+                        Duration::from_secs(30)
+                    )["ok"],
+                    true
+                );
+            }
+        }
+    }
+}
+#[test]
+fn moving_a_brush_stroke_shows_its_actual_points_even_when_count_is_unchanged() {
+    let mut s = stage("initial", 0.0, 0.0);
+    let mut before: lightcraft_develop::DevelopSettings = serde_json::from_value(s["before_state"].clone()).unwrap();
+    let brush = |x| lightcraft_develop::MaskComponent {
+        name: None,
+        op: Default::default(),
+        invert: false,
+        shape: lightcraft_develop::MaskShape::Brush {
+            strokes: vec![lightcraft_develop::BrushStroke { points: vec![lightcraft_geom::Point::new(x, 0.2)], ..Default::default() }],
+        },
+    };
+    before.masks.push(lightcraft_develop::Mask { id: 7, name: "Background".into(), components: vec![brush(0.1)], ..Default::default() });
+    let mut after = before.clone();
+    after.masks[0].components = vec![brush(0.3)];
+    s["before_state"] = json!(before);
+    s["proposed_state"] = json!(after);
+    s["applied_state"] = json!(after);
+    let (mut h, _) = headless(vec![json!({"local_round_id":"brush-card","stages":[s]})]);
+    let result = h.app.run("ai.status", json!({})).unwrap();
+    let changes = result["resultCards"][0]["stages"][0]["changes"].as_array().unwrap();
+    assert!(
+        changes
+            .iter()
+            .any(|v| v["control"] == "mask.7.component.0.stroke.0.points" && v["before"] == "(10.0, 20.0)" && v["actual"] == "(30.0, 20.0)")
+    );
+}
+#[test]
+fn fallback_fragment_card_lookup_keeps_its_owner_across_bounded_scan_frames() {
+    let records:Vec<_>=(0..100).map(|i|json!({"local_round_id":format!("fallback-{i}"),"stages":if i==90 {vec![stage("initial",0.0,0.35)]} else {Vec::new()},"local_terminal":"completed"})).collect();
+    let (mut h, photo) = headless(records);
+    // Replace the page's text through the same caller-used persisted conversation interface.
+    let records = h.app.session.load_companion_conversation(photo).unwrap().unwrap()["round_records"].clone();
+    h.app.session.save_companion_conversation(photo,json!({"schema_version":2,"messages":[{"role":"assistant","text":format!("OWNER_FRAGMENT{}","A".repeat(270_000)),"local_round_id":"fallback-90"}],"round_records":records,"rounds":[]})).unwrap();
+    let session = std::mem::take(&mut h.app.session);
+    let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1400.0, 1000.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    h.app.run("ai.history", json!({"record":0})).unwrap();
+    for _ in 0..8 {
+        h.step();
+    }
+    let status = h.app.run("ai.status", json!({})).unwrap();
+    assert_eq!(status["resultCards"][0]["localRoundId"], "fallback-90");
 }

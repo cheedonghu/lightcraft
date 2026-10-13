@@ -256,5 +256,6 @@
   "{}× slower than {}": "速度是 {1} 的 1/{0}",
   "Shows the model's terms, then downloads {} from {host} and installs it{}. Nothing else is sent.": "显示模型使用条款，然后从 {host} 下载 {} 并安装模型{}。不会发送其他数据。",
   "{faces} faces learned.": "已学习 {faces} 张人脸。",
-  "{before} → {after}": "{before} → {after}"
+  "{before} → {after}": "{before} → {after}",
+  "Point Color {n}": "点颜色 {n}"
 }

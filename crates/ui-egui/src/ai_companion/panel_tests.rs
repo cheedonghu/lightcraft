@@ -272,7 +272,7 @@ fn multiline_draft_scrolls_inside_a_fixed_composer_without_sizing_consuming_inpu
     }
 }
 
-fn short_tools(h: &mut Headless, stacked: bool, height: f32) {
+pub(super) fn short_tools(h: &mut Headless, stacked: bool, height: f32) {
     if stacked {
         frames(h);
         // Stack heights are relative weights. Keep the companion body at the
@@ -306,7 +306,7 @@ fn short_tools(h: &mut Headless, stacked: bool, height: f32) {
     assert!(rect(h, "panel:right_panel").height() <= height + 1.0, "the supported Tools pane actually stays short");
 }
 
-fn reachable(h: &mut Headless, id: &str, direction: f32) -> egui::Rect {
+pub(super) fn reachable(h: &mut Headless, id: &str, direction: f32) -> egui::Rect {
     for _ in 0..30 {
         if let Some((_, target)) = h.app.widgets.iter().find(|(key, _)| key == id)
             && target.height() >= 12.0
@@ -406,7 +406,7 @@ fn supported_short_tools_allow_idle_draft_clear_and_start_through_visible_widget
     }
 }
 
-fn short_snapshot(h: &mut Headless, name: &str) {
+pub(super) fn short_snapshot(h: &mut Headless, name: &str) {
     if let Ok(dir) = std::env::var("UX06_SCREENSHOT_DIR") {
         h.app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
         h.app.services.png = Some(Box::new(|image| {
