@@ -901,9 +901,15 @@ impl Session {
             {
                 return Err(error("runtime prefix retention capacity exceeded"));
             }
+            let replaced = self.companion_archive.prefixes.get(&photo).is_some_and(|old| old != &header);
             self.companion_archive.prefixes.insert(photo, header);
-        } else {
-            self.companion_archive.prefixes.remove(&photo);
+            if replaced {
+                self.companion_archive.readers.release_photo(photo);
+                self.companion_archive.schedule_cleanup(photo);
+            }
+        } else if self.companion_archive.prefixes.remove(&photo).is_some() {
+            self.companion_archive.readers.release_photo(photo);
+            self.companion_archive.schedule_cleanup(photo);
         }
         Ok(())
     }

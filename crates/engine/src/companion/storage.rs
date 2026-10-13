@@ -633,9 +633,13 @@ impl Session {
     /// A bounded cleanup timer needs future frames even after the last AI job ends.
     pub fn companion_cleanup_pending(&self) -> bool {
         !self.companion_archive.cleanup_photos.is_empty()
+            || !self.companion_archive.cleanup_waiting.is_empty()
+            || self.companion_archive.readers.has_releases()
     }
     pub fn companion_photo_cleanup_pending(&self, photo: PhotoId) -> bool {
         self.companion_archive.cleanup_photos.contains(&photo)
+            || self.companion_archive.cleanup_waiting.contains(&photo)
+            || self.companion_archive.readers.photo_released(photo)
     }
     pub fn companion_cleanup_error(&self, photo: PhotoId) -> Option<&str> {
         self.companion_archive.cleanup_errors.get(&photo).map(String::as_str)

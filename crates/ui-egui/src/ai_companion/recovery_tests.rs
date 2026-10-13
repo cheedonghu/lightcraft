@@ -202,3 +202,55 @@ fn public_poll_schedules_cleanup_after_the_last_ai_job_has_ended() {
     assert!(delay <= Duration::from_secs(1), "cleanup needs a future frame even without an AI job; delay={delay:?}");
     assert_eq!(app.run("ai.status", json!({})).unwrap()["busy"], false);
 }
+
+#[test]
+fn public_poll_keeps_dormant_retirement_frames_and_stops_after_actual_release_collection() {
+    let mut session = lightcraft_engine::Session::new();
+    session
+        .open_library_in(
+            LibraryStores {
+                catalog: Box::new(MemStore::new()),
+                files: Box::new(MemStore::new()),
+                dir: "UX09-dormant-retirement".into(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let photo = session.active().unwrap();
+    session.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"retained dormant graph"}],"rounds":[]})).unwrap();
+    let old = session.companion_photo_header(photo).unwrap().unwrap();
+    let guard = session.retain_companion_history(&old).unwrap();
+    session.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"current dormant graph"}],"rounds":[]})).unwrap();
+    for _ in 0..200 {
+        session.persist().unwrap();
+    }
+    assert_eq!(session.companion_messages_bounded(&old, 0, 1, 1024).unwrap().records[0]["text"], "retained dormant graph");
+    let mut app = LightcraftApp::new(session, crate::Services::default());
+    let ctx = egui::Context::default();
+    for tick in 0..6 {
+        let mut output = ctx.run_ui(egui::RawInput { time: Some(tick as f64), ..Default::default() }, |ui| super::poll(&mut app, ui.ctx()));
+        assert!(
+            output.viewport_output.values().any(|v| v.repaint_delay <= Duration::from_millis(250)),
+            "a dormant old graph needs future frames until actual retirement"
+        );
+        output.textures_delta.clear();
+    }
+    assert!(app.session.companion_cleanup_pending());
+    drop(guard);
+    for _ in 0..200 {
+        app.session.persist().unwrap();
+    }
+    assert!(!app.session.companion_cleanup_pending());
+    assert!(app.session.companion_messages_bounded(&old, 0, 1, 1024).is_err());
+    for tick in 6..12 {
+        let mut output = ctx.run_ui(egui::RawInput { time: Some(tick as f64), ..Default::default() }, |ui| super::poll(&mut app, ui.ctx()));
+        if tick == 11 {
+            assert!(
+                output.viewport_output.values().all(|v| v.repaint_delay == Duration::MAX),
+                "consumed release with no remaining retention must stop polling"
+            );
+        }
+        output.textures_delta.clear();
+    }
+}

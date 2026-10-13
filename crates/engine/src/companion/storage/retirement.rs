@@ -28,6 +28,7 @@ fn write_gc<T: Serialize>(store: &mut dyn Store, key: &str, value: &T) -> Result
 pub struct CleanupReport {
     pub pending: bool,
     pub removed: usize,
+    pub(crate) protected: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct OwnerRoot {
@@ -342,6 +343,7 @@ pub(crate) fn collect(store: &mut dyn Store, photo: PhotoId, mut retained: Vec<P
         return Err(error("cleanup requires a known activated archive"));
     }
     let current = header(store, photo)?;
+    let protected = retained.iter().any(|h| current.as_ref().is_none_or(|head| head.transaction_id != h.transaction_id));
     let pending: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
     if let Some(p) = pending.as_ref() {
         let visible = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
@@ -349,7 +351,7 @@ pub(crate) fn collect(store: &mut dyn Store, photo: PhotoId, mut retained: Vec<P
         // Before the staged manifest is finalized, arbitrary caller-owned preview
         // references may not yet have a graph. Protect all ownership until retry.
         if p.head.manifest_digest.is_empty() {
-            return Ok(CleanupReport { pending: true, removed: 0 });
+            return Ok(CleanupReport { pending: true, removed: 0, protected });
         }
         for head in p.old_head.iter().chain(std::iter::once(&p.head)) {
             let root = Root { transaction: head.transaction_id.clone(), digest: head.manifest_digest.clone() };
@@ -403,7 +405,7 @@ pub(crate) fn collect(store: &mut dyn Store, photo: PhotoId, mut retained: Vec<P
             done: false,
         }
     };
-    let mut report = CleanupReport::default();
+    let mut report = CleanupReport { protected, ..Default::default() };
     for _ in 0..budget {
         if work.done {
             break;
@@ -430,7 +432,7 @@ impl Session {
         let pins = self.companion_archive.readers.clone();
         let readers = pins.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if pins.conservative && !readers.headers.is_empty() {
-            return Ok(CleanupReport { pending: true, removed: 0 });
+            return Ok(CleanupReport { pending: true, removed: 0, protected: false });
         }
         retained.extend(readers.headers.values().filter(|h| h.photo_id == photo).cloned());
         // Capture/drop and deletion share this bounded namespace critical section.

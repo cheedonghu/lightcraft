@@ -25,6 +25,7 @@ pub(crate) struct Archive {
     pub(super) tails: BTreeMap<PhotoId, super::storage::TailUpdate>,
     pub(super) prefixes: BTreeMap<PhotoId, super::storage::PhotoHeader>,
     pub(super) cleanup_photos: BTreeSet<PhotoId>,
+    pub(super) cleanup_waiting: BTreeSet<PhotoId>,
     pub(super) cleanup_errors: BTreeMap<PhotoId, String>,
     pub(super) cleanup_published: BTreeMap<PhotoId, String>,
     cleanup_at: Option<web_time::Instant>,
@@ -107,9 +108,19 @@ impl Archive {
             || !self.receipts.is_empty()
             || self.editors.dirty();
         (data && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t))
-            || (!data && !self.cleanup_photos.is_empty() && self.cleanup_at.is_none_or(|t| web_time::Instant::now() >= t))
+            || (!data
+                && (!self.cleanup_photos.is_empty() || self.readers.has_releases())
+                && self.cleanup_at.is_none_or(|t| web_time::Instant::now() >= t))
+    }
+    pub(super) fn schedule_cleanup(&mut self, photo: PhotoId) {
+        self.cleanup_photos.insert(photo);
+        self.cleanup_waiting.remove(&photo);
+        self.cleanup_at = None;
     }
     fn cleanup_step(&mut self, store: &mut dyn Store) {
+        if let Some(photo) = self.readers.take_release() {
+            self.schedule_cleanup(photo);
+        }
         use std::ops::Bound::{Excluded, Unbounded};
         let photo = self
             .cleanup_after
@@ -133,7 +144,7 @@ impl Archive {
         let result = if self.readers.conservative && !readers.headers.is_empty() {
             // Windows uses a shared native protection domain. Do not mix other
             // libraries' headers into this photo's graph or report them unsaved.
-            Ok(super::storage::CleanupReport { pending: true, removed: 0 })
+            Ok(super::storage::CleanupReport { pending: true, removed: 0, protected: false })
         } else {
             retained.extend(readers.headers.values().filter(|h| h.photo_id == photo).cloned());
             super::storage::collect(store, photo, retained, 2)
@@ -142,6 +153,11 @@ impl Archive {
             Ok(report) => {
                 if !report.pending {
                     self.cleanup_photos.remove(&photo);
+                    if report.protected {
+                        self.cleanup_waiting.insert(photo);
+                    } else {
+                        self.cleanup_waiting.remove(&photo);
+                    }
                 }
                 self.cleanup_errors.remove(&photo);
             }

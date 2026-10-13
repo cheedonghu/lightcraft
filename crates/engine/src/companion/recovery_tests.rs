@@ -384,6 +384,150 @@ fn native_reader_holds_library_lock_until_actual_retirement_after_switching_libr
     s.close_library().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+fn persist_to_idle(s: &mut Session, meter: &Arc<Mutex<IoCount>>) {
+    for _ in 0..2000 {
+        *meter.lock().unwrap() = IoCount::default();
+        s.persist().unwrap();
+        let count = meter.lock().unwrap();
+        assert_eq!(count.unbounded_reads, 0);
+        assert!(count.largest_read <= 32 * 1024);
+        assert!(count.calls <= 100, "two maintenance units remain bounded: {} calls", count.calls);
+        if count.calls == 0 {
+            return;
+        }
+    }
+    panic!("ordinary maintenance must reach zero-I/O idle after its protected cycle");
+}
+fn persist_until_old_reclaimed(
+    s: &mut Session,
+    meter: &Arc<Mutex<IoCount>>,
+    old: &super::storage::PhotoHeader,
+    current: &super::storage::PhotoHeader,
+) {
+    for _ in 0..2000 {
+        *meter.lock().unwrap() = IoCount::default();
+        s.persist().unwrap();
+        let count = meter.lock().unwrap();
+        assert_eq!(count.unbounded_reads, 0);
+        assert!(count.largest_read <= 32 * 1024);
+        assert!(count.calls <= 100);
+        drop(count);
+        assert_eq!(s.companion_messages_bounded(current, 0, 1, 1024).unwrap().records[0]["text"], "current retained-release graph");
+        if s.companion_messages_bounded(old, 0, 1, 1024).is_err() {
+            return;
+        }
+    }
+    panic!("actual retention release must reschedule idle-photo cleanup without a HEAD read or manual collector");
+}
+#[test]
+fn actual_guard_drop_reschedules_automatic_cleanup_after_protected_collection_goes_idle() {
+    let meter = Arc::new(Mutex::new(IoCount::default()));
+    let mut s = open(MeterStore { inner: FaultStore { memory: MemStore::new(), plan: FaultPlan::default() }, meter: meter.clone() });
+    let photo = s.active().unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"old retained-release graph"}],"rounds":[]})).unwrap();
+    let old = s.companion_photo_header(photo).unwrap().unwrap();
+    let guard = s.retain_companion_history(&old).unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"current retained-release graph"}],"rounds":[]})).unwrap();
+    let current = s.companion_photo_header(photo).unwrap().unwrap();
+    let inactive = s.catalog.photos().find(|p| p.id != photo).unwrap().id;
+    s.execute("library.select", &json!({"ids":[inactive.0],"active":inactive.0})).unwrap();
+    persist_to_idle(&mut s, &meter);
+    assert_eq!(s.companion_messages_bounded(&old, 0, 1, 1024).unwrap().records[0]["text"], "old retained-release graph");
+    *meter.lock().unwrap() = IoCount::default();
+    std::thread::spawn(move || drop(guard)).join().unwrap();
+    assert_eq!(meter.lock().unwrap().calls, 0, "cross-thread Drop does no filesystem I/O");
+    assert!(s.companion_cleanup_pending(), "retired graph must schedule maintenance for its idle photo");
+    persist_until_old_reclaimed(&mut s, &meter, &old, &current);
+    persist_to_idle(&mut s, &meter);
+    assert!(!s.companion_cleanup_pending(), "no obsolete retention remains; repaint polling must end");
+    assert!(s.unsaved().is_none());
+}
+
+#[test]
+fn cached_prefix_change_reschedules_automatic_cleanup_without_touching_the_idle_photo_head() {
+    for replacement in [false, true] {
+        let meter = Arc::new(Mutex::new(IoCount::default()));
+        let mut s = open(MeterStore { inner: FaultStore { memory: MemStore::new(), plan: FaultPlan::default() }, meter: meter.clone() });
+        let photo = s.active().unwrap();
+        s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"old retained-release graph"}],"rounds":[]})).unwrap();
+        let old = s.companion_photo_header(photo).unwrap().unwrap();
+        s.pin_companion_prefix(photo, Some(old.clone())).unwrap();
+        s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"current retained-release graph"}],"rounds":[]})).unwrap();
+        let current = s.companion_photo_header(photo).unwrap().unwrap();
+        let inactive = s.catalog.photos().find(|p| p.id != photo).unwrap().id;
+        s.execute("library.select", &json!({"ids":[inactive.0],"active":inactive.0})).unwrap();
+        persist_to_idle(&mut s, &meter);
+        assert_eq!(s.companion_messages_bounded(&old, 0, 1, 1024).unwrap().records[0]["text"], "old retained-release graph");
+        *meter.lock().unwrap() = IoCount::default();
+        s.pin_companion_prefix(photo, if replacement { Some(current.clone()) } else { None }).unwrap();
+        assert_eq!(meter.lock().unwrap().calls, 0, "cache release does no filesystem work");
+        persist_until_old_reclaimed(&mut s, &meter, &old, &current);
+        persist_to_idle(&mut s, &meter);
+        assert!(!s.companion_cleanup_pending());
+    }
+}
+
+#[test]
+fn retired_namespace_debt_survives_reopen_without_scheduling_a_different_library() {
+    let files = MemStore::new();
+    let meter = Arc::new(Mutex::new(IoCount::default()));
+    let mut s = open(MeterStore { inner: FaultStore { memory: files.clone(), plan: FaultPlan::default() }, meter: meter.clone() });
+    let photo = s.active().unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"old retained-release graph"}],"rounds":[]})).unwrap();
+    let old = s.companion_photo_header(photo).unwrap().unwrap();
+    let guard = s.retain_companion_history(&old).unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"current retained-release graph"}],"rounds":[]})).unwrap();
+    let current = s.companion_photo_header(photo).unwrap().unwrap();
+    persist_to_idle(&mut s, &meter);
+    s.close_library().unwrap();
+    drop(s);
+    drop(guard);
+    let other_meter = Arc::new(Mutex::new(IoCount::default()));
+    let mut other = open(MeterStore { inner: FaultStore { memory: MemStore::new(), plan: FaultPlan::default() }, meter: other_meter.clone() });
+    other.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"independent library"}],"rounds":[]})).unwrap();
+    persist_to_idle(&mut other, &other_meter);
+    assert!(!other.companion_cleanup_pending());
+    *other_meter.lock().unwrap() = IoCount::default();
+    other.persist_if_dirty();
+    assert_eq!(other_meter.lock().unwrap().calls, 0, "A's release must neither schedule B nor be discarded by B");
+    let mut reopened = open(MeterStore { inner: FaultStore { memory: files, plan: FaultPlan::default() }, meter: meter.clone() });
+    assert!(reopened.companion_cleanup_pending(), "reopen consumes only its preserved namespace event, without reading HEAD");
+    persist_until_old_reclaimed(&mut reopened, &meter, &old, &current);
+    persist_to_idle(&mut reopened, &meter);
+    assert!(!reopened.companion_cleanup_pending());
+    assert_eq!(other.companion_messages_page(photo, 0, 1).unwrap().records[0]["text"], "independent library");
+}
+
+#[test]
+fn actual_release_event_cannot_bypass_an_editor_failure_backoff() {
+    let meter = Arc::new(Mutex::new(IoCount::default()));
+    let plan = FaultPlan::default();
+    let mut s = open(MeterStore { inner: FaultStore { memory: MemStore::new(), plan: plan.clone() }, meter: meter.clone() });
+    let photo = s.active().unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"old retained-release graph"}],"rounds":[]})).unwrap();
+    let old = s.companion_photo_header(photo).unwrap().unwrap();
+    let guard = s.retain_companion_history(&old).unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"current retained-release graph"}],"rounds":[]})).unwrap();
+    let current = s.companion_photo_header(photo).unwrap().unwrap();
+    persist_to_idle(&mut s, &meter);
+    s.set_companion_editor(photo, super::EditorState { draft: "retained unsaved draft".into(), ..Default::default() }).unwrap();
+    *plan.0.lock().unwrap() = Some(("/editor.json".into(), false, false));
+    assert!(s.persist().is_err());
+    drop(guard);
+    *meter.lock().unwrap() = IoCount::default();
+    for _ in 0..10 {
+        s.persist_if_dirty();
+    }
+    assert_eq!(meter.lock().unwrap().calls, 0, "the queued release does not reset data/editor2s backoff");
+    assert!(s.companion_photo_unsaved(photo));
+    s.persist().unwrap();
+    persist_until_old_reclaimed(&mut s, &meter, &old, &current);
+    persist_to_idle(&mut s, &meter);
+    assert!(!s.companion_cleanup_pending());
+    assert!(s.unsaved().is_none());
+    assert_eq!(s.companion_editor(photo).unwrap().draft, "retained unsaved draft");
+}
 fn receipt(s: &mut Session, photo: PhotoId) -> RoundIdentity {
     let id = RoundIdentity {
         scope: PhotoScope { library_generation: s.library_generation(), photo },
