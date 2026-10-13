@@ -803,7 +803,7 @@ fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId) -> Result<V
     app.session.set_photo_companion(photo, None).map_err(|e| e.to_string())?;
     app.session.persist().map_err(|e| e.to_string())?;
     state.conversations.insert(photo, Conversation::default());
-    if let Some(library) = app.session.library.as_ref() {
+    if let Some(library) = app.session.library.as_mut() {
         for name in names {
             library.remove_companion_attachment(&name).map_err(|e| e.to_string())?;
         }

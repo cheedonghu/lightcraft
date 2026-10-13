@@ -9,10 +9,26 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// A flat namespace of named files with the few operations the journal needs.
+/// Named files relative to a controlled storage root. Native and memory stores reject
+/// absolute paths, traversal and symlink references. Existing journal operations stay available;
+/// new bounded operations default to explicit `Unsupported` errors for custom stores.
 pub trait Store: Send {
     /// The whole file, or `None` if it doesn't exist.
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>>;
+    /// Read at most `max_bytes`; oversized files return `InvalidData` without unbounded I/O.
+    /// Unsupported stores must not fall back to a whole-file read.
+    fn read_limited(&mut self, _name: &str, _max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "bounded reads are unsupported by this store"))
+    }
+    /// Read exactly `length` bytes at `offset`. Missing files return `NotFound`, short ranges
+    /// return `UnexpectedEof`, and arithmetic overflow returns `InvalidInput`.
+    fn read_range(&mut self, _name: &str, _offset: u64, _length: usize) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "range reads are unsupported by this store"))
+    }
+    /// Durably remove a file. Removing a missing file succeeds.
+    fn remove(&mut self, _name: &str) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "file removal is unsupported by this store"))
+    }
     /// Replace a file atomically: after a crash either the old or the new content is visible,
     /// never a mix (native: write temp + fsync + rename + fsync directory).
     fn write_atomic(&mut self, name: &str, data: &[u8]) -> io::Result<()>;
@@ -61,76 +77,138 @@ impl FsStore {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir.join(name)
-    }
-    fn sync_dir(&self) {
-        // Makes the rename durable on POSIX; opening a directory fails on Windows (where
-        // `rename` is already journaled by NTFS), so errors are ignored.
-        if let Ok(d) = std::fs::File::open(&self.dir) {
-            let _ = d.sync_all();
+    fn path(&self, name: &str) -> io::Result<PathBuf> {
+        validate_name(name)?;
+        let mut path = self.dir.clone();
+        for part in name.split('/') {
+            path.push(part);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "storage paths may not contain symlinks"));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
+        Ok(path)
+    }
+    fn prepare_parent(&self, name: &str) -> io::Result<PathBuf> {
+        let path = self.path(name)?;
+        let mut parent = self.dir.clone();
+        let mut parts = name.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                break;
+            }
+            let previous = parent.clone();
+            parent.push(part);
+            match std::fs::create_dir(&parent) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && parent.is_dir() => {}
+                Err(e) => return Err(e),
+            }
+            // Also persist an existing parent: a previous attempt might have failed to sync it.
+            sync_directory(&previous)?;
+        }
+        Ok(path)
     }
 }
 
 impl Store for FsStore {
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
-        match std::fs::read(self.path(name)) {
+        match std::fs::read(self.path(name)?) {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    fn write_atomic(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
-        use std::io::Write;
+    fn read_limited(&mut self, name: &str, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
+        use io::Read;
+        let path = self.path(name)?;
+        let limit = max_bytes.checked_add(1).ok_or_else(|| invalid("bounded read limit is too large"))?;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if file.metadata()?.len() > max_bytes {
+            return Err(oversized(max_bytes));
+        }
+        // `take` bounds real reads even if the file grows after the metadata check.
+        let bytes = read_bytes(file.take(limit))?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(oversized(max_bytes));
+        }
+        Ok(Some(bytes))
+    }
+
+    fn read_range(&mut self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        use io::{Read, Seek};
+        let path = self.path(name)?;
+        let end = range_end(offset, length)?;
+        let mut file = std::fs::File::open(path)?;
+        if end > file.metadata()?.len() {
+            return Err(short_range());
+        }
+        file.seek(io::SeekFrom::Start(offset))?;
+        let bytes = read_bytes(file.take(length as u64))?;
+        if bytes.len() != length {
+            return Err(short_range());
+        }
+        Ok(bytes)
+    }
+
+    fn remove(&mut self, name: &str) -> io::Result<()> {
+        let path = self.path(name)?;
         if self.appender.as_ref().is_some_and(|(n, _)| n == name) {
             self.appender = None;
         }
-        let tmp = self.path(&format!("{name}.tmp"));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(data)?;
-            f.sync_all()?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => sync_directory(path.parent().unwrap_or(&self.dir)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Retry the parent sync if a prior delete succeeded but its sync failed.
+                let parent = path.parent().unwrap_or(&self.dir);
+                if parent.is_dir() { sync_directory(parent) } else { Ok(()) }
+            }
+            Err(e) => Err(e),
         }
-        std::fs::rename(&tmp, self.path(name))?;
-        self.sync_dir();
-        Ok(())
+    }
+
+    fn write_atomic(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        self.write_atomic_with(name, &mut |writer| writer.write_all(data)).map(|_| ())
     }
 
     fn write_atomic_with(&mut self, name: &str, fill: &mut dyn FnMut(&mut dyn io::Write) -> io::Result<()>) -> io::Result<u64> {
-        use std::io::Write;
+        let path = self.prepare_parent(name)?;
         if self.appender.as_ref().is_some_and(|(n, _)| n == name) {
             self.appender = None;
         }
-        let tmp = self.path(&format!("{name}.tmp"));
-        let written = (|| {
-            let mut w = Counter { inner: io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?), n: 0 };
-            fill(&mut w)?;
-            w.flush()?;
-            let f = w.inner.into_inner().map_err(|e| e.into_error())?;
-            f.sync_all()?;
-            Ok(w.n)
-        })();
-        let n = match written {
-            Ok(n) => n,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
-        };
-        std::fs::rename(&tmp, self.path(name))?;
-        self.sync_dir();
+        // Preserve recovery from the old fixed temp name. Unlinking a leftover symlink removes
+        // only that link; it never opens its target. `.tmp` is reserved by the storage writer.
+        let legacy_tmp = self.dir.join(format!("{name}.tmp"));
+        match std::fs::remove_file(legacy_tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        // The shared durable writer uses unique, exclusively created temp files and removes
+        // them on a failed fill. Report directory sync errors instead of silently accepting them.
+        let n = crate::safe_file::write_atomic_with(&path, fill)?;
+        sync_directory(path.parent().unwrap_or(&self.dir))?;
         Ok(n)
     }
 
     fn append(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
         use std::io::Write;
+        validate_name(name)?;
         if self.appender.as_ref().is_none_or(|(n, _)| n != name) {
-            let existed = self.path(name).exists();
-            let f = std::fs::OpenOptions::new().create(true).append(true).open(self.path(name))?;
+            let path = self.prepare_parent(name)?;
+            let existed = path.exists();
+            let f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
             if !existed {
-                self.sync_dir();
+                sync_directory(path.parent().unwrap_or(&self.dir))?;
             }
             self.appender = Some((name.to_string(), f));
         }
@@ -149,7 +227,7 @@ impl Store for FsStore {
         if self.appender.as_ref().is_some_and(|(n, _)| n == name) {
             self.appender = None;
         }
-        let f = match std::fs::OpenOptions::new().write(true).open(self.path(name)) {
+        let f = match std::fs::OpenOptions::new().write(true).open(self.path(name)?) {
             Ok(f) => f,
             // nothing to cut (an append that failed before creating the file)
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -169,21 +247,63 @@ impl Store for FsStore {
     }
 }
 
-/// Counts the bytes written through it.
-struct Counter<W> {
-    inner: W,
-    n: u64,
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-impl<W: io::Write> io::Write for Counter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let k = self.inner.write(buf)?;
-        self.n += k as u64;
-        Ok(k)
+fn validate_name(name: &str) -> io::Result<()> {
+    if name.contains(['\\', ':', '\0']) || name.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+        return Err(invalid("storage name must be a relative path without empty or traversal components"));
     }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+    Ok(())
+}
+
+fn oversized(max_bytes: u64) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("storage file exceeds the {max_bytes}-byte read limit"))
+}
+
+fn range_end(offset: u64, length: usize) -> io::Result<u64> {
+    let length = u64::try_from(length).map_err(|_| invalid("range length is too large"))?;
+    offset.checked_add(length).ok_or_else(|| invalid("storage read range overflows"))
+}
+
+fn short_range() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "storage read range exceeds the file length")
+}
+
+/// Accumulate only bytes actually read; hostile offsets/lengths never preallocate a huge buffer.
+fn read_bytes(mut reader: impl io::Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => return Ok(bytes),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        bytes.try_reserve(n).map_err(io::Error::other)?;
+        bytes.extend_from_slice(chunk.get(..n).ok_or_else(|| io::Error::other("invalid storage reader length"))?);
     }
+}
+
+fn copy_bytes(source: &[u8]) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(source.len()).map_err(io::Error::other)?;
+    bytes.extend_from_slice(source);
+    Ok(bytes)
+}
+
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    } // Windows directory handles are not available through std.
 }
 
 /// In-memory files. Clones share the same files (so a test can "reopen" or corrupt them).
@@ -208,19 +328,50 @@ impl MemStore {
 
 impl Store for MemStore {
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        validate_name(name)?;
         Ok(self.get(name))
     }
+    fn read_limited(&mut self, name: &str, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
+        validate_name(name)?;
+        max_bytes.checked_add(1).ok_or_else(|| invalid("bounded read limit is too large"))?;
+        let files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(bytes) = files.get(name) else { return Ok(None) };
+        if bytes.len() as u64 > max_bytes {
+            return Err(oversized(max_bytes));
+        }
+        Ok(Some(copy_bytes(bytes)?))
+    }
+    fn read_range(&mut self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        validate_name(name)?;
+        let end = range_end(offset, length)?;
+        let files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = files.get(name).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "storage file is missing"))?;
+        if end > bytes.len() as u64 {
+            return Err(short_range());
+        }
+        let start = usize::try_from(offset).map_err(|_| short_range())?;
+        let end = usize::try_from(end).map_err(|_| short_range())?;
+        copy_bytes(bytes.get(start..end).ok_or_else(short_range)?)
+    }
+    fn remove(&mut self, name: &str) -> io::Result<()> {
+        validate_name(name)?;
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+        Ok(())
+    }
     fn write_atomic(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        validate_name(name)?;
         self.set(name, data.to_vec());
         Ok(())
     }
     fn append(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+        validate_name(name)?;
         self.files.lock().unwrap_or_else(|e| e.into_inner()).entry(name.to_string()).or_default().extend_from_slice(data);
         Ok(())
     }
     fn truncate(&mut self, name: &str, len: u64) -> io::Result<()> {
+        validate_name(name)?;
         if let Some(f) = self.files.lock().unwrap_or_else(|e| e.into_inner()).get_mut(name) {
-            f.truncate(len as usize);
+            f.truncate(usize::try_from(len).unwrap_or(usize::MAX));
         }
         Ok(())
     }
@@ -231,3 +382,7 @@ impl Store for MemStore {
         self.background.then(|| Box::new(self.clone()) as Box<dyn Store>)
     }
 }
+
+#[cfg(test)]
+#[path = "tests_store.rs"]
+mod tests;
