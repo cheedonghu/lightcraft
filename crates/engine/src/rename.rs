@@ -479,6 +479,83 @@ fn is_respelling(fs: &dyn MoveFs, from: &Path, to: &Path) -> bool {
     from != to && folded_path(&from.to_string_lossy()) == folded_path(&to.to_string_lossy()) && fs.exists(to) && fs.same_file(from, to)
 }
 
+/// Resolve aliases without requiring the final destination to exist.
+fn resolved_path(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(mut resolved) = std::fs::canonicalize(ancestor)
+            && let Ok(rest) = path.strip_prefix(ancestor)
+        {
+            for component in rest.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    component => resolved.push(component.as_os_str()),
+                }
+            }
+            return resolved;
+        }
+    }
+    path.to_path_buf()
+}
+
+fn same_path(fs: &dyn MoveFs, a: &Path, b: &Path) -> bool {
+    a == b || fs.same_file(a, b) || resolved_path(a) == resolved_path(b)
+}
+
+/// A directory move also removes symlink traversal entries below that directory,
+/// even when the final photo symlink resolves outside it. Moving a symlink folder
+/// itself changes its entry, not unrelated direct users of its target directory.
+fn folder_affects_path(folder: &Path, source: &Path) -> bool {
+    let folder_is_link = std::fs::symlink_metadata(folder).is_ok_and(|metadata| metadata.file_type().is_symlink());
+    let resolved_folder = resolved_path(folder);
+    let mut cursor = source.to_path_buf();
+    let mut seen = HashSet::new();
+    // Walk in native component order. Inspect every traversal entry before
+    // canonicalization can erase it, then restart at each followed link target.
+    for _ in 0..64 {
+        if !seen.insert(cursor.clone()) {
+            break;
+        }
+        let ancestors: Vec<_> = cursor.ancestors().collect();
+        let mut next = None;
+        for ancestor in ancestors.into_iter().rev() {
+            if same_entry(ancestor, folder) || (!folder_is_link && resolved_path(ancestor).starts_with(&resolved_folder)) {
+                return true;
+            }
+            if let Ok(target) = std::fs::read_link(ancestor) {
+                let target = if target.is_absolute() { target } else { ancestor.parent().unwrap_or_else(|| Path::new("")).join(target) };
+                // Carry the remaining components through directory links;
+                // their target ancestors may contain further traversal links.
+                next = cursor.strip_prefix(ancestor).ok().map(|suffix| target.join(suffix));
+                break;
+            }
+        }
+        let Some(target) = next else { break };
+        cursor = target;
+    }
+    false
+}
+
+fn same_entry(a: &Path, b: &Path) -> bool {
+    let location = |path: &Path| match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => resolved_path(parent).join(name),
+        _ => resolved_path(path),
+    };
+    if location(a) == location(b) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+            return a.file_type().is_symlink() && b.file_type().is_symlink() && a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    false
+}
+
 /// Windows accepts both separators; spelling differences must not hide file identity.
 fn folded_path(path: &str) -> String {
     if cfg!(windows) { path.replace('\\', "/").to_lowercase() } else { path.to_lowercase() }
@@ -946,8 +1023,80 @@ impl Session {
         self.apply_rename_with(&RealFs, plans)
     }
 
-    /// Complete retained repairs before a file or folder change can stale their exact paths.
+    /// Actual physical endpoints belong to their current users, even when an older
+    /// history Op does not mention those photos. Keep this mutable authorization
+    /// before every repair/move so durable invalidation can extend the same seam.
+    pub(crate) fn authorize_file_effects(
+        &mut self,
+        fs: &dyn MoveFs,
+        op: &Op,
+        moves: &[(String, String)],
+        folder: Option<&crate::FolderMove>,
+        repairs: &[SidecarMove],
+    ) -> Result<()> {
+        let mut ops = vec![op.clone()];
+        if let Some(id) = self.companion_task_photo()
+            && let Some(photo) = self.catalog.photo(id)
+            && let Source::File { path } = &photo.source
+        {
+            let original = Path::new(path);
+            let mut owned = vec![original.to_path_buf()];
+            owned.extend(sidecars(path).into_iter().map(|(path, _, _)| path));
+            let mut endpoints: Vec<PathBuf> = moves.iter().flat_map(|(from, to)| [PathBuf::from(from), PathBuf::from(to)]).collect();
+            // Sidecars are additional filesystem targets. Existing destinations are
+            // retained by move_file_with; a shared stem packet is copied rather than
+            // taken from a task photo which still uses that stem.
+            for (from, to) in moves {
+                for (source, naming, upper) in sidecars(from).into_iter().filter(|(source, _, _)| fs.is_file(source)) {
+                    let mut target = crate::sidecar::sidecar_path(to, naming);
+                    if upper {
+                        target = target.with_extension("XMP");
+                    }
+                    let task_keeps_stem = naming == SidecarNaming::Stem
+                        && !same_path(fs, original, Path::new(from))
+                        && same_path(fs, &source, &original.with_extension(if upper { "XMP" } else { "xmp" }))
+                        && fs.is_file(original);
+                    if fs.exists(&target) && (task_keeps_stem || !is_respelling(fs, &source, &target)) {
+                        continue;
+                    }
+                    if !task_keeps_stem {
+                        endpoints.push(source);
+                    }
+                    endpoints.push(target);
+                }
+            }
+            // Recovery paths are exact, previously observed physical endpoints;
+            // never assume that an .xmp recovery path cannot now name an original.
+            endpoints.extend(repairs.iter().flat_map(|repair| [repair.from.clone(), repair.to.clone()]));
+            let touches_file = endpoints.iter().any(|endpoint| owned.iter().any(|owned| same_path(fs, endpoint, owned)));
+            let touches_folder = folder.is_some_and(|folder| {
+                [&folder.from, &folder.to].into_iter().filter(|path| !path.is_empty()).any(|folder| folder_affects_path(Path::new(folder), original))
+            });
+            if touches_file || touches_folder {
+                ops.push(Op::SetFile { id, file_name: photo.file_name.clone(), source: photo.source.clone() });
+            }
+        }
+        self.authorize_mutation(&Op::Batch { ops })
+    }
+
+    pub(crate) fn retained_sidecar_repairs(&self) -> Vec<SidecarMove> {
+        self.pending_sidecar_repairs.iter().chain(self.undo.iter().chain(&self.redo).flat_map(|entry| &entry.retry_sidecars)).cloned().collect()
+    }
+
+    /// Called while the entry is still on its stack, and again as the final
+    /// filesystem fallback after detachment, before any global repair can retire.
+    pub(crate) fn authorize_history_entry(&mut self, fs: &dyn MoveFs, entry: &crate::UndoEntry) -> Result<()> {
+        let moves = self.file_moves(&entry.op);
+        let mut repairs = entry.retry_sidecars.clone();
+        if entry.folder.is_some() || !entry.retry_sidecars.is_empty() || !moves.is_empty() {
+            repairs.extend(self.retained_sidecar_repairs());
+        }
+        self.authorize_file_effects(fs, &entry.op, &moves, entry.folder.as_ref(), &repairs)
+    }
+
     pub(crate) fn repair_sidecars_with(&mut self, fs: &dyn MoveFs) -> Result<()> {
+        let repairs = self.retained_sidecar_repairs();
+        self.authorize_file_effects(fs, &Op::Batch { ops: Vec::new() }, &[], None, &repairs)?;
         for repair in self.pending_sidecar_repairs.iter().chain(self.undo.iter().chain(&self.redo).flat_map(|e| &e.retry_sidecars)) {
             repair.validate_repair(fs).map_err(EngineError::Other)?;
         }
@@ -959,6 +1108,9 @@ impl Session {
     }
 
     pub(crate) fn repair_sidecars_for_paths(&mut self, paths: &[PathBuf], fs: &dyn MoveFs) -> Result<()> {
+        let repairs =
+            self.retained_sidecar_repairs().into_iter().filter(|repair| paths.iter().any(|path| repair.touches(fs, path))).collect::<Vec<_>>();
+        self.authorize_file_effects(fs, &Op::Batch { ops: Vec::new() }, &[], None, &repairs)?;
         self.validate_sidecar_packets_for_paths(paths, fs)?;
         retry_sidecars_for_paths(fs, &mut self.pending_sidecar_repairs, paths).map_err(EngineError::Other)?;
         for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
@@ -1008,7 +1160,6 @@ impl Session {
     pub(crate) fn apply_file_plans(&mut self, fs: &dyn MoveFs, plans: &[RenamePlan], label: &dyn Fn(usize) -> String) -> Result<usize> {
         // A partly completed rename can already have the requested photo name. Repair
         // its sidecars before treating that empty move list as a successful retry.
-        self.repair_sidecars_with(fs)?;
         let mut ops = Vec::new();
         let by_path: HashMap<&str, &RenamePlan> = plans.iter().filter_map(|p| p.from_path.as_deref().map(|f| (f, p))).collect();
         for p in self.catalog.photos() {
@@ -1035,6 +1186,9 @@ impl Session {
                 _ => None,
             })
             .collect();
+        let repairs = self.retained_sidecar_repairs();
+        self.authorize_file_effects(fs, &op, &moves, None, &repairs)?;
+        self.repair_sidecars_with(fs)?;
         if let Err(e) = move_all(fs, &moves) {
             return Err(EngineError::Other(self.follow_stuck(&op, e, true).0));
         }
@@ -1685,3 +1839,7 @@ pub(crate) mod tests {
         assert_eq!(expand_tokens("{seq}|{seq:2}", &p, 7, 3), "007|07");
     }
 }
+
+#[cfg(test)]
+#[path = "rename/tests_companion_history.rs"]
+mod tests_companion_history;

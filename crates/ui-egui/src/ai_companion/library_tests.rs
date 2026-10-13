@@ -27,6 +27,7 @@ fn invalid_library_keeps_the_round_and_new_library_archives_it() {
     app.ai.jobs.insert(
         photo,
         Job {
+            lease: app.session.acquire_companion_lease(photo, LocalRoundId::new().unwrap()).unwrap(),
             identity: RoundIdentity {
                 scope: PhotoScope { library_generation: generation, photo },
                 local_round_id: LocalRoundId::new().unwrap(),
