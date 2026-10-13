@@ -936,3 +936,34 @@ fn cold_verified_history_keeps_trace_and_consent_controls_scoped_while_loading()
         assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"), "same photo IDs in a new library cannot reuse old diagnostics");
     }
 }
+
+#[test]
+fn invalid_client_plan_explains_untouched_start_and_manual_recovery() {
+    let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
+    let (connection, requests, events) = network::test_connection();
+    app.ai.connection = Some(connection);
+    app.ai.generation = app.session.library_generation();
+    let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
+    h.app.run("ai.open", json!({})).unwrap();
+    frames(&mut h);
+    request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
+    let photo = h.app.session.active().unwrap();
+    let original = h.app.session.develop_of(photo).unwrap();
+    h.app.run("ai.start", json!({"prompt":"Improve my photo"})).unwrap();
+    let create = outgoing(&mut h, &requests, "/v1/rounds");
+    for state in ["awaiting_input", "awaiting_initial_execution"] {
+        events.send(network::Event::Server {kind:"round.state".into(),data:json!({"round_id":"invalid-client-plan","payload":{"submission_seq":create.submission,"photo_ref":create.body["photo_ref"],"state":state}})}).unwrap();
+        if state == "awaiting_input" {
+            outgoing(&mut h, &requests, "/input");
+        }
+    }
+    events.send(network::Event::Server {kind:"edit.plan".into(),data:json!({"round_id":"invalid-client-plan","payload":{"plan_id":"invalid","capability_version":"unsupported-client","expected_revision":h.app.session.photo_revision(photo),"operations":[{"type":"set_controls","values":{"light.exposure":0.4}}]}})}).unwrap();
+    frames(&mut h);
+    let status = h.app.run("ai.status", json!({})).unwrap();
+    let text = status["text"].as_str().unwrap();
+    assert!(text.contains("could not be validated"), "{status}");
+    assert!(text.to_lowercase().contains("start a new request"), "{text}");
+    assert!(text.contains("starting settings"), "{text}");
+    assert_eq!(*h.app.session.develop_of(photo).unwrap(), *original);
+    assert_eq!(status["task"]["terminal"], "failed");
+}

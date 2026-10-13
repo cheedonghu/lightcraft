@@ -44,3 +44,17 @@ pub(super) fn trace(record: &serde_json::Value) -> Option<&str> {
 pub(super) fn diagnostic(conversation: &super::Conversation) -> Option<&str> {
     conversation.records.iter().rev().find_map(trace).or_else(|| conversation.view.as_ref().and_then(|view| view.diagnostic.as_deref()))
 }
+
+/// Keep authored human preflight causes; technical client errors stay in durable diagnostics.
+pub(super) fn local_notice(error: &str, published: bool) -> String {
+    for cause in [
+        "The complete AI history exceeds the service limit. Local history is retained.",
+        "The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.",
+        "AI history preparation failed. Try again.",
+    ] {
+        if error == cause || error == tr(cause) {
+            return format!("{}\n{}", tr(cause), notice("client_failure", published));
+        }
+    }
+    notice(if error == "AI 方案与当前照片状态不匹配。" { "invalid_plan" } else { "client_failure" }, published)
+}

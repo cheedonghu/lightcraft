@@ -1043,7 +1043,11 @@ impl State {
                         step["delivery_state"] = json!("queued");
                     }
                 }
-                self.finish(photo, &format!("处理未完成：{error}。保留最近完整结果。"));
+                let published = self
+                    .conversations
+                    .get(&photo)
+                    .is_some_and(|c| c.records.iter().any(|r| r["local_round_id"] == identity.local_round_id.as_str() && errors::published(r)));
+                self.finish(photo, &errors::notice("execution_failed", published));
                 return self.save(app, photo);
             }
         };
@@ -1491,15 +1495,25 @@ impl State {
     }
     fn fail_one(&mut self, app: &mut LightcraftApp, photo: PhotoId, error: &str) {
         let error = tr(error);
-        self.mark_failure(photo, error);
+        let published = self.jobs.get(&photo).is_some_and(|job| {
+            self.conversations
+                .get(&photo)
+                .is_some_and(|c| c.records.iter().any(|r| r["local_round_id"] == job.identity.local_round_id.as_str() && errors::published(r)))
+        });
+        let notice = errors::local_notice(error, published);
+        self.mark_failure(photo, &notice);
+        if let Some(job) = self.jobs.get(&photo)
+            && let Some(record) = self
+                .conversations
+                .get_mut(&photo)
+                .and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == job.identity.local_round_id.as_str()))
+        {
+            record["local_failure"]["diagnostic"] = json!(error.chars().take(4096).collect::<String>());
+        }
         let _ = self.stop(photo);
         if let Some(c) = self.conversations.get_mut(&photo) {
             c.storage_notice = app.session.companion_history_unsaved(photo);
-            c.notice = if c.storage_notice {
-                tr("Photo changes are kept. AI history is not saved; saving will retry.").into()
-            } else {
-                format!("处理未完成：{error}。保留最近完整结果。")
-            };
+            c.notice = if c.storage_notice { tr("Photo changes are kept. AI history is not saved; saving will retry.").into() } else { notice };
         }
         let _ = self.save(app, photo);
     }
