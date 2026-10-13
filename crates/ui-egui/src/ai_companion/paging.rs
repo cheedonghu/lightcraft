@@ -7,6 +7,8 @@ struct PageRequest {
     scope: PhotoScope,
     header: lightcraft_engine::companion::storage::PhotoHeader,
     cursor: HistoryCursor,
+    legacy_cursor: u64,
+    preview_cursor: u64,
 }
 struct ReadMessage {
     retention: lightcraft_engine::companion::storage::HistoryRetention,
@@ -14,7 +16,7 @@ struct ReadMessage {
     scope: PhotoScope,
     transaction: String,
     cursor: HistoryCursor,
-    result: Result<(HistorySlice, Vec<card::Card>, Option<String>, Option<String>), String>,
+    result: Result<(HistorySlice, Vec<card::Card>, Option<String>, Option<String>, Option<Value>, Option<historical::Preview>), String>,
 }
 pub(super) struct Paging {
     tx: mpsc::SyncSender<ReadMessage>,
@@ -76,7 +78,7 @@ impl State {
             }
             self.paging.completed = message.request;
             match message.result {
-                Ok((page, cards, notice, diagnostic)) => {
+                Ok((page, cards, notice, diagnostic, legacy_plan, preview)) => {
                     if let Some(notice) = notice {
                         conversation.notice = notice;
                     }
@@ -91,9 +93,14 @@ impl State {
                         cards_bytes: cards
                             .iter()
                             .map(|c| serde_json::to_vec(c).map_or(usize::MAX, |bytes| bytes.len()))
-                            .fold(0, usize::saturating_add),
+                            .fold(0, usize::saturating_add)
+                            .saturating_add(legacy_plan.as_ref().and_then(|p| serde_json::to_vec(p).ok()).map_or(0, |p| p.len()))
+                            .saturating_add(preview.as_ref().map_or(0, historical::Preview::bytes)),
                         cards,
                         diagnostic,
+                        legacy_plan,
+                        legacy_scan: None,
+                        preview,
                         card_cursor: None,
                         card_pending: BTreeSet::new(),
                         card_owners: VecDeque::new(),
@@ -113,12 +120,33 @@ impl State {
                         bytes: 0,
                         cards: Vec::new(),
                         diagnostic: None,
+                        legacy_plan: None,
+                        legacy_scan: None,
+                        preview: None,
                         cards_bytes: 0,
                         card_cursor: None,
                         card_pending: BTreeSet::new(),
                         card_owners: VecDeque::new(),
                         card_scan: None,
                     });
+                }
+            }
+        }
+        if let Some(photo) = self.displayed_photo(app)
+            && let Some(conversation) = self.conversations.get_mut(&photo)
+            && let Some(view) = conversation.view.as_mut()
+            && let Some(scan) = view.legacy_scan.as_mut()
+        {
+            match app.session.companion_display_step(scan) {
+                Ok(Some(plan)) => {
+                    view.cards_bytes = view.cards_bytes.saturating_add(serde_json::to_vec(&plan).map_or(usize::MAX, |b| b.len()));
+                    view.legacy_plan = Some(plan);
+                    view.legacy_scan = None;
+                }
+                Ok(None) => return,
+                Err(e) => {
+                    conversation.notice = e.to_string();
+                    view.legacy_scan = None;
                 }
             }
         }
@@ -159,6 +187,9 @@ impl State {
                                     }
                                 }
                             }
+                            DisplayRecord::LegacyPlan(_) => {
+                                view.legacy_plan = Some(record);
+                            }
                         }
                         view.card_scan = None;
                         if view.card_owners.is_empty() && view.card_pending.is_empty() {
@@ -190,7 +221,15 @@ impl State {
     }
     pub(super) fn request_page(&mut self, app: &mut LightcraftApp, photo: PhotoId, cursor: HistoryCursor) -> Result<(), String> {
         let Some(header) = self.conversations.get(&photo).and_then(|c| c.prefix.clone()) else { return Ok(()) };
-        if self.paging.busy() && self.paging.desired.as_ref().is_some_and(|r| r.scope.photo == photo && r.header == header && r.cursor == cursor) {
+        if self.paging.busy()
+            && self.paging.desired.as_ref().is_some_and(|r| {
+                r.scope.photo == photo
+                    && r.header == header
+                    && r.cursor == cursor
+                    && r.legacy_cursor == self.conversations.get(&photo).map(|c| c.legacy_cursor).unwrap_or(0)
+                    && r.preview_cursor == self.conversations.get(&photo).map(|c| c.preview_cursor).unwrap_or(0)
+            })
+        {
             return Ok(());
         }
         self.paging.sequence = self.paging.sequence.checked_add(1).ok_or_else(|| tr("AI history preparation failed. Try again.").to_owned())?;
@@ -199,6 +238,8 @@ impl State {
             scope: PhotoScope { library_generation: app.session.library_generation(), photo },
             header,
             cursor,
+            legacy_cursor: self.conversations.get(&photo).map(|c| c.legacy_cursor).unwrap_or(0),
+            preview_cursor: self.conversations.get(&photo).map(|c| c.preview_cursor).unwrap_or(0),
         };
         self.paging.desired = Some(request.clone());
         if self.paging.busy() {
@@ -255,7 +296,7 @@ impl State {
                                 }
                             }
                         }
-                        while !wanted.is_empty() && !cancel.load(Ordering::Relaxed) {
+                        while !request.header.legacy_migrated && !wanted.is_empty() && !cancel.load(Ordering::Relaxed) {
                             let rounds = match reader.rounds_display(cursor, 32) {
                                 Ok(rounds) => rounds,
                                 Err(error) => {
@@ -279,7 +320,19 @@ impl State {
                             let Some(next) = rounds.next_cursor else { break };
                             cursor = next;
                         }
-                        (page, cards, notice, diagnostic)
+                        let legacy_plan = if request.header.legacy_plan_count() > 0 {
+                            match reader.legacy_plan(request.legacy_cursor) {
+                                Ok(plan) => Some(plan),
+                                Err(e) => {
+                                    notice = Some(e.to_string());
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let preview = historical::read_native(&mut reader, &page, request.preview_cursor);
+                        (page, cards, notice, diagnostic, legacy_plan, preview)
                     });
                     if !cancel.load(Ordering::Relaxed) {
                         let _ = tx.try_send(ReadMessage {
@@ -335,13 +388,16 @@ fn assemble(
     prompt: &str,
     settings: &DevelopSettings,
 ) -> Result<Vec<Value>, String> {
+    if !reader.header().history_complete() {
+        return Err(projection::invalid());
+    }
     let mut projection = projection::HistoryProjection::new(reader.header().photo_id);
     let mut cursor = 0;
     while cursor < reader.header().message_count {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        let page = reader.messages(cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
+        let page = reader.protocol_messages(cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
         for message in &page.records {
             projection.push_cancellable(message, |picture| reader.preview(picture).map_err(|e| e.to_string()), || cancel.load(Ordering::Relaxed))?;
         }

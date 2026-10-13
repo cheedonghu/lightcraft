@@ -40,6 +40,7 @@ pub use model::*;
 pub use query::{DateGroup, Filter, Person, RatingOp, Sort, SortKey, mix64};
 pub use rules::{Match, Rule, RuleSet};
 use serde::{Deserialize, Serialize};
+pub use store::source::{SourceIdentity, SourceSnapshot};
 pub use store::{FsStore, MemStore, Store};
 
 #[derive(Debug, thiserror::Error, PartialEq)]

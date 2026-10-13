@@ -6,6 +6,7 @@ use super::*;
 pub enum DisplayRecord {
     Message(u64),
     Round(u64),
+    LegacyPlan(u64),
 }
 pub struct DisplayScan {
     header: PhotoHeader,
@@ -31,17 +32,22 @@ impl Session {
         let store = self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut();
         if scan.entry.is_none() {
             let h = &scan.header;
-            let (root, total, index) = match scan.target {
-                DisplayRecord::Message(index) => (h.message_root.as_ref(), h.message_count, index),
-                DisplayRecord::Round(index) => {
-                    if h.record_count > 0 {
-                        (h.record_root.as_ref(), h.record_count, index)
-                    } else {
-                        (h.round_root.as_ref(), h.round_count, index)
+            if let DisplayRecord::LegacyPlan(index) = scan.target {
+                scan.entry = Some(legacy_entry(store, h, index)?);
+            } else {
+                let (root, total, index) = match scan.target {
+                    DisplayRecord::LegacyPlan(_) => return Err(error("legacy display cursor was not selected")),
+                    DisplayRecord::Message(index) => (h.message_root.as_ref(), h.message_count, index),
+                    DisplayRecord::Round(index) => {
+                        if h.record_count > 0 {
+                            (h.record_root.as_ref(), h.record_count, index)
+                        } else {
+                            (h.round_root.as_ref(), h.round_count, index)
+                        }
                     }
-                }
-            };
-            scan.entry = Some(entry(store, h.photo_id, root, total, index)?);
+                };
+                scan.entry = Some(entry(store, h.photo_id, root, total, index)?);
+            }
         }
         let e = scan.entry.as_ref().ok_or_else(|| error("display entry missing"))?;
         // Never straddle a chunk: physical verification reads at most one 4 MiB
@@ -65,7 +71,7 @@ impl Session {
             return Err(error("display record digest mismatch"));
         }
         if e.length <= 256 * 1024 {
-            return serde_json::from_slice(&scan.small).map(Some).map_err(error);
+            return selected(&scan.small).map(Some);
         }
         scan.fields.finish().map(Some)
     }
@@ -73,6 +79,7 @@ impl Session {
 
 #[derive(Default)]
 pub(super) struct Fields {
+    display: bool,
     state: State,
     root: serde_json::Map<String, Value>,
     stage: serde_json::Map<String, Value>,
@@ -108,6 +115,7 @@ struct ValueScan {
     primitive: bool,
     bytes: Vec<u8>,
     started: bool,
+    ignored_depth: u64,
 }
 impl ValueScan {
     // 0: continue, 1: complete and consumed, 2: complete before delimiter.
@@ -138,7 +146,7 @@ impl ValueScan {
                 self.escape = true;
             } else if byte == b'"' {
                 self.string = false;
-                if self.depth.is_empty() {
+                if self.depth.is_empty() && self.ignored_depth == 0 {
                     return Ok(1);
                 }
             } else if byte < 32 {
@@ -148,17 +156,26 @@ impl ValueScan {
             match byte {
                 b'"' => self.string = true,
                 b'{' | b'[' => {
-                    if self.depth.len() >= 128 {
-                        return Err(error("display nesting exceeds bound"));
+                    if !capture {
+                        self.ignored_depth = self.ignored_depth.checked_add(1).ok_or_else(|| error("display nesting overflow"))?;
+                    } else {
+                        if self.depth.len() >= 128 {
+                            return Err(error("display nesting exceeds bound"));
+                        }
+                        self.depth.push(byte);
                     }
-                    self.depth.push(byte);
                 }
                 b'}' | b']' => {
                     let expected = if byte == b'}' { b'{' } else { b'[' };
-                    if self.depth.pop() != Some(expected) {
+                    // A retained legacy setting can stop buffering halfway through
+                    // its value. Close ignored descendants first, then the captured
+                    // ancestors that were already open at the size boundary.
+                    if self.ignored_depth > 0 {
+                        self.ignored_depth -= 1;
+                    } else if self.depth.pop() != Some(expected) {
                         return Err(error("invalid display nesting"));
                     }
-                    if self.depth.is_empty() {
+                    if self.depth.is_empty() && self.ignored_depth == 0 {
                         return Ok(1);
                     }
                 }
@@ -270,17 +287,26 @@ impl Fields {
                                         | "applied_state"
                                 )
                             } else {
-                                matches!(
-                                    self.name.as_str(),
-                                    "local_round_id"
-                                        | "photo_id"
-                                        | "local_terminal"
-                                        | "trace_id"
-                                        | "before_preview_message_id"
-                                        | "recent_complete_hash"
-                                        | "recent_complete_result"
-                                        | "revert_state"
-                                )
+                                (self.display
+                                    && matches!(
+                                        self.name.as_str(),
+                                        "role" | "text" | "images" | "tool_calls" | "tool_call_id" | "complete_state" | "display_kind"
+                                    ))
+                                    || matches!(
+                                        self.name.as_str(),
+                                        "local_round_id"
+                                            | "photo_id"
+                                            | "local_terminal"
+                                            | "trace_id"
+                                            | "before_preview_message_id"
+                                            | "recent_complete_hash"
+                                            | "recent_complete_result"
+                                            | "revert_state"
+                                            | "plan_id"
+                                            | "round_id"
+                                            | "reason"
+                                            | "operations"
+                                    )
                             };
                         }
                         self.legacy = matches!(self.name.as_str(), "before_state" | "proposed_state" | "applied_state" | "recent_complete_result");
@@ -366,5 +392,17 @@ impl Fields {
             return Err(error("incomplete display record"));
         }
         Ok(Value::Object(std::mem::take(&mut self.root)))
+    }
+}
+
+/// Known selected fields are bounded; additive values never become a Value.
+pub(super) fn selected(bytes: &[u8]) -> Result<Value> {
+    match serde_json::from_slice(bytes) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            let mut fields = Fields { display: true, ..Default::default() };
+            fields.push(bytes)?;
+            fields.finish()
+        }
     }
 }

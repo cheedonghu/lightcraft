@@ -18,14 +18,18 @@ mod errors;
 mod health;
 #[cfg(test)]
 mod health_task_tests;
+mod historical;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]
 #[path = "ai_companion/identity_tests.rs"]
 mod identity_tests;
+mod legacy;
 #[cfg(test)]
 #[path = "ai_companion/library_tests.rs"]
 mod library_tests;
+#[cfg(test)]
+mod migration_tests;
 #[cfg(test)]
 mod native_history_tests;
 mod network;
@@ -141,6 +145,9 @@ struct HistoryView {
     bytes: usize,
     cards: Vec<card::Card>,
     diagnostic: Option<String>,
+    legacy_plan: Option<Value>,
+    legacy_scan: Option<lightcraft_engine::companion::storage::DisplayScan>,
+    preview: Option<historical::Preview>,
     cards_bytes: usize,
     card_cursor: Option<u64>,
     card_pending: BTreeSet<String>,
@@ -150,6 +157,9 @@ struct HistoryView {
 struct Conversation {
     scope: Option<PhotoScope>,
     schema_version: u64,
+    legacy_cursor: u64,
+    preview_cursor: u64,
+    legacy_readonly: bool,
     prefix: Option<lightcraft_engine::companion::storage::PhotoHeader>,
     view: Option<HistoryView>,
     dirty: bool,
@@ -167,6 +177,9 @@ impl Default for Conversation {
         Self {
             scope: None,
             schema_version: 2,
+            legacy_cursor: 0,
+            preview_cursor: 0,
+            legacy_readonly: false,
             prefix: None,
             view: None,
             dirty: false,
@@ -318,6 +331,12 @@ impl State {
     pub(crate) fn admission(&self, app: &LightcraftApp, explicit: Option<PhotoId>) -> Result<PhotoId, String> {
         if self.readonly_task.is_some() {
             return Err(tr("Return to the selected photo before starting a new AI task.").into());
+        }
+        if app.session.companion_migration_pending() {
+            return Err(tr("Legacy conversation is being upgraded. New AI tasks are paused.").into());
+        }
+        if app.session.companion_archive_protected_reason().is_some() {
+            return Err(tr("This conversation format is protected. Original history is retained.").into());
         }
         if self.pending_confirmations.len() >= 96 {
             return Err(tr("AI history is waiting to be saved. Retry after saving completes.").into());
@@ -1472,6 +1491,9 @@ impl State {
         if !self.pending_local_saves.is_empty() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+        if app.session.companion_migration_pending() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         if app.session.companion_cleanup_pending() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -1769,12 +1791,52 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 "text": conversation.map(display_text).unwrap_or_else(|| state.text.clone()),
                 "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().chain(c.records.iter().filter_map(|r|card::from_record(r,None))).map(|card| present_card(app,&state,viewed_photo.unwrap_or(PhotoId(0)),card)).collect::<Vec<_>>()).unwrap_or_default(),
                 "historyLoading": state.paging.busy() || viewed_photo.is_some_and(|photo| state.paging.awaiting_page(photo)) || conversation.and_then(|c| c.view.as_ref()).is_some_and(|v|v.card_cursor.is_some()),
+                "migrationPending": app.session.companion_migration_pending(),
+                "migrationBusy":app.session.companion_migration_busy(),
+                "migrationError":app.session.companion_migration_error(),
+                "historicalPreview":conversation.and_then(|c|c.view.as_ref()).and_then(|v|v.preview.as_ref()).map(historical::Preview::status),
+                "legacyPlans": conversation.and_then(|c|c.view.as_ref()).and_then(|v|v.legacy_plan.as_ref()).into_iter().cloned().collect::<Vec<_>>(),
                 "activePhotos": state.jobs.keys().map(|p| p.0).collect::<Vec<_>>(),
-                "saveState": photo.map(|p| if app.session.companion_photo_unsaved(p) || state.pending_local_saves.contains(&p) { "unsaved" } else { "saved" }),
+                "saveState": photo.map(|p| if app.session.companion_photo_unsaved(p) || state.pending_local_saves.contains(&p) || app.session.companion_migration_error().is_some() { "unsaved" } else if app.session.companion_migration_pending(){"migrating"}else { "saved" }),
                 "cleanupPending": photo.is_some_and(|p| app.session.companion_photo_cleanup_pending(p)),
                 "cleanupError": photo.and_then(|p| app.session.companion_cleanup_error(p)),
             }))
         }
+        "ai.retryMigration" => {
+            state.request_feedback();
+            app.session.defer_companion_retry(true);
+            app.session.retry_companion_migration().map(|done| json!({"complete":done})).map_err(|e| e.to_string())
+        }
+        "ai.historicalImage" => state.displayed_photo(app).ok_or_else(|| "请先选择照片。".into()).and_then(|photo| {
+            state.load(app, photo)?;
+            let conversation = state.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+            let total = conversation.view.as_ref().and_then(|v| v.preview.as_ref()).map(|p| p.total).unwrap_or(0);
+            let index = params
+                .get("index")
+                .and_then(Value::as_u64)
+                .filter(|index| *index < total)
+                .ok_or_else(|| tr("Historical preview is unavailable.").to_owned())?;
+            conversation.preview_cursor = index;
+            let cursor = conversation.view.as_ref().map(|v| v.cursor).unwrap_or_default();
+            state.request_page(app, photo, cursor)?;
+            Ok(json!({"requested":true}))
+        }),
+        "ai.legacyPlan" => state.displayed_photo(app).ok_or_else(|| "请先选择照片。".into()).and_then(|photo| {
+            state.load(app, photo)?;
+            let conversation = state.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+            let header =
+                conversation.prefix.as_ref().filter(|h| h.legacy_plan_count() > 0).ok_or_else(|| tr("Legacy plan is unavailable.").to_owned())?;
+            let total = header.legacy_plan_count();
+            let index = params
+                .get("index")
+                .and_then(Value::as_u64)
+                .filter(|index| *index < total)
+                .ok_or_else(|| tr("Legacy plan is unavailable.").to_owned())?;
+            conversation.legacy_cursor = index;
+            let cursor = conversation.view.as_ref().map(|v| v.cursor).unwrap_or_default();
+            state.request_page(app, photo, cursor)?;
+            Ok(json!({"requested":true}))
+        }),
         "ai.history" => {
             let viewed_photo = if params.get("photo").is_some() { photo } else { state.displayed_photo(app) };
             viewed_photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| {
@@ -2058,6 +2120,8 @@ fn readonly_task_body(app: &mut LightcraftApp, ui: &mut egui::Ui, scope: PhotoSc
 fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
     let mut locate = false;
     let mut revert = None;
+    let mut legacy_navigation = None;
+    let mut preview_navigation = None;
     let controls_top = ui.cursor().top();
     history_controls(app, ui, photo);
     let controls_height = (ui.cursor().top() - controls_top).max(0.0);
@@ -2086,8 +2150,20 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
         area = area.vertical_scroll_offset(offset);
     }
     let scroll = area.show(ui, |ui| {
-        if let Some(conversation) = app.ai.conversations.get(&photo) {
+        if let Some(conversation) = app.ai.conversations.get_mut(&photo) {
             ui.label(display_text(conversation));
+            if let Some(preview) = conversation.view.as_mut().and_then(|v| v.preview.as_mut()) {
+                preview_navigation = historical::show(ui, preview);
+            }
+            if let Some(header) = conversation.prefix.as_ref().filter(|h| h.legacy_plan_count() > 0) {
+                let total = header.legacy_plan_count();
+                if total > 0 {
+                    legacy_navigation =
+                        legacy::show(ui, conversation.view.as_ref().and_then(|v| v.legacy_plan.as_ref()), conversation.legacy_cursor, total);
+                }
+            }
+        }
+        if let Some(conversation) = app.ai.conversations.get(&photo) {
             for card in conversation
                 .view
                 .iter()
@@ -2107,6 +2183,12 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
         }
     });
     composer_widget(ui, "ai:messages", scroll.inner_rect);
+    if let Some(index) = preview_navigation {
+        let _ = app.run("ai.historicalImage", json!({"index":index}));
+    }
+    if let Some(index) = legacy_navigation {
+        let _ = app.run("ai.legacyPlan", json!({"index":index}));
+    }
     let at_bottom = scroll.state.offset.y + scroll.inner_rect.height() >= scroll.content_size.y - 2.0;
     if ready {
         drafts::scroll_position(app, photo, scroll.state.offset.y, at_bottom && final_page);
@@ -2147,7 +2229,21 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
     let editor_ready = app.ai.editor_photo == Some(photo) && app.ai.editors.contains_key(&photo);
     let worker = app.ai.worker_busy(photo);
     let stage = ui.horizontal_wrapped(|ui| {
-        if busy {
+        if app.session.companion_migration_pending() {
+            if app.session.companion_migration_error().is_some() {
+                ui.label(tr("Legacy conversation upgrade paused. Original history is retained."));
+                let retry = ui.add_enabled(!app.session.companion_migration_busy(), egui::Button::new(tr("Retry conversation upgrade")));
+                composer_widget(ui, "button:aiRetryMigration", retry.rect);
+                if !sizing && retry.clicked() {
+                    let _ = app.run("ai.retryMigration", json!({}));
+                    app.ai.defer_local_saves_for_feedback(ui.ctx());
+                    app.session.defer_companion_retry(true);
+                }
+            } else {
+                ui.spinner();
+                ui.label(tr("Upgrading legacy conversation…"));
+            }
+        } else if busy {
             ui.spinner();
             let phase = app
                 .ai
@@ -2247,7 +2343,10 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
             app.ai.conversations.entry(photo).or_default().notice = error;
         }
         ui.horizontal_wrapped(|ui| {
-            let button = ui.add_enabled(!worker, egui::Button::new(tr("Delete Conversation")));
+            let button = ui.add_enabled(
+                !worker && !app.session.companion_migration_pending() && app.session.companion_archive_protected_reason().is_none(),
+                egui::Button::new(tr("Delete Conversation")),
+            );
             composer_widget(ui, "button:aiClear", button.rect);
             if !sizing
                 && button.clicked()

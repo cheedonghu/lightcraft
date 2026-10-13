@@ -2,6 +2,15 @@
 use super::*;
 impl State {
     pub(super) fn load(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
+        let pending = app.session.companion_migration_pending();
+        if self.conversations.get(&photo).is_some_and(|c| c.legacy_readonly && c.prefix.is_none()) {
+            // A pre-stage source view is only a bounded compatibility cache; once
+            // a graph/activation is ready, reload it rather than freezing an empty view.
+            self.conversations.remove(&photo);
+        }
+        if !pending && let Some(conversation) = self.conversations.get_mut(&photo) {
+            conversation.legacy_readonly = false;
+        }
         if let Some(conversation) = self.conversations.get(&photo) {
             let prefix = conversation.prefix.clone();
             let loaded = conversation.view.as_ref().map(|view| view.cursor);
@@ -13,14 +22,26 @@ impl State {
             }
             return Ok(());
         }
-        let mut conversation =
-            Conversation { scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }), ..Default::default() };
-        let header = if app.session.library.is_some() { app.session.companion_photo_header(photo).map_err(|e| e.to_string())? } else { None };
-        let archive = if let Some(header) = header {
-            conversation.prefix = Some(header);
-            app.session.companion_metadata(photo).map_err(|e| e.to_string())?
+        let mut conversation = Conversation {
+            scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }),
+            legacy_readonly: pending,
+            ..Default::default()
+        };
+        let header = if app.session.library.is_some() {
+            match app.session.companion_photo_header(photo).map_err(|e| e.to_string())? {
+                Some(header) => Some(header),
+                None if pending => app.session.companion_legacy_photo_header(photo).map_err(|e| e.to_string())?,
+                None => None,
+            }
         } else {
-            app.session.photo_companion(photo).map_err(|e| e.to_string())?.cloned()
+            None
+        };
+        let archive = if let Some(header) = header {
+            let metadata = app.session.companion_metadata_at(&header).map_err(|e| e.to_string())?;
+            conversation.prefix = Some(header);
+            Some(metadata)
+        } else {
+            app.session.load_companion_conversation(photo).map_err(|e| e.to_string())?
         };
         if let Some(archive) = archive {
             if !matches!(archive.get("schema_version").and_then(Value::as_u64), Some(1 | 2)) {
@@ -137,6 +158,9 @@ impl State {
         let conversation = self.conversations.get(&photo).ok_or("AI 会话不存在。")?;
         let tail = conversation.messages.clone();
         let prefix = conversation.prefix.clone();
+        if prefix.as_ref().is_some_and(|h| !h.history_complete()) {
+            return Err(projection::invalid());
+        }
         let mut projection = projection::HistoryProjection::new(photo);
         if let Some(prefix) = prefix {
             let mut cursor = 0;
@@ -188,6 +212,10 @@ impl State {
             })
             .collect();
         let total = if prefix.record_count > 0 { prefix.record_count } else { prefix.round_count };
+        let position = self.conversations.get(&photo).map(|c| c.preview_cursor).unwrap_or(0);
+        let preview =
+            historical::read(&page, position, |image| app.session.read_companion_historical_preview(photo, image).map_err(|e| e.to_string()));
+        let preview_bytes = preview.as_ref().map_or(0, historical::Preview::bytes);
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
         conversation.view = Some(HistoryView {
             _retention: retention,
@@ -199,7 +227,15 @@ impl State {
             bytes: page.bytes,
             cards: Vec::new(),
             diagnostic: None,
-            cards_bytes: 0,
+            legacy_plan: None,
+            legacy_scan: (prefix.legacy_plan_count() > 0).then(|| {
+                lightcraft_engine::companion::storage::DisplayScan::new(
+                    prefix.clone(),
+                    lightcraft_engine::companion::storage::DisplayRecord::LegacyPlan(conversation.legacy_cursor),
+                )
+            }),
+            preview,
+            cards_bytes: preview_bytes,
             card_cursor: (total > 0 && (!wanted.is_empty() || !owners.is_empty())).then_some(0),
             card_pending: wanted,
             card_owners: owners,

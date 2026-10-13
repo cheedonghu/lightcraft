@@ -123,12 +123,25 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
             return Err(error("fragment offset outside record"));
         }
         let oversized = entry.length > byte_budget.saturating_sub(result.bytes) || cursor.offset > 0;
+        if oversized && entry.chunk_payload.is_none() {
+            if entry.length as u64 > BLOCK {
+                return Err(error("unverified legacy chunk layout; original history retained"));
+            }
+            let complete = range(store, h.photo_id, &entry, 0, entry.length)?;
+            if digest(&complete) != entry.digest {
+                return Err(error("record digest mismatch"));
+            }
+        }
         let text_end = if oversized && let Some([start, end]) = entry.text_range {
             if start > end || end > entry.length as u64 {
                 return Err(error("invalid message text range"));
             }
             cursor.offset = cursor.offset.max(start);
             if cursor.offset >= end {
+                if start == end {
+                    result.items.push(HistoryItem::Fragment { record: cursor.record, offset: start, index: result.fragments.len() });
+                    result.fragments.push(String::new());
+                }
                 cursor.record += 1;
                 cursor.offset = 0;
                 continue;
@@ -156,7 +169,7 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
                 return Err(error("record digest mismatch"));
             }
             result.items.push(HistoryItem::Record { record: cursor.record, index: result.records.len() });
-            result.records.push(serde_json::from_slice(&bytes).map_err(error)?);
+            result.records.push(scan::selected(&bytes)?);
         } else {
             // Keep boundaries on complete UTF-8 scalars; the subsequent fragment resumes
             // at the exact remaining byte. No content or message is discarded.
@@ -201,6 +214,11 @@ pub(super) fn metadata_raw(store: &mut dyn Store, h: &PhotoHeader) -> Result<Val
     serde_json::from_slice(&bytes).map_err(error)
 }
 pub(super) fn metadata(store: &mut dyn Store, h: &PhotoHeader) -> Result<Value> {
+    if h.legacy_migrated {
+        return Ok(
+            json!({"schema_version":2,"checkpoint":null,"legacy_history":true,"legacy_history_complete":h.history_complete(),"metadata_retained":true}),
+        );
+    }
     let mut value = metadata_raw(store, h)?;
     if let Some(checkpoint) = value.get_mut("checkpoint").filter(|v| v.is_object()) {
         let revert: Option<Value> = read(store, &format!("{}/revert.json", base(h.photo_id)), SMALL)?;
@@ -352,6 +370,10 @@ pub(super) fn tail(
         metadata_length: metadata_entry.length as u64,
         metadata_chunk_payload: metadata_entry.chunk_payload,
         record_patch: None,
+        legacy_migrated: false,
+        legacy_history_incomplete: prefix.is_some_and(|h| !h.history_complete()),
+        legacy_round_count: prefix.map_or(0, |h| h.legacy_round_count),
+        legacy_record_count: prefix.map_or(0, |h| h.legacy_record_count),
     };
     write(writer.store, &writer.pending.head.manifest, &manifest)?;
     writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
@@ -367,6 +389,11 @@ impl Session {
     pub fn companion_metadata(&mut self, photo: PhotoId) -> Result<Option<Value>> {
         let Some(h) = self.companion_photo_header(photo)? else { return Ok(None) };
         metadata(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), &h).map(Some)
+    }
+    /// Metadata from an already captured immutable graph, including verified
+    /// read-only legacy graphs before root activation. No full source Value.
+    pub fn companion_metadata_at(&mut self, header: &PhotoHeader) -> Result<Value> {
+        metadata(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header)
     }
     pub fn save_companion_tail(
         &mut self,
@@ -552,11 +579,40 @@ impl HistoryReader {
     pub fn messages(&mut self, cursor: u64, count: usize, max_bytes: usize) -> Result<RecordPage> {
         bounded_messages(self.store.as_mut(), &self.header, cursor, count, max_bytes)
     }
+    /// Complete protocol fields from each captured record. Additive local data
+    /// remains stored and never consumes the service input materialization budget.
+    pub fn protocol_messages(&mut self, cursor: u64, count: usize, max_bytes: usize) -> Result<RecordPage> {
+        if count == 0 || count > PAGE_ITEMS || max_bytes > 32 * 1024 * 1024 {
+            return Err(error("invalid protocol read budget"));
+        }
+        let end = cursor.checked_add(count as u64).ok_or_else(|| error("protocol cursor overflow"))?.min(self.header.message_count);
+        let mut records = Vec::new();
+        let mut bytes = 0usize;
+        for ordinal in cursor..end {
+            let entry = entry(self.store.as_mut(), self.header.photo_id, self.header.message_root.as_ref(), self.header.message_count, ordinal)?;
+            let value = migration::protocol_record(self.store.as_mut(), self.header.photo_id, &entry, max_bytes.saturating_sub(bytes))?;
+            bytes = bytes.checked_add(serialized_length(&value)?).ok_or_else(|| error("protocol size overflow"))?;
+            if bytes > max_bytes {
+                return Err(error("complete history exceeds service read budget; local history retained"));
+            }
+            records.push(value);
+        }
+        Ok(RecordPage { records, next_cursor: (end < self.header.message_count).then_some(end) })
+    }
     pub fn slice(&mut self, cursor: HistoryCursor, bytes: usize) -> Result<HistorySlice> {
         slice(self.store.as_mut(), &self.header, cursor, bytes)
     }
+    /// A selected original reference, with bounded work buffers and no array quota.
+    pub fn original_image_reference(&mut self, record: u64, index: u64) -> Result<(u64, Option<Value>)> {
+        let entry = entry(self.store.as_mut(), self.header.photo_id, self.header.message_root.as_ref(), self.header.message_count, record)?;
+        migration::image_reference(self.store.as_mut(), self.header.photo_id, &entry, index)
+    }
     pub fn preview(&mut self, image: &Value) -> Result<Vec<u8>> {
-        read_preview_reference(self.store.as_mut(), image)
+        if image.get("data").is_some() || image.get("attachment").and_then(Value::as_str).is_some_and(|key| key.starts_with("companion/preview-")) {
+            migration::preview(self.store.as_mut(), self.header.photo_id, image)
+        } else {
+            read_preview_reference(self.store.as_mut(), image)
+        }
     }
 }
 fn bounded_messages(store: &mut dyn Store, header: &PhotoHeader, cursor: u64, budget: usize, max_bytes: usize) -> Result<RecordPage> {
@@ -589,6 +645,12 @@ impl Session {
         }
         let pin = reader_pins::capture(&self.companion_archive.readers, store.as_mut(), header, library.retain_read_lock())?;
         Ok(Some(HistoryReader { store, header: header.clone(), _pin: pin }))
+    }
+    pub fn read_companion_historical_preview(&mut self, photo: PhotoId, image: &Value) -> Result<Vec<u8>> {
+        if self.catalog.photo(photo).is_none() {
+            return Err(error("no such photo"));
+        }
+        migration::preview(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), photo, image)
     }
     pub fn companion_messages_bounded(&mut self, header: &PhotoHeader, cursor: u64, count: usize, bytes: usize) -> Result<RecordPage> {
         bounded_messages(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, cursor, count, bytes)
@@ -985,7 +1047,7 @@ fn display_record(store: &mut dyn Store, photo: PhotoId, entry: &Entry) -> Resul
         if digest(&bytes) != entry.digest {
             return Err(error("round digest mismatch"));
         }
-        return serde_json::from_slice(&bytes).map_err(error);
+        return scan::selected(&bytes);
     }
     let source = RecordReader { store, photo, entry, offset: 0, hash: lightcraft_preview::Hasher128::new(), cached: Vec::new(), cached_start: 0 };
     let (record, source) = projection::read(source)?;
@@ -1063,5 +1125,27 @@ impl HistoryReader {
 impl Session {
     pub fn companion_message_round_id_at(&mut self, header: &PhotoHeader, index: u64) -> Result<Option<String>> {
         message_round_id(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, index)
+    }
+}
+
+fn legacy_entry(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Entry> {
+    if header.legacy_round_count > header.round_count || header.legacy_record_count > header.record_count {
+        return Err(error("legacy provenance exceeds graph"));
+    }
+    if index < header.legacy_round_count {
+        entry(store, header.photo_id, header.round_root.as_ref(), header.round_count, index)
+    } else {
+        let index = index.checked_sub(header.legacy_round_count).ok_or_else(|| error("legacy cursor overflow"))?;
+        if index >= header.legacy_record_count {
+            return Err(error("legacy cursor outside original plans"));
+        }
+        entry(store, header.photo_id, header.record_root.as_ref(), header.record_count, index)
+    }
+}
+impl HistoryReader {
+    /// One original unassociated plan from the immutable retained legacy prefix.
+    pub fn legacy_plan(&mut self, index: u64) -> Result<Value> {
+        let entry = legacy_entry(self.store.as_mut(), &self.header, index)?;
+        display_record(self.store.as_mut(), self.header.photo_id, &entry)
     }
 }

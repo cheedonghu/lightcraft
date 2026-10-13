@@ -212,6 +212,7 @@ struct ReadGate {
     entered: mpsc::SyncSender<()>,
     release: std::sync::Mutex<mpsc::Receiver<()>>,
     used: AtomicBool,
+    armed: AtomicBool,
     reads: std::sync::Mutex<Vec<(String, usize)>>,
 }
 struct GatedFiles {
@@ -221,7 +222,7 @@ struct GatedFiles {
 }
 impl GatedFiles {
     fn observe(&self, name: &str, length: usize) {
-        if !self.background {
+        if !self.background || !self.gate.armed.load(Ordering::Acquire) {
             return;
         }
         self.gate.reads.lock().unwrap().push((name.into(), length));
@@ -289,10 +290,23 @@ fn native_stop_during_preview_read_prevents_old_input_after_reconsent_and_allows
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
         used: AtomicBool::new(false),
+        armed: AtomicBool::new(false),
         reads: std::sync::Mutex::new(Vec::new()),
     });
     let (mut h, requests, events) =
         consent(library.open_with(Box::new(GatedFiles { inner: FsStore::open(&library.dir).unwrap(), gate: gate.clone(), background: false })));
+    // Opening the panel now reads the visible original preview too. Finish that
+    // public view load before arming the actual filesystem pause for Start.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        h.step();
+        if h.app.run("ai.status", json!({})).unwrap()["historyLoading"] == false {
+            break;
+        }
+        assert!(Instant::now() < deadline, "visible history did not finish loading");
+        std::thread::yield_now();
+    }
+    gate.armed.store(true, Ordering::Release);
     let old = h.app.run("ai.start", json!({"prompt":"old cancelled submission"})).unwrap()["localRoundId"].clone();
     entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(requests.try_recv().is_err());

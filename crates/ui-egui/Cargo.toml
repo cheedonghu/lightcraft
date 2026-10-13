@@ -21,6 +21,7 @@ lightcraft-catalog = { workspace = true }
 web-time = { workspace = true }
 lightcraft-engine = { workspace = true }
 lightcraft-preview = { workspace = true }
+lightcraft-codecs = { workspace = true }
 egui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,7 +31,6 @@ log = { workspace = true }
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 lightcraft-denoise = { workspace = true, features = ["runtime"] }
-lightcraft-codecs = { workspace = true }
 lightcraft-faces = { workspace = true }
 lightcraft-merge = { workspace = true }
 

@@ -4,6 +4,8 @@
 //! memory (tests, ephemeral sessions) and lets tests simulate crashes by editing the bytes. A web
 //! host can implement [`Store`] over OPFS.
 
+pub mod source;
+use source::{SourceIdentity, SourceSnapshot};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,6 +26,35 @@ pub trait Store: Send {
     /// return `UnexpectedEof`, and arithmetic overflow returns `InvalidInput`.
     fn read_range(&mut self, _name: &str, _offset: u64, _length: usize) -> io::Result<Vec<u8>> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "range reads are unsupported by this store"))
+    }
+    /// Capture a bounded reader tied to this exact source; changes are errors,
+    /// never mixed reads. Native and memory adapters support it; custom adapters
+    /// must opt in rather than using a whole-file fallback.
+    fn source_snapshot(&mut self, _name: &str) -> io::Result<Option<Box<dyn SourceSnapshot>>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "source snapshots are unsupported by this store"))
+    }
+    /// Stream a verified source into a durable atomic destination. Unlike the
+    /// general write_atomic_with default this has no whole-source fallback.
+    fn copy_source_atomic(&mut self, _name: &str, _source: &mut dyn SourceSnapshot) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "streamed source copying is unsupported by this store"))
+    }
+    /// Replace the original source only while its identity still matches.
+    /// Callers coordinate all ordinary writers across verification/publication.
+    fn replace_source_atomic(&mut self, _name: &str, _expected: &SourceIdentity, _data: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "verified source replacement is unsupported by this store"))
+    }
+    /// Conditional source publication with caller-owned revocable authority.
+    /// Expensive fresh identity proofs may run on an owned worker; adapters
+    /// recheck authority immediately before the atomic publication. Unsupported
+    /// adapters must not weaken this to a pre-check plus an unchecked writer.
+    fn replace_source_atomic_authorized(
+        &mut self,
+        _name: &str,
+        _expected: &SourceIdentity,
+        _data: &[u8],
+        _authorized: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "revocable source publication is unsupported by this store"))
     }
     /// Durably remove a file. Removing a missing file succeeds.
     fn remove(&mut self, _name: &str) -> io::Result<()> {
@@ -64,6 +95,12 @@ pub trait Store: Send {
     /// wrappers must forward both properties, never use a global owner identity.
     fn conservative_retention(&self) -> bool {
         false
+    }
+    /// An owned adapter for potentially large source migrations. Custom stores
+    /// may reuse their background writer; memory migrations do not change the
+    /// journal compaction background preference.
+    fn migration_writer(&self) -> Option<Box<dyn Store>> {
+        self.background_writer()
     }
     /// Another handle on the same files that a worker thread can write `catalog.snap` through
     /// while this one keeps appending to the log (background compaction). `None` (the default):
@@ -129,6 +166,31 @@ impl FsStore {
 }
 
 impl Store for FsStore {
+    fn source_snapshot(&mut self, name: &str) -> io::Result<Option<Box<dyn SourceSnapshot>>> {
+        source::native_snapshot(self.path(name)?)
+    }
+    fn copy_source_atomic(&mut self, name: &str, source: &mut dyn SourceSnapshot) -> io::Result<()> {
+        self.write_atomic_with(name, &mut |writer| source::copy(source, writer)).map(|_| ())
+    }
+    fn replace_source_atomic(&mut self, name: &str, expected: &SourceIdentity, data: &[u8]) -> io::Result<()> {
+        self.replace_source_atomic_authorized(name, expected, data, &|| true)
+    }
+    fn replace_source_atomic_authorized(
+        &mut self,
+        name: &str,
+        expected: &SourceIdentity,
+        data: &[u8],
+        authorized: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        source::authority(authorized)?;
+        let path = self.path(name)?;
+        let mut check = || {
+            source::check_native(&path, expected)?;
+            source::authority(authorized)
+        };
+        crate::safe_file::write_atomic_checked(&path, data, &mut check)?;
+        sync_directory(path.parent().unwrap_or(&self.dir))
+    }
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
         match std::fs::read(self.path(name)?) {
             Ok(b) => Ok(Some(b)),
@@ -373,6 +435,42 @@ impl MemStore {
 }
 
 impl Store for MemStore {
+    fn migration_writer(&self) -> Option<Box<dyn Store>> {
+        Some(Box::new(self.clone()))
+    }
+    fn source_snapshot(&mut self, name: &str) -> io::Result<Option<Box<dyn SourceSnapshot>>> {
+        validate_name(name)?;
+        source::memory_snapshot(self, name)
+    }
+    fn copy_source_atomic(&mut self, name: &str, source: &mut dyn SourceSnapshot) -> io::Result<()> {
+        validate_name(name)?;
+        let mut bytes = Vec::new();
+        source::copy(source, &mut bytes)?;
+        self.set(name, bytes);
+        Ok(())
+    }
+    fn replace_source_atomic(&mut self, name: &str, expected: &SourceIdentity, data: &[u8]) -> io::Result<()> {
+        self.replace_source_atomic_authorized(name, expected, data, &|| true)
+    }
+    fn replace_source_atomic_authorized(
+        &mut self,
+        name: &str,
+        expected: &SourceIdentity,
+        data: &[u8],
+        authorized: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        source::authority(authorized)?;
+        validate_name(name)?;
+        let mut files = self.files.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = files.get(name).ok_or_else(source::changed)?;
+        if source::memory_identity(self, bytes) != *expected {
+            return Err(source::changed());
+        }
+        let replacement = copy_bytes(data)?;
+        source::authority(authorized)?;
+        files.insert(name.to_owned(), replacement);
+        Ok(())
+    }
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
         validate_name(name)?;
         Ok(self.get(name))

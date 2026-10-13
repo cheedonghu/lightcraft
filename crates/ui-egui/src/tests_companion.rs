@@ -36,26 +36,68 @@ fn unopened_conversation_cannot_undo_after_manual_change_away_and_back() {
 }
 
 #[test]
-fn conversation_and_preview_survive_reopen_and_clear_removes_only_its_attachment() {
+fn conversation_and_preview_survive_reopen_and_clear_preserves_the_recoverable_legacy_backup() {
     let dir = std::env::temp_dir().join(format!("lc-companion-archive-{}", std::process::id()));
     let mut session = Session::new().with_fs();
     session.open_library(&dir, true).unwrap();
     let photo = session.catalog.photos().next().unwrap().id;
     session.execute("library.select", &json!({"ids":[photo.0],"active":photo.0})).unwrap();
+    session.execute("develop.set", &json!({"control":"light.exposure","value":0.3})).unwrap();
     let before = session.develop_of(photo).unwrap();
     let name = session.library.as_mut().unwrap().companion_attachment(photo, b"synthetic preview").unwrap();
     assert!(session.library.as_mut().unwrap().read_companion_attachment("../catalog.snap").is_err());
     session.set_photo_companion(photo, Some(json!({"schema_version":1,"messages":[{"role":"user","text":"恢复对话","images":[{"mime_type":"image/jpeg","attachment":name}]}],"rounds":[]}))).unwrap();
     session.close_library().unwrap();
+    let original = std::fs::read(dir.join("companion/state.json")).unwrap();
     session.open_library(&dir, false).unwrap();
-    let mut app = LightcraftApp::new(session, Services::default());
-    let status = app.run("ai.status", json!({})).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while session.companion_migration_pending() && std::time::Instant::now() < deadline {
+        let _ = session.persist();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!session.companion_migration_pending(), "legacy history must activate before testing explicit clear");
+    session.set_companion_editor(photo, lightcraft_engine::companion::EditorState { draft: "未发送草稿".into(), ..Default::default() }).unwrap();
+    let mut h = crate::headless::Headless::new(LightcraftApp::new(session, Services::default()), [1100., 750.], 1.);
+    h.app.ui.settings.gpu = false;
+    h.app.run("ai.open", json!({})).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        h.step();
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["historyLoading"] == false {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "legacy view did not load");
+        std::thread::yield_now();
+    };
     assert!(status["text"].as_str().unwrap().contains("恢复对话"));
-    assert_eq!(app.session.library.as_mut().unwrap().read_companion_attachment(&name).unwrap(), b"synthetic preview");
-    app.run("ai.clear", json!({})).unwrap();
-    assert!(!dir.join(name).exists());
-    assert_eq!(*app.session.develop_of(photo).unwrap(), *before);
-    app.session.close_library().unwrap();
+    assert_eq!(h.app.session.library.as_mut().unwrap().read_companion_attachment(&name).unwrap(), b"synthetic preview");
+    let history_entries = h.app.session.undo.len();
+    h.app.run("ai.clear", json!({})).unwrap();
+    assert_eq!(h.app.session.companion_messages_page(photo, 0, 1).unwrap().records, Vec::<serde_json::Value>::new());
+    assert!(!h.app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().contains("恢复对话"));
+    assert_eq!(*h.app.session.develop_of(photo).unwrap(), *before);
+    assert_eq!(h.app.session.undo.len(), history_entries);
+    assert_eq!(h.app.session.companion_editor(photo).unwrap().draft, "未发送草稿");
+    // The exact recoverable backup still references this original, invalid-JPEG
+    // attachment. Logical deletion must not guess that it is safe to unlink.
+    assert_eq!(std::fs::read(dir.join("companion/state.v1.backup.json")).unwrap(), original);
+    assert_eq!(std::fs::read(dir.join(&name)).unwrap(), b"synthetic preview");
+    // Let the actual bounded retirement worker finish before removing the
+    // temporary library; dropping the UI is not a producer-retirement proof.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        h.step();
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["cleanupPending"] == false && status["historyLoading"] == false {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "actual cleanup did not retire: {status}");
+        std::thread::yield_now();
+    }
+    assert!(h.settle(std::time::Duration::from_secs(10)), "temporary library render/cache producers must finish before cleanup");
+    h.app.session.close_library().unwrap();
+    drop(h);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

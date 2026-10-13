@@ -347,6 +347,12 @@ fn start_refuses_truncated_historical_jpeg_and_keeps_valid_jpeg_usable() {
         );
         let mut session = lightcraft_engine::Session::new();
         session.open_library_in(stores(), false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.companion_migration_pending() && Instant::now() < deadline {
+            let _ = session.persist();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!session.companion_migration_pending(), "migration must finish before testing image-specific admission");
         let mut app = LightcraftApp::new(session, crate::Services::default());
         let (connection, requests, _events) = network::test_connection();
         app.ai.generation = app.session.library_generation();
@@ -361,7 +367,16 @@ fn start_refuses_truncated_historical_jpeg_and_keeps_valid_jpeg_usable() {
             let error = result.unwrap_err();
             assert!(error.contains("history is incomplete or invalid"), "{error}");
             assert!(requests.try_recv().is_err(), "corrupt JPEG must not create/upload a round");
-            assert_eq!(h.app.session.load_companion_conversation(photo).unwrap().unwrap(), saved, "complete local history is still readable");
+            assert_eq!(
+                h.app.session.companion_messages_page(photo, 0, 1).unwrap().records,
+                saved["messages"].as_array().unwrap().clone(),
+                "complete original messages remain readable"
+            );
+            assert_eq!(
+                files.get("companion/state.v1.backup.json"),
+                Some(serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():saved}})).unwrap()),
+                "the exact original archive remains recoverable"
+            );
             h.app.run("develop.set", json!({"control":"light.exposure","value":0.7})).unwrap();
             assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.7);
         } else {
@@ -401,6 +416,12 @@ fn start_refuses_service_unsupported_lossless_jpeg_and_keeps_normal_jpeg_usable(
         );
         let mut session = lightcraft_engine::Session::new();
         session.open_library_in(stores(), false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.companion_migration_pending() && Instant::now() < deadline {
+            let _ = session.persist();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!session.companion_migration_pending(), "migration must finish before testing image-specific admission");
         let mut app = LightcraftApp::new(session, crate::Services::default());
         let (connection, requests, _events) = network::test_connection();
         app.ai.generation = app.session.library_generation();
@@ -415,7 +436,16 @@ fn start_refuses_service_unsupported_lossless_jpeg_and_keeps_normal_jpeg_usable(
             let error = result.unwrap_err();
             assert!(error.contains("history is incomplete or invalid"), "{error}");
             assert!(requests.try_recv().is_err(), "corrupt JPEG must not create/upload a round");
-            assert_eq!(h.app.session.load_companion_conversation(photo).unwrap().unwrap(), saved, "complete local history is still readable");
+            assert_eq!(
+                h.app.session.companion_messages_page(photo, 0, 1).unwrap().records,
+                saved["messages"].as_array().unwrap().clone(),
+                "complete original messages remain readable"
+            );
+            assert_eq!(
+                files.get("companion/state.v1.backup.json"),
+                Some(serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():saved}})).unwrap()),
+                "the exact original archive remains recoverable"
+            );
             h.app.run("develop.set", json!({"control":"light.exposure","value":0.7})).unwrap();
             assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.7);
         } else {
