@@ -1,6 +1,6 @@
 //! Bounded native history I/O runs outside the frame and owns a captured graph.
 use super::*;
-use lightcraft_engine::companion::storage::{HistoryCursor, HistoryReader, HistorySlice};
+use lightcraft_engine::companion::storage::{DisplayRecord, DisplayScan, HistoryCursor, HistoryReader, HistorySlice};
 #[derive(Clone)]
 struct PageRequest {
     id: u64,
@@ -13,7 +13,7 @@ struct ReadMessage {
     scope: PhotoScope,
     transaction: String,
     cursor: HistoryCursor,
-    result: Result<HistorySlice, String>,
+    result: Result<(HistorySlice, Vec<card::Card>, Option<String>), String>,
 }
 pub(super) struct Paging {
     tx: mpsc::SyncSender<ReadMessage>,
@@ -23,11 +23,21 @@ pub(super) struct Paging {
     desired: Option<PageRequest>,
     pending: Option<PageRequest>,
     sequence: u64,
+    completed: u64,
 }
 impl Default for Paging {
     fn default() -> Self {
         let (tx, rx) = mpsc::sync_channel(2);
-        Self { tx, rx, alive: Arc::new(AtomicBool::new(false)), cancel: Arc::new(AtomicBool::new(false)), desired: None, pending: None, sequence: 0 }
+        Self {
+            tx,
+            rx,
+            alive: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            desired: None,
+            pending: None,
+            sequence: 0,
+            completed: 0,
+        }
     }
 }
 impl Drop for Paging {
@@ -38,6 +48,9 @@ impl Drop for Paging {
 impl Paging {
     pub(super) fn busy(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+    pub(super) fn awaiting_page(&self, photo: PhotoId) -> bool {
+        self.desired.as_ref().is_some_and(|request| request.scope.photo == photo && self.completed != request.id)
     }
     pub(super) fn has_request(&self, photo: PhotoId, transaction: &str) -> bool {
         self.desired.as_ref().is_some_and(|r| r.scope.photo == photo && r.header.transaction_id == transaction)
@@ -60,8 +73,12 @@ impl State {
             if conversation.scope != Some(message.scope) || conversation.prefix.as_ref().is_none_or(|h| h.transaction_id != message.transaction) {
                 continue;
             }
+            self.paging.completed = message.request;
             match message.result {
-                Ok(page) => {
+                Ok((page, cards, notice)) => {
+                    if let Some(notice) = notice {
+                        conversation.notice = notice;
+                    }
                     conversation.view = Some(HistoryView {
                         items: page.items,
                         cursor: message.cursor,
@@ -69,6 +86,15 @@ impl State {
                         messages: page.records,
                         fragments: page.fragments,
                         bytes: page.bytes,
+                        cards_bytes: cards
+                            .iter()
+                            .map(|c| serde_json::to_vec(c).map_or(usize::MAX, |bytes| bytes.len()))
+                            .fold(0, usize::saturating_add),
+                        cards,
+                        card_cursor: None,
+                        card_pending: BTreeSet::new(),
+                        card_owners: VecDeque::new(),
+                        card_scan: None,
                     });
                     self.accept_page(app, message.scope.photo, message.cursor);
                 }
@@ -81,7 +107,61 @@ impl State {
                         messages: Vec::new(),
                         fragments: Vec::new(),
                         bytes: 0,
+                        cards: Vec::new(),
+                        cards_bytes: 0,
+                        card_cursor: None,
+                        card_pending: BTreeSet::new(),
+                        card_owners: VecDeque::new(),
+                        card_scan: None,
                     });
+                }
+            }
+        }
+        // One resumable record step per frame, retaining verified graph identity.
+        if let Some(photo) = app.session.active()
+            && let Some(conversation) = self.conversations.get_mut(&photo)
+            && let Some(header) = conversation.prefix.as_ref()
+            && let Some(view) = conversation.view.as_mut()
+            && let Some(cursor) = view.card_cursor
+        {
+            if view.card_scan.is_none() {
+                let target = view.card_owners.front().copied().map(DisplayRecord::Message).unwrap_or(DisplayRecord::Round(cursor));
+                view.card_scan = Some(DisplayScan::new(header.clone(), target));
+            }
+            if let Some(scan) = view.card_scan.as_mut() {
+                match app.session.companion_display_step(scan) {
+                    Ok(Some(record)) => {
+                        match scan.target() {
+                            DisplayRecord::Message(_) => {
+                                view.card_owners.pop_front();
+                                if let Some(id) = record["local_round_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 128) {
+                                    view.card_pending.insert(id.to_owned());
+                                }
+                            }
+                            DisplayRecord::Round(index) => {
+                                let total = if header.record_count > 0 { header.record_count } else { header.round_count };
+                                view.card_cursor = (index + 1 < total).then_some(index + 1);
+                                if record["local_round_id"].as_str().is_some_and(|id| view.card_pending.remove(id))
+                                    && let Some(card) = card::from_record(&record, None)
+                                    && !view.cards.iter().any(|c| c.local_round_id == card.local_round_id)
+                                {
+                                    view.cards_bytes =
+                                        view.cards_bytes.saturating_add(serde_json::to_vec(&card).map_or(usize::MAX, |bytes| bytes.len()));
+                                    view.cards.push(card);
+                                }
+                            }
+                        }
+                        view.card_scan = None;
+                        if view.card_owners.is_empty() && view.card_pending.is_empty() {
+                            view.card_cursor = None;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        conversation.notice = error.to_string();
+                        view.card_cursor = None;
+                        view.card_scan = None;
+                    }
                 }
             }
         }
@@ -95,6 +175,7 @@ impl State {
             && let Err(error) = self.launch_page(app, request.clone())
             && let Some(c) = self.conversations.get_mut(&request.scope.photo)
         {
+            self.paging.completed = request.id;
             c.notice = error;
         }
     }
@@ -119,7 +200,12 @@ impl State {
             return Ok(());
         }
         self.paging.pending = None;
-        self.launch_page(app, request)
+        let id = request.id;
+        let result = self.launch_page(app, request);
+        if result.is_err() {
+            self.paging.completed = id;
+        }
+        result
     }
     fn launch_page(&mut self, app: &mut LightcraftApp, request: PageRequest) -> Result<(), String> {
         // The preceding reader has retired. Drain its obsolete completions before
@@ -138,7 +224,49 @@ impl State {
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
-                    let result = reader.slice(request.cursor, 256 * 1024).map_err(|e| e.to_string());
+                    let result = reader.slice(request.cursor, 256 * 1024).map_err(|e| e.to_string()).map(|page| {
+                        let mut cursor = 0;
+                        let mut cards = Vec::new();
+                        let mut notice = None;
+                        // Exact recorded ids, never inferred from neighbouring rounds.
+                        let mut wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
+                        for item in &page.items {
+                            if cancel.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            if let lightcraft_engine::companion::storage::HistoryItem::Fragment { record, .. } = item {
+                                match reader.message_round_id(*record) {
+                                    Ok(Some(id)) => {
+                                        wanted.insert(id);
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => notice = Some(error.to_string()),
+                                }
+                            }
+                        }
+                        while !wanted.is_empty() && !cancel.load(Ordering::Relaxed) {
+                            let rounds = match reader.rounds_display(cursor, 32) {
+                                Ok(rounds) => rounds,
+                                Err(error) => {
+                                    notice = Some(error.to_string());
+                                    break;
+                                }
+                            };
+                            for record in rounds.records {
+                                if record["local_round_id"].as_str().is_some_and(|id| wanted.remove(id))
+                                    && let Some(card) = card::from_record(&record, None)
+                                {
+                                    cards.push(card);
+                                }
+                            }
+                            if wanted.is_empty() {
+                                break;
+                            }
+                            let Some(next) = rounds.next_cursor else { break };
+                            cursor = next;
+                        }
+                        (page, cards, notice)
+                    });
                     if !cancel.load(Ordering::Relaxed) {
                         let _ = tx.try_send(ReadMessage {
                             request: request.id,
@@ -151,7 +279,9 @@ impl State {
                 })
                 .map_err(|e| e.to_string())?;
         } else {
-            self.read_page(app, request.scope.photo, request.cursor)?;
+            let result = self.read_page(app, request.scope.photo, request.cursor);
+            self.paging.completed = request.id;
+            result?;
         }
         Ok(())
     }

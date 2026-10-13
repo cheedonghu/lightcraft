@@ -13,7 +13,7 @@ const PAGE_ITEMS: usize = 128;
 const PACK_ITEMS: usize = 64;
 mod pagination;
 use pagination::load_index;
-pub use pagination::{HistoryCursor, HistoryItem, HistoryReader, HistorySlice, RoundSearch, record_size};
+pub use pagination::{DisplayRecord, DisplayScan, HistoryCursor, HistoryItem, HistoryReader, HistorySlice, RoundSearch, record_size};
 pub(crate) use pagination::{TailUpdate, persist_tail};
 
 const FORMAT: &str = "lightcraft-companion";
