@@ -13,6 +13,7 @@ impl State {
             }
             return Ok(());
         }
+        let _ = app.session.prepare_companion_revert(photo);
         let mut conversation =
             Conversation { scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }), ..Default::default() };
         let header = if app.session.library.is_some() { app.session.companion_photo_header(photo).map_err(|e| e.to_string())? } else { None };

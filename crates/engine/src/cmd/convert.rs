@@ -67,6 +67,27 @@ fn convert(s: &mut Session, p: &Value) -> Result<Value> {
         .map(|ph| Op::Relink { id: ph.id, file_name: ph.file_name.clone(), source: ph.source.clone(), format: None })
         .collect();
     s.authorize_mutation(&Op::Batch { ops: checks })?;
+    let converting: std::collections::BTreeSet<_> = ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            s.catalog.photo(*id).is_some_and(|ph| {
+                matches!(ph.source, Source::File { .. })
+                    && ph.kind == MediaKind::Raw
+                    && !ph.format.eq_ignore_ascii_case("DNG")
+                    && ph.copy_of.is_none()
+            })
+        })
+        .collect();
+    let affected = s
+        .catalog
+        .photos()
+        .filter(|ph| converting.contains(&ph.id) || ph.copy_of.is_some_and(|id| converting.contains(&id)))
+        .map(|ph| ph.id)
+        .collect();
+    // Relink follows creation of the DNG, so its ordinary operation gate is
+    // too late to protect the first file effect of this complete batch.
+    s.invalidate_companion_reverts_before(&affected)?;
     let mut ops = Vec::new();
     let mut converted = Vec::new();
     let mut skipped = Vec::new();

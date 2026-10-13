@@ -370,6 +370,7 @@ impl Session {
         // what was learned about the old library's faces is saved, and none of it carries over (photo ids are per library)
         #[cfg(not(target_arch = "wasm32"))]
         self.faces.library_changed();
+        let (load_fenced, uncertain_load) = crate::companion::revert_guard::begin_load(files.as_mut())?;
         crate::companion::archive::discard_legacy_ops(catalog.as_mut())?;
         let (mut journal, mut catalog, report) = Journal::open(catalog)?;
         self.companion_archive = crate::companion::archive::Archive::load(files.as_mut(), &dir, on_disk);
@@ -480,6 +481,20 @@ impl Session {
             blocked: settings.blocked,
             lock: lock.take(),
         });
+        self.mutation_guard = Default::default();
+        self.mutation_guard.loaded_seq = self.library.as_ref().map(|l| l.journal.seq()).unwrap_or(0);
+        self.mutation_guard.clean_load = !uncertain_load
+            && self.library.as_ref().is_some_and(|l| {
+                !l.report.created
+                    && l.report.failed == 0
+                    && l.report.torn_bytes == 0
+                    && l.report.torn_fragments == 0
+                    && l.report.damaged.is_none()
+                    && l.report.upgraded_from.is_none()
+            });
+        self.mutation_guard.load_fenced = load_fenced;
+        self.mutation_guard.retire_load = load_fenced && !self.mutation_guard.clean_load;
+        self.finish_companion_load()?;
         // forget untouched Local records of folders not browsed for a while (journaled at once)
         if self.forget_local_days > 0 {
             let plan = self.forget_local(false, None);
@@ -511,12 +526,12 @@ impl Session {
     /// Called after every top-level command; cheap when nothing changed. Fails (with
     /// [`EngineError::NotSaved`]) only when the queued ops couldn't be written; they stay queued.
     pub fn persist(&mut self) -> Result<()> {
-        self.persist_inner(false)
+        self.persist_inner(false, true)
     }
     pub(crate) fn persist_automatic(&mut self) -> Result<()> {
-        self.persist_inner(self.companion_retry_deferred)
+        self.persist_inner(self.companion_retry_deferred, true)
     }
-    fn persist_inner(&mut self, defer_companion: bool) -> Result<()> {
+    fn persist_inner(&mut self, defer_companion: bool, seal_reverts: bool) -> Result<()> {
         let Some(lib) = self.library.as_mut() else { return Ok(()) };
         if !self.pending_log.is_empty() {
             if let Err(e) = lib.journal.append(&self.pending_log) {
@@ -556,14 +571,23 @@ impl Session {
                 lib.presets_written = presets;
             }
         }
-        if defer_companion { Ok(()) } else { self.flush_companion() }
+        if defer_companion {
+            Ok(())
+        } else {
+            self.finish_companion_load()?;
+            self.flush_companion()?;
+            if seal_reverts { self.seal_companion_reverts() } else { Ok(()) }
+        }
     }
 
     /// Persist if commands left ops pending (cheap; frontends call it once per frame for state
     /// changed outside [`Session::execute`]).
     pub fn persist_if_dirty(&mut self) {
         let backing_off = self.library.as_ref().and_then(|l| l.retry_at).is_some_and(|t| web_time::Instant::now() < t);
-        if self.library.is_some() && (!self.pending_log.is_empty() || self.companion_archive.needs_retry()) && !backing_off {
+        if self.library.is_some()
+            && (!self.pending_log.is_empty() || self.companion_archive.needs_retry() || self.mutation_guard.load_fenced)
+            && !backing_off
+        {
             let _ = self.persist_automatic();
         } else if let Some(lib) = self.library.as_mut() {
             poll_compaction(lib);
@@ -586,13 +610,16 @@ impl Session {
     ///
     /// The snapshot is written even when appending the queued ops fails: it is a fresh file
     /// holding everything in memory, so it saves those ops too (the log handle may be the only
-    /// thing that's broken). Fails only if nothing could be saved; the ops then stay queued.
+    /// thing that's broken). Unsaved ops stay queued if neither write succeeds.
+    /// Returns companion/final-snapshot errors too; callers must not report a completed
+    /// close until the final snapshot, companion flush/seal and fence retirement succeed.
     pub fn close_library(&mut self) -> Result<()> {
         if self.library.is_none() {
             return Ok(());
         }
-        let _ = self.end_interaction();
-        let persisted = self.persist();
+        self.end_interaction()?;
+        self.begin_companion_close()?;
+        let persisted = self.persist_inner(false, false);
         self.save_view();
         let unlogged = if persisted.is_err() { self.pending_log.len() as u64 } else { 0 };
         let Some(lib) = self.library.as_mut() else { return Ok(()) };
@@ -613,7 +640,14 @@ impl Session {
             (_, Err(s)) => Err(s.into()),
         };
         result?;
+        if let Some(lib) = self.library.as_mut() {
+            lib.last_error = None;
+        }
+        self.finish_companion_load()?;
         self.flush_companion()?;
+        self.seal_companion_reverts()?;
+        self.flush_companion()?;
+        self.finish_companion_close()?;
         self.library_identity = std::sync::Arc::new(());
         Ok(())
     }

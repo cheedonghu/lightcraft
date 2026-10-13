@@ -386,10 +386,12 @@ impl Session {
                 .and_then(|_| self.companion_photo_header(photo)?.ok_or_else(|| error("committed header missing")));
         match result {
             Ok(header) => {
+                self.capture_companion_revert_record(photo, header.conversation_epoch, prefix.map(|p| p.record_count).unwrap_or(0), records);
                 self.companion_archive.tails.remove(&photo);
                 if self.companion_archive.tails.is_empty()
                     && self.companion_archive.dirty_photos.is_empty()
                     && self.companion_archive.revert_dirty.is_empty()
+                    && self.companion_archive.certificate_dirty.is_empty()
                     && self.companion_archive.receipts.is_empty()
                 {
                     self.companion_archive.error = None;
@@ -531,6 +533,36 @@ pub(super) fn verify_record(store: &mut dyn Store, photo: PhotoId, entry: &Entry
         return Err(error("record digest mismatch"));
     }
     Ok(())
+}
+
+/// Only the frozen effect is materialized; unrelated diagnostic/message fields
+/// are streamed and discarded. The complete logical record still verifies.
+#[derive(Deserialize)]
+pub(crate) struct RevertRecord {
+    pub local_round_id: String,
+    pub original: lightcraft_develop::DevelopSettings,
+    pub recent_complete_result: lightcraft_develop::DevelopSettings,
+}
+pub(crate) fn revert_record(store: &mut dyn Store, header: &PhotoHeader, ordinal: u64) -> Result<RevertRecord> {
+    let entry = entry(store, header.photo_id, header.record_root.as_ref(), header.record_count, ordinal)?;
+    let reader = RecordReader {
+        store,
+        photo: header.photo_id,
+        entry: &entry,
+        offset: 0,
+        hash: lightcraft_preview::Hasher128::new(),
+        cached: Vec::new(),
+        cached_start: 0,
+    };
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader);
+    let mut decoder = serde_json::Deserializer::from_reader(&mut reader);
+    let record = RevertRecord::deserialize(&mut decoder).map_err(error)?;
+    decoder.end().map_err(error)?;
+    let reader = reader.into_inner();
+    if reader.offset != entry.length as u64 || reader.hash.finish().to_string() != entry.digest {
+        return Err(error("record digest mismatch"));
+    }
+    Ok(record)
 }
 
 /// Read-only worker view of a captured immutable graph. It owns at most one

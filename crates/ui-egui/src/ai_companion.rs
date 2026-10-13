@@ -84,6 +84,7 @@ pub struct State {
     paging: paging::Paging,
     conversations: BTreeMap<PhotoId, Conversation>,
     pending_local_saves: BTreeSet<PhotoId>,
+    save_retry_feedback: BTreeMap<PhotoId, &'static str>,
     local_save_retry_at: Option<Instant>,
     local_save_after_frame: Option<u64>,
     feedback_pending: bool,
@@ -120,6 +121,7 @@ impl Default for State {
             paging: paging::Paging::default(),
             conversations: BTreeMap::new(),
             pending_local_saves: BTreeSet::new(),
+            save_retry_feedback: BTreeMap::new(),
             local_save_retry_at: None,
             local_save_after_frame: None,
             feedback_pending: false,
@@ -1163,6 +1165,7 @@ impl State {
             self.prompt.clear();
             self.completed.clear();
             self.pending_local_saves.clear();
+            self.save_retry_feedback.clear();
             self.local_save_retry_at = None;
             self.local_save_after_frame = None;
             self.feedback_pending = false;
@@ -1687,6 +1690,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         state.prompt.clear();
         state.completed.clear();
         state.pending_local_saves.clear();
+        state.save_retry_feedback.clear();
         state.local_save_retry_at = None;
         state.local_save_after_frame = None;
         state.feedback_pending = false;
@@ -1738,6 +1742,36 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             state.stop(p)?;
             Ok(Value::Null)
         }),
+        "ai.retrySave" => (|| {
+            if app.session.library.is_none()
+                || params.get("library_generation").is_some_and(|value| value.as_u64() != Some(app.session.library_generation()))
+            {
+                return Err(tr("This save request belongs to another or closed library.").into());
+            }
+            if state.readonly_task.is_some_and(|scope| scope.library_generation != app.session.library_generation()) {
+                return Err(tr("This AI task belongs to a closed library.").into());
+            }
+            let viewed_photo = state.displayed_photo(app);
+            if params.get("photo").is_some_and(|value| value.as_u64().map(PhotoId) != viewed_photo) {
+                return Err(tr("Choose the displayed photo to retry saving.").into());
+            }
+            // Storage-only recovery. Do not poll jobs, reconnect, confirm a
+            // backend receipt, end an interaction, or replay a rejected edit.
+            state.stage_editors(app)?;
+            state.flush_local_saves(app)?;
+            app.session.persist().map_err(|e| tr(&e.to_string()).to_owned())?;
+            if viewed_photo.is_some_and(|photo| app.session.companion_photo_unsaved(photo) || state.pending_local_saves.contains(&photo)) {
+                return Err(tr("Saving is still pending. Release the current gesture, then retry saving.").into());
+            }
+            state.local_save_retry_at = None;
+            if let Some(photo) = viewed_photo {
+                let conversation = state.conversations.entry(photo).or_default();
+                conversation.notice = tr("Saved. Retry the edit explicitly when ready.").into();
+                conversation.storage_notice = false;
+                state.save_retry_feedback.remove(&photo);
+            }
+            Ok(json!({"saved":true}))
+        })(),
         "ai.status" => {
             let viewed_photo = if params.get("photo").is_some() { photo } else { state.displayed_photo(app) };
             if let Some(photo) = viewed_photo
@@ -1770,7 +1804,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().chain(c.records.iter().filter_map(|r|card::from_record(r,None))).map(|card| present_card(app,&state,viewed_photo.unwrap_or(PhotoId(0)),card)).collect::<Vec<_>>()).unwrap_or_default(),
                 "historyLoading": state.paging.busy() || viewed_photo.is_some_and(|photo| state.paging.awaiting_page(photo)) || conversation.and_then(|c| c.view.as_ref()).is_some_and(|v|v.card_cursor.is_some()),
                 "activePhotos": state.jobs.keys().map(|p| p.0).collect::<Vec<_>>(),
-                "saveState": photo.map(|p| if app.session.companion_photo_unsaved(p) || state.pending_local_saves.contains(&p) { "unsaved" } else { "saved" }),
+                "saveState": viewed_photo.map(|p| if app.session.companion_photo_unsaved(p) || state.pending_local_saves.contains(&p) { "unsaved" } else { "saved" }),
                 "cleanupPending": photo.is_some_and(|p| app.session.companion_photo_cleanup_pending(p)),
                 "cleanupError": photo.and_then(|p| app.session.companion_cleanup_error(p)),
             }))
@@ -1826,7 +1860,7 @@ fn present_card(app: &LightcraftApp, state: &State, photo: PhotoId, card: card::
         && card.photo == Some(photo)
         && !state.jobs.contains_key(&photo)
         && !state.worker_busy(photo)
-        && local.as_ref().is_some_and(|round| app.session.verify_round_revert(photo, round).is_ok());
+        && outcome == RoundRevertState::Eligible;
     card
 }
 
@@ -2052,8 +2086,43 @@ fn readonly_task_body(app: &mut LightcraftApp, ui: &mut egui::Ui, scope: PhotoSc
             ui.ctx().copy_text(trace);
         }
     }
+    save_recovery(app, ui, scope.photo);
     let height = if compact { 240.0 } else { ui.available_height().max(0.0) };
     message_area(app, ui, scope.photo, height);
+}
+fn save_recovery(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
+    let sizing = ui.is_sizing_pass();
+    let protection_error = app.session.companion_revert_save_error(photo);
+    // Ordinary dirty drafts and queued saves are not storage failures.
+    let unsaved = protection_error.is_some()
+        || app.session.unsaved().is_some()
+        || app.ai.local_save_retry_at.is_some()
+        || app.ai.conversations.get(&photo).is_some_and(|c| c.storage_notice);
+    let cause = protection_error.unwrap_or("Local saving needs attention. Photo changes are kept.");
+    // A failure arriving between press and release must not move the controls
+    // under that pointer. Existing recovery geometry stays until acknowledgment.
+    if unsaved && !app.ai.save_retry_feedback.contains_key(&photo) && ui.input(|input| input.pointer.any_down() || input.pointer.any_released()) {
+        ui.ctx().request_repaint();
+        return;
+    }
+    if unsaved && !sizing {
+        app.ai.save_retry_feedback.entry(photo).or_insert(cause);
+    }
+    if unsaved || app.ai.save_retry_feedback.contains_key(&photo) {
+        // Retain the original cause and geometry until acknowledgment. An
+        // automatic save between pointer press/release must not move the button.
+        ui.label(tr(app.ai.save_retry_feedback.get(&photo).copied().unwrap_or(cause)));
+        let retry = ui.button(tr("Retry Saving"));
+        composer_widget(ui, "button:aiRetrySave", retry.rect);
+        if !sizing
+            && retry.clicked()
+            && let Err(error) = app.run("ai.retrySave", json!({"photo":photo.0,"library_generation":app.session.library_generation()}))
+        {
+            app.ai.conversations.entry(photo).or_default().notice = error;
+        }
+    } else if app.ai.conversations.get(&photo).is_some_and(|c| c.notice == tr("Saved. Retry the edit explicitly when ready.")) {
+        ui.label(tr("Saved. Retry the edit explicitly when ready."));
+    }
 }
 fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
     let mut locate = false;
@@ -2177,6 +2246,7 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
         }
     });
     composer_widget(ui, "ai:stage", stage.response.rect);
+    save_recovery(app, ui, photo);
     if compact {
         consent_control(app, ui, photo);
     }

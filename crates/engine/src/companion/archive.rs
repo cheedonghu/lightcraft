@@ -34,6 +34,7 @@ pub(crate) struct Archive {
     pub(super) readers: std::sync::Arc<super::storage::reader_pins::Pins>,
     pub(super) dirty_photos: BTreeSet<PhotoId>,
     pub(super) revert_dirty: BTreeSet<PhotoId>,
+    pub(super) certificate_dirty: BTreeSet<PhotoId>,
     dirty: bool,
     pub(super) blocked: Option<String>,
     pub(super) error: Option<String>,
@@ -97,25 +98,17 @@ impl Archive {
             }
         }
     }
-    pub(crate) fn invalidate_storage(&mut self, library: &mut crate::library::Library, ids: &BTreeSet<PhotoId>) {
-        if !self.v2 {
-            return;
-        }
-        self.revert_dirty.extend(ids.iter().copied());
-        match super::storage::invalidate_revert(library.files.as_mut(), &self.revert_dirty) {
-            Ok(()) => {
-                self.revert_dirty.clear();
-            }
-            Err(e) => {
-                self.error = Some(e.to_string());
-            }
-        }
+    pub(super) fn certificate_failed(&mut self, photo: PhotoId, reason: String) {
+        self.certificate_dirty.insert(photo);
+        self.error = Some(reason);
+        self.retry_at = Some(web_time::Instant::now() + std::time::Duration::from_secs(2));
     }
     pub(crate) fn needs_retry(&self) -> bool {
         let data = self.dirty
             || !self.tails.is_empty()
             || !self.dirty_photos.is_empty()
             || !self.revert_dirty.is_empty()
+            || !self.certificate_dirty.is_empty()
             || !self.receipts.is_empty()
             || self.editors.dirty();
         (data && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t))
@@ -183,13 +176,24 @@ impl Archive {
         self.error
             .as_deref()
             .filter(|_| {
-                self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() || !self.receipts.is_empty()
+                self.dirty
+                    || !self.tails.is_empty()
+                    || !self.dirty_photos.is_empty()
+                    || !self.revert_dirty.is_empty()
+                    || !self.certificate_dirty.is_empty()
+                    || !self.receipts.is_empty()
             })
             .or_else(|| self.editors.unsaved())
     }
     fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {
         if let Some(e) = &self.blocked {
-            if self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() || !self.receipts.is_empty() {
+            if self.dirty
+                || !self.tails.is_empty()
+                || !self.dirty_photos.is_empty()
+                || !self.revert_dirty.is_empty()
+                || !self.certificate_dirty.is_empty()
+                || !self.receipts.is_empty()
+            {
                 return Err(error(e));
             }
             return Ok(());
@@ -342,6 +346,43 @@ impl Session {
         self.flush_companion()
     }
     pub(crate) fn flush_companion(&mut self) -> Result<()> {
+        let locators: Vec<_> = self
+            .mutation_guard
+            .reverts
+            .values()
+            .filter(|p| p.eligible && p.record.is_none())
+            .filter_map(|proof| {
+                let (records, start, epoch) = if let Some(tail) = self.companion_archive.tails.get(&proof.photo) {
+                    (
+                        tail.records.as_slice(),
+                        tail.prefix.as_ref().map(|h| h.record_count).unwrap_or(0),
+                        tail.prefix.as_ref().map(|h| h.conversation_epoch),
+                    )
+                } else {
+                    (self.companion_archive.photos.get(&proof.photo)?.get("round_records")?.as_array()?.as_slice(), 0, None)
+                };
+                let index = records.iter().position(|r| {
+                    r["local_round_id"] == proof.round.as_str()
+                        && r["original"] == json!(proof.original)
+                        && r["recent_complete_result"] == json!(proof.expected)
+                })?;
+                Some((proof.photo, start.checked_add(index as u64)?, epoch))
+            })
+            .collect();
+        for (photo, ordinal, epoch) in locators {
+            let epoch = match (epoch, self.library.as_mut()) {
+                (Some(epoch), _) => Some(epoch),
+                (None, Some(lib)) => super::storage::stored_epoch(lib.files.as_mut(), photo).ok(),
+                _ => None,
+            };
+            if let Some(epoch) = epoch
+                && let Some(proof) = self.mutation_guard.reverts.get_mut(&photo)
+            {
+                // A locator for an existing trusted publication is not authority.
+                // Sealing still requires saved data and validates that exact record.
+                std::sync::Arc::make_mut(proof).record = Some((epoch, ordinal));
+            }
+        }
         match self.library.as_mut() {
             Some(lib) => {
                 let editor_dirty = self.companion_archive.editors.dirty();

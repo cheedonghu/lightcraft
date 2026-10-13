@@ -1,4 +1,7 @@
 {
+  "Choose the displayed photo to retry saving.": "请选择当前显示的照片重试保存。",
+  "This save request belongs to another or closed library.": "此保存请求属于其他图库或已关闭的图库。",
+  "Saving is still pending. Release the current gesture, then retry saving.": "保存仍未完成。请先松开当前手势，再重试保存。",
   "  (library default)": "  （图库默认值）",
   " (inverted)": " （已反相）",
   " · best of its burst": " · 连拍中的最佳照片",
@@ -2183,5 +2186,12 @@
   "This round was reverted. The conversation was kept.": "已撤回本轮，保留对话。",
   "This round's edits were reverted. The photo was restored to its round starting state.": "本轮修改已撤回，照片已恢复到本轮起点。",
   "Revert unavailable; use ordinary History.": "无法撤回本轮，请使用普通历史恢复。",
-  "Choose a valid photo to revert.": "请选择有效照片以撤回本轮。"
+  "Choose a valid photo to revert.": "请选择有效照片以撤回本轮。",
+  "Retry Saving": "重试保存",
+  "Saved. Retry the edit explicitly when ready.": "已保存。准备好后请明确重试编辑。",
+  "Local saving needs attention. Photo changes are kept.": "本地保存需要处理，照片修改已保留。",
+  "The revert protection record could not be saved. This edit was not applied; check storage and retry.": "无法保存撤回保护记录，本次编辑未执行。请检查存储后重试。",
+  "This gesture was not applied. Release it, then retry the edit explicitly.": "本次手势未执行。请先松开，再明确重试编辑。",
+  "The original source could not be verified or has changed. Use ordinary History; the current photo was kept.": "无法验证原始源文件，或源文件已变化。请使用普通历史记录，当前照片已保留。",
+  "The AI result is kept, but its revert certificate was not saved. Retry saving.": "AI 结果已保留，但撤回证书未保存。请重试保存。"
 }

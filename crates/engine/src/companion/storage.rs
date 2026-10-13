@@ -17,7 +17,7 @@ mod recovery;
 mod retirement;
 use pagination::load_index;
 pub use pagination::{DisplayRecord, DisplayScan, HistoryCursor, HistoryItem, HistoryReader, HistorySlice, RoundSearch, record_size};
-pub(crate) use pagination::{TailUpdate, persist_tail, retry_receipt};
+pub(crate) use pagination::{RevertRecord, TailUpdate, persist_tail, retry_receipt, revert_record};
 pub use reader_pins::HistoryRetention;
 pub use retirement::CleanupReport;
 pub(crate) use retirement::collect;
@@ -155,7 +155,7 @@ fn header(store: &mut dyn Store, photo: PhotoId) -> Result<Option<PhotoHeader>> 
     }
     Ok(Some(h))
 }
-fn page(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRoot>, count: u64, cursor: u64, budget: usize) -> Result<RecordPage> {
+pub(super) fn page(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRoot>, count: u64, cursor: u64, budget: usize) -> Result<RecordPage> {
     if budget == 0 || budget > PAGE_ITEMS {
         return Err(error("page budget must be 1..128"));
     }
@@ -559,7 +559,7 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
     write(store, &head_key, &pending.head)?;
     let manifest = header(store, pending.photo)?.ok_or_else(|| error("committed manifest missing"))?;
     let metadata = pagination::metadata_raw(store, &manifest)?;
-    let live_revert: Option<Value> = read(store, &format!("{}/revert.json", base(pending.photo)), SMALL)?;
+    let live_revert = super::revert_guard::read_guard(store, pending.photo)?;
     let revert = pending.revert_override.as_ref();
     let override_eligible = revert.map(|r| {
         r["eligible"] == true
@@ -577,11 +577,11 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
     });
     let eligible =
         !invalidated && override_eligible.unwrap_or_else(|| metadata.pointer("/checkpoint/eligible").and_then(Value::as_bool).unwrap_or(false));
-    write(
-        store,
-        &format!("{}/revert.json", base(pending.photo)),
-        &json!({"transaction_id":pending.transaction_id,"local_round_id":local_round_id,"eligible":eligible}),
-    )?;
+    let mut guard = live_revert.unwrap_or_else(|| json!({}));
+    guard["transaction_id"] = json!(pending.transaction_id);
+    guard["local_round_id"] = json!(local_round_id);
+    guard["eligible"] = json!(eligible);
+    write(store, &format!("{}/revert.json", base(pending.photo)), &guard)?;
     Ok(())
 }
 /// Ownership and HEAD are already durable. Pending removal is cleanup debt and
@@ -645,7 +645,9 @@ impl Session {
         self.companion_archive.cleanup_errors.get(&photo).map(String::as_str)
     }
     pub fn companion_photo_unsaved(&self, photo: PhotoId) -> bool {
-        self.companion_archive.editors.dirty_for(photo) || self.companion_history_unsaved(photo)
+        self.companion_archive.editors.dirty_for(photo)
+            || self.companion_history_unsaved(photo)
+            || self.companion_archive.certificate_dirty.contains(&photo)
     }
     pub fn companion_history_unsaved(&self, photo: PhotoId) -> bool {
         self.companion_archive.tails.contains_key(&photo)
@@ -744,15 +746,19 @@ impl Session {
         let result = self
             .companion_photo_header(photo)
             .and_then(|h| self.companion_stage(photo, h.map(|h| h.conversation_epoch).unwrap_or(0), &conversation))
-            .and_then(|p| self.companion_commit(&p).map(|_| ()));
+            .and_then(|p| self.companion_commit(&p));
         match result {
-            Ok(()) => {
+            Ok(receipt) => {
+                if let Some(records) = conversation.get("round_records").and_then(Value::as_array) {
+                    self.capture_companion_revert_record(photo, receipt.conversation_epoch, 0, records);
+                }
                 // Format 2 keeps graphs on disk; only failed writes own a retry
                 // payload. Successful full-value compatibility saves are not cached.
                 self.companion_archive.photos.remove(&photo);
                 self.companion_archive.dirty_photos.remove(&photo);
                 if self.companion_archive.dirty_photos.is_empty()
                     && self.companion_archive.revert_dirty.is_empty()
+                    && self.companion_archive.certificate_dirty.is_empty()
                     && self.companion_archive.tails.is_empty()
                     && self.companion_archive.receipts.is_empty()
                 {
@@ -869,20 +875,19 @@ pub(crate) fn invalidate_revert(store: &mut dyn Store, photos: &std::collections
     let mut failed = None;
     for photo in photos {
         let result = (|| {
-            if let Some(h) = header(store, *photo)? {
-                let key = format!("{}/revert.json", base(*photo));
-                let mut guard: Value = read(store, &key, SMALL)?.unwrap_or_else(|| json!({}));
-                if !guard.is_object() {
-                    return Err(error("unknown revert guard protected"));
-                }
-                guard["transaction_id"] = json!(h.transaction_id);
-                guard["eligible"] = json!(false);
-                write(store, &key, &guard)?;
+            let mut guard = super::revert_guard::read_guard(store, *photo)?.unwrap_or_else(|| json!({}));
+            let epoch = guard["mutation_epoch"].as_u64().unwrap_or(0).checked_add(1).ok_or_else(|| error("mutation epoch exhausted"))?;
+            guard["mutation_epoch"] = json!(epoch);
+            guard["eligible"] = json!(false);
+            if let Some(cert) = guard.get_mut("certificate") {
+                cert["eligible"] = json!(false);
             }
-            Ok(())
+            // Repeat the atomic write even if the previous failed write became
+            // visible. Visibility alone is never a durable invalidation receipt.
+            super::revert_guard::write_guard(store, *photo, &guard)
         })();
         if let Err(e) = result {
-            failed = Some(e);
+            failed = Some(e)
         }
     }
     failed.map_or(Ok(()), Err)

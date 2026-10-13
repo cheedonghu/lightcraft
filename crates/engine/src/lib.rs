@@ -333,6 +333,7 @@ impl Session {
         self.photo_revisions.get(&photo).copied().unwrap_or(1)
     }
     fn note_photo_edits(&mut self, op: &Op) -> Result<()> {
+        self.note_companion_actual_edit(op);
         let mut pending = vec![op];
         let revision = self.catalog.revision.saturating_add(1);
         let mut changed = std::collections::BTreeSet::new();
@@ -357,9 +358,6 @@ impl Session {
             }
         }
         self.companion_archive.invalidate(&changed);
-        if let Some(library) = self.library.as_mut() {
-            self.companion_archive.invalidate_storage(library, &changed);
-        }
         Ok(())
     }
 
@@ -899,6 +897,7 @@ impl Session {
         }
         let id = self.active().ok_or_else(|| EngineError::Other("no active photo".into()))?;
         let original = self.develop_of(id).unwrap_or_default();
+        self.mutation_guard.rejected_interaction = false;
         self.interaction = Some(Interaction { label: label.into(), photo: id, original });
         Ok(())
     }
@@ -911,6 +910,7 @@ impl Session {
             return Ok(());
         };
         if *cur == *i.original {
+            self.mutation_guard.rejected_interaction = false;
             self.interaction = None;
             return Ok(());
         }
@@ -920,6 +920,7 @@ impl Session {
         // Check the actual final batch before taking the interaction or restoring its start.
         self.authorize_mutation(&op)?;
         let Some(i) = self.interaction.take() else { return Ok(()) };
+        self.mutation_guard.rejected_interaction = false;
         self.apply_silent(Op::SetDevelop { id: i.photo, settings: i.original, label: i.label.clone(), edited: None })?;
         self.commit(&i.label, op)
     }
@@ -932,6 +933,7 @@ impl Session {
             self.authorize_mutation(&op)?;
         }
         if let Some(i) = self.interaction.take() {
+            self.mutation_guard.rejected_interaction = false;
             self.apply_silent(Op::SetDevelop { id: i.photo, settings: i.original, label: i.label, edited: None })?;
         }
         Ok(())

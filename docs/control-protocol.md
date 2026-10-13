@@ -53,7 +53,7 @@ filmstrip is visible.
 ## Methods
 
 The native Photo Companion extension registers `ai.open`, `ai.start`, `ai.stop`, `ai.undo`,
-`ai.clear`, `ai.status`, `ai.health`, `ai.task`, and `ai.returnCurrent` as UI commands. `ai.start {prompt?, photo?}` requires prior consent
+`ai.clear`, `ai.status`, `ai.health`, `ai.task`, `ai.returnCurrent`, and `ai.retrySave` as UI commands. `ai.start {prompt?, photo?}` requires prior consent
 through `checkbox:aiConsent`; JSON parameters cannot grant consent. Exactly one available,
 non-deleted photo must be selected, and explicit `photo` must match it. Every desktop instance
 permits one task across submitting, queued and processing. The task photo is protected from
@@ -67,7 +67,7 @@ The desktop uses one SSE connection to the loopback backend at `PHOTO_COMPANION_
 (default `127.0.0.1:18080`); model credentials belong to that backend. Full native edit plans are
 validated and rendered before a photo-specific commit. Normal libraries preserve conversations
 and preview attachments; `ai.clear` removes that context without changing edits. Undo refuses
-to overwrite subsequent manual edits. Accounts, budgets, and browser support remain later work.
+to overwrite subsequent manual edits. A normally saved round may retain verified revert permission after reopening: its independent certificate binds the complete frozen effect, photo/round/store identity, source evidence, mutation/conversation epochs and clean core Journal sequence. Saved history alone grants no permission. Actual restore verifies fresh original bytes; card display stays memory-only. Q30 relinquishes authority durably before the first later preview, file/batch effect or Undo/Redo stack change. A failed protection save rejects that edit and preserves parameters/files/stacks. `ai.retrySave {photo?, library_generation?}` / `button:aiRetrySave` retry local storage only; they never replay the edit, reconnect or submit content. An omitted photo targets the displayed task (including readonly task A while B is selected); explicit other-photo or stale/closed-library requests reject before persistence. The button captures the current library generation, and recovery remains available when a cold physical alias owns the library’s protection-save debt. Success returns `saved: true` only after that displayed task has no pending local save; a certificate waiting for interaction end returns the localized pending error and requires release followed by another explicit save retry. A failed held gesture requires release and a fresh explicit edit. Accounts, budgets, and browser support remain later work.
 See the adjacent backend's `.scratch/photo-companion-v1/validation.md`. Widgets are
 `button:aiOpen`, `icon:ai`, `button:aiCollapse`, `field:aiPrompt`, `checkbox:aiConsent`, `button:aiStart`, `button:aiStop`,
 `button:aiUndo`, and `button:aiClear`. `ai:messages` identifies the independently scrolling message viewport; `ai:stage` identifies the fixed status area. In ordinary Tools panes, input and consent remain outside message scrolling. Supported short floating/stacked panes use a compact scrolling body with Stop and consent first; the remaining input/actions/history stay reachable through its scrollbar. Composer control rectangles are registered only within the visible clip, so hidden controls cannot target the photo underneath. `ai:composer` identifies this viewport.
