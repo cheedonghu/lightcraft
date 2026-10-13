@@ -23,11 +23,21 @@ pub(super) struct Paging {
     desired: Option<PageRequest>,
     pending: Option<PageRequest>,
     sequence: u64,
+    completed: u64,
 }
 impl Default for Paging {
     fn default() -> Self {
         let (tx, rx) = mpsc::sync_channel(2);
-        Self { tx, rx, alive: Arc::new(AtomicBool::new(false)), cancel: Arc::new(AtomicBool::new(false)), desired: None, pending: None, sequence: 0 }
+        Self {
+            tx,
+            rx,
+            alive: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            desired: None,
+            pending: None,
+            sequence: 0,
+            completed: 0,
+        }
     }
 }
 impl Drop for Paging {
@@ -38,6 +48,9 @@ impl Drop for Paging {
 impl Paging {
     pub(super) fn busy(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+    pub(super) fn awaiting_page(&self, photo: PhotoId) -> bool {
+        self.desired.as_ref().is_some_and(|request| request.scope.photo == photo && self.completed != request.id)
     }
     pub(super) fn has_request(&self, photo: PhotoId, transaction: &str) -> bool {
         self.desired.as_ref().is_some_and(|r| r.scope.photo == photo && r.header.transaction_id == transaction)
@@ -60,6 +73,7 @@ impl State {
             if conversation.scope != Some(message.scope) || conversation.prefix.as_ref().is_none_or(|h| h.transaction_id != message.transaction) {
                 continue;
             }
+            self.paging.completed = message.request;
             match message.result {
                 Ok((page, cards, notice)) => {
                     if let Some(notice) = notice {
@@ -82,6 +96,7 @@ impl State {
                         card_owners: VecDeque::new(),
                         card_scan: None,
                     });
+                    self.accept_page(app, message.scope.photo, message.cursor);
                 }
                 Err(error) => {
                     conversation.notice = error;
@@ -150,9 +165,6 @@ impl State {
                 }
             }
         }
-        if let Some(photo) = app.session.active() {
-            self.prune_cache(app, photo);
-        }
         if !self.paging.busy()
             && let Some(request) = self.paging.pending.take()
             && request.scope.library_generation == app.session.library_generation()
@@ -163,6 +175,7 @@ impl State {
             && let Err(error) = self.launch_page(app, request.clone())
             && let Some(c) = self.conversations.get_mut(&request.scope.photo)
         {
+            self.paging.completed = request.id;
             c.notice = error;
         }
     }
@@ -187,7 +200,12 @@ impl State {
             return Ok(());
         }
         self.paging.pending = None;
-        self.launch_page(app, request)
+        let id = request.id;
+        let result = self.launch_page(app, request);
+        if result.is_err() {
+            self.paging.completed = id;
+        }
+        result
     }
     fn launch_page(&mut self, app: &mut LightcraftApp, request: PageRequest) -> Result<(), String> {
         // The preceding reader has retired. Drain its obsolete completions before
@@ -261,7 +279,9 @@ impl State {
                 })
                 .map_err(|e| e.to_string())?;
         } else {
-            self.read_page(app, request.scope.photo, request.cursor)?;
+            let result = self.read_page(app, request.scope.photo, request.cursor);
+            self.paging.completed = request.id;
+            result?;
         }
         Ok(())
     }

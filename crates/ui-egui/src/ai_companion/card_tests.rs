@@ -317,18 +317,25 @@ fn cold_background_page_reads_old_card_from_large_round_record() {
     for _ in 0..4 {
         h.step();
     }
-    let viewport = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").unwrap().1;
-    for _ in 0..5 {
-        h.app.synthetic.push(egui::Event::PointerMoved(viewport.center()));
-        h.app.synthetic.push(egui::Event::MouseWheel {
-            phase: egui::TouchPhase::Move,
-            unit: egui::MouseWheelUnit::Point,
-            delta: egui::vec2(0.0, -100_000.0),
-            modifiers: egui::Modifiers::NONE,
-        });
+    let mut readable = false;
+    for index in 0..120 {
+        let viewport = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").unwrap().1;
+        readable = h.view.painted_shapes().iter().any(|shape| matches!(shape, egui::epaint::Shape::Text(t) if t.galley.text() == "Round result" && viewport.contains_rect(t.visual_bounding_rect())));
+        if readable {
+            break;
+        }
+        if index % 10 == 0 {
+            h.app.synthetic.push(egui::Event::PointerMoved(viewport.center()));
+            h.app.synthetic.push(egui::Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -100_000.0),
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
         h.step();
     }
-    assert!(h.painted_text().iter().any(|text| text == "Round result"));
+    assert!(readable, "the historical card title must actually be visible after scrolling");
 }
 #[test]
 fn published_non_slider_plan_exposes_its_actual_structural_parameters() {
@@ -424,7 +431,7 @@ fn result_cards_are_readable_and_clipped_in_normal_narrow_and_short_tools() {
                 let mut visible = false;
                 for index in 0..160 {
                     let viewport = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").map(|(_, r)| *r);
-                    visible=viewport.is_some_and(|v|h.view.painted_shapes().iter().any(|shape|matches!(shape,egui::epaint::Shape::Text(t) if t.opacity_factor>0.0 && t.galley.rows.iter().any(|row|row.text()==literal && v.contains_rect(row.rect().translate(t.pos.to_vec2()))))));
+                    visible = viewport.is_some_and(|v| h.view.painted_shapes().iter().any(|shape| matches!(shape,egui::epaint::Shape::Text(t) if t.opacity_factor>0.0 && t.galley.text()==literal && v.contains_rect(t.visual_bounding_rect()))));
                     if visible {
                         break;
                     }
@@ -436,7 +443,7 @@ fn result_cards_are_readable_and_clipped_in_normal_narrow_and_short_tools() {
                     h.app.synthetic.push(egui::Event::MouseWheel {
                         phase: egui::TouchPhase::Move,
                         unit: egui::MouseWheelUnit::Point,
-                        delta: egui::vec2(0.0, if index == 0 { 10000.0 } else { -12.0 }),
+                        delta: egui::vec2(0.0, if index < 80 { 12.0 } else { -12.0 }),
                         modifiers: egui::Modifiers::NONE,
                     });
                     for _ in 0..3 {
