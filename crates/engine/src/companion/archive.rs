@@ -22,7 +22,7 @@ pub(crate) struct Archive {
     pub(super) legacy: bool,
     pub(super) v2: bool,
     pub(super) dirty_photos: BTreeSet<PhotoId>,
-    revert_dirty: BTreeSet<PhotoId>,
+    pub(super) revert_dirty: BTreeSet<PhotoId>,
     dirty: bool,
     pub(super) blocked: Option<String>,
     pub(super) error: Option<String>,

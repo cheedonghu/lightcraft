@@ -78,6 +78,7 @@ fn real_initial_correction_save_reopen_retains_associations_previews_and_actual_
         state.poll_inner(&mut app, &egui::Context::default());
         assert_eq!(state.conversations[&photo].records[0]["backend_confirmed_plan"], "i");
     }
+    app.session.execute("develop.set", &json!({"ids":[photo.0],"values":{"light.exposure":0.6}})).unwrap();
     let revision = app.session.photo_revision(photo);
     events
         .try_send(network::Event::Response {
@@ -91,6 +92,7 @@ fn real_initial_correction_save_reopen_retains_associations_previews_and_actual_
     state.poll_inner(&mut app, &egui::Context::default());
     assert_eq!(state.conversations[&photo].records[0]["backend_confirmed_plan"], "c");
     assert_eq!(app.session.photo_revision(photo), revision, "late receipt records facts only");
+    assert!(!state.conversations[&photo].checkpoint.as_ref().unwrap().eligible, "a receipt must never renew a manually invalidated checkpoint");
     app.session.close_library().unwrap();
     let mut reopened = self::app(catalog, files.clone());
     let mut state = State::default();

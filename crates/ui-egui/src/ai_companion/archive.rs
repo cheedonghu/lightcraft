@@ -42,6 +42,12 @@ impl State {
         if conversation.scope.is_some_and(|scope| scope != PhotoScope { library_generation: app.session.library_generation(), photo }) {
             return Err("AI 会话属于已关闭的图库，未写入当前图库。".into());
         }
+        if let Some(checkpoint) = conversation.checkpoint.as_mut()
+            && checkpoint.eligible
+            && !current(app, checkpoint)
+        {
+            checkpoint.eligible = false;
+        }
         // Archive a copy: a failed attachment/write must retain the complete in-memory result.
         for (sequence, message) in conversation.messages.iter_mut().enumerate() {
             if message.get("local_message_id").is_none()

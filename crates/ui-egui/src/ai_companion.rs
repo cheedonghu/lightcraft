@@ -337,7 +337,7 @@ impl State {
                     }
                 }
                 record["terminal_notice"] = json!(notice);
-                record["backend_round_id"] = json!(job.round);
+                record["backend_round_id"] = if job.round.is_empty() { Value::Null } else { json!(job.round) };
             }
             conversation.pending.clear();
             close_pending_tools(&mut conversation.messages);
@@ -504,7 +504,10 @@ impl State {
                 if let Some(record) = self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["backend_round_id"] == round)) {
                     record["local_terminal"] = json!(state);
                     record["backend_terminal"] = json!(payload);
-                    record["trace_id"] = json!(trace);
+                    record["trace_id"] = data.get("trace_id").cloned().unwrap_or(Value::Null);
+                    if let Some(confirmed) = payload.get("last_confirmed_plan_id").and_then(Value::as_str) {
+                        record["backend_reported_last_confirmed_plan_id"] = json!(confirmed);
+                    }
                 }
                 self.finish(photo, &notice);
                 self.save(app, photo)?;

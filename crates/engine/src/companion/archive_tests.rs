@@ -301,6 +301,7 @@ fn v2_failed_photo_commit_preserves_old_head_memory_and_other_photo_then_retries
     let queued = json!({"schema_version":2,"messages":[{"role":"user","text":"actual result kept"}],"rounds":[]});
     assert!(s.save_companion_conversation(id, queued.clone()).is_err());
     assert_eq!(s.photo_companion(id).unwrap(), Some(&queued));
+    assert_eq!(s.load_companion_conversation(id).unwrap(), Some(queued.clone()), "reading must not overwrite queued actual result with old HEAD");
     assert_eq!(files.get(&format!("companion/v2/photos/{}/HEAD.json", id.0)).unwrap(), old_head);
     s.save_companion_conversation(other, saved.clone()).unwrap();
     assert!(s.unsaved().is_some(), "other-photo success must not hide queued archive failure");

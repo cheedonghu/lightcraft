@@ -511,6 +511,9 @@ impl Session {
         if let Some(e) = &self.companion_archive.blocked {
             return Err(error(e));
         }
+        if self.catalog.photo(photo).is_none() {
+            return Err(error("no such photo"));
+        }
         if self.companion_archive.legacy {
             return self.set_photo_companion(photo, Some(conversation));
         }
@@ -518,13 +521,15 @@ impl Session {
             self.companion_archive.photos.insert(photo, conversation);
             return Ok(());
         }
-        let epoch = self.companion_photo_header(photo)?.map(|h| h.conversation_epoch).unwrap_or(0);
         self.companion_archive.photos.insert(photo, conversation.clone());
-        let result = self.companion_stage(photo, epoch, &conversation).and_then(|p| self.companion_commit(&p).map(|_| ()));
+        let result = self
+            .companion_photo_header(photo)
+            .and_then(|h| self.companion_stage(photo, h.map(|h| h.conversation_epoch).unwrap_or(0), &conversation))
+            .and_then(|p| self.companion_commit(&p).map(|_| ()));
         match result {
             Ok(()) => {
                 self.companion_archive.dirty_photos.remove(&photo);
-                if self.companion_archive.dirty_photos.is_empty() {
+                if self.companion_archive.dirty_photos.is_empty() && self.companion_archive.revert_dirty.is_empty() {
                     self.companion_archive.error = None;
                 }
                 Ok(())
@@ -539,6 +544,9 @@ impl Session {
     pub fn load_companion_conversation(&mut self, photo: PhotoId) -> Result<Option<Value>> {
         if let Some(e) = &self.companion_archive.blocked {
             return Err(error(e));
+        }
+        if self.companion_archive.dirty_photos.contains(&photo) {
+            return Ok(self.companion_archive.photos.get(&photo).cloned());
         }
         if !self.companion_archive.v2 {
             return Ok(self.photo_companion(photo)?.cloned());
