@@ -430,8 +430,9 @@ impl Session {
     pub fn collect_companion(&mut self, photo: PhotoId, budget: usize) -> Result<CleanupReport> {
         let mut retained = self.companion_retained_headers(photo);
         let pins = self.companion_archive.readers.clone();
+        let protection = pins.physical_pause();
         let readers = pins.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pins.conservative && !readers.headers.is_empty() {
+        if protection.as_deref().is_some_and(|count| *count > 0) {
             return Ok(CleanupReport { pending: true, removed: 0, protected: false });
         }
         retained.extend(readers.headers.values().filter(|h| h.photo_id == photo).cloned());

@@ -39,34 +39,45 @@ pub(crate) struct Archive {
     pub(super) error: Option<String>,
     retry_at: Option<web_time::Instant>,
 }
+impl Drop for Archive {
+    fn drop(&mut self) {
+        // Transfer only already-known roots/work in O(1). Never touch Store,
+        // catalog photos or all history; reopening drains one photo per step.
+        self.readers.retire_archive(super::storage::reader_pins::ArchiveDebt {
+            prefixes: std::mem::take(&mut self.prefixes),
+            active: std::mem::take(&mut self.cleanup_photos),
+            waiting: std::mem::take(&mut self.cleanup_waiting),
+        });
+    }
+}
 pub(super) fn error(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("AI archive: {e}"))
 }
 impl Archive {
     pub(crate) fn load(store: &mut dyn Store, _dir: &Path, _on_disk: bool) -> Self {
         let pins = super::storage::reader_pins::for_store(store);
-        let mut read = || -> Result<Self> {
-            let Some(bytes) = store.read_limited(STATE_FILE, MAX_ARCHIVE).map_err(error)? else { return Ok(Self::default()) };
+        let mut archive = Self::default();
+        let mut read = || -> Result<()> {
+            let Some(bytes) = store.read_limited(STATE_FILE, MAX_ARCHIVE).map_err(error)? else { return Ok(()) };
             let root: Value = serde_json::from_slice(&bytes).map_err(error)?;
             if root["format"] == "lightcraft-companion" && root["version"] == 2 && root["layout"] == "photo-head-v2" {
-                return Ok(Self { v2: true, ..Default::default() });
+                archive.v2 = true;
+                return Ok(());
             }
             let saved: Saved = serde_json::from_slice(&bytes).map_err(error)?;
             if saved.format != "lightcraft-companion" || saved.version != 1 {
                 return Err(error("unsupported format; the file was left unchanged"));
             }
-            Ok(Self { photos: saved.photos, legacy: true, ..Default::default() })
+            archive.photos = saved.photos;
+            archive.legacy = true;
+            Ok(())
         };
-        match read() {
-            Ok(mut a) => {
-                a.readers = pins;
-                a
-            }
-            Err(e) => {
-                log::error!("{e}");
-                Self { blocked: Some(e.to_string()), readers: pins, ..Default::default() }
-            }
+        if let Err(e) = read() {
+            log::error!("{e}");
+            archive.blocked = Some(e.to_string());
         }
+        archive.readers = pins;
+        archive
     }
     pub(crate) fn invalidate(&mut self, ids: &BTreeSet<PhotoId>) {
         for id in ids {
@@ -128,6 +139,13 @@ impl Archive {
             .or_else(|| self.cleanup_photos.first().copied());
         let Some(photo) = photo else { return };
         self.cleanup_after = Some(photo);
+        let pins = self.readers.clone();
+        let protection = pins.physical_pause();
+        if protection.as_deref().is_some_and(|count| *count > 0) {
+            // Keep owning-library debt active, without I/O or foreign roots.
+            self.cleanup_at = web_time::Instant::now().checked_add(std::time::Duration::from_millis(250));
+            return;
+        }
         if !self.tails.contains_key(&photo)
             && !self.dirty_photos.contains(&photo)
             && !self.receipts.contains_key(&photo)
@@ -141,14 +159,8 @@ impl Archive {
         let mut retained: Vec<_> =
             self.prefixes.get(&photo).into_iter().cloned().chain(self.tails.get(&photo).and_then(|t| t.prefix.as_ref()).cloned()).collect();
         let readers = self.readers.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = if self.readers.conservative && !readers.headers.is_empty() {
-            // Windows uses a shared native protection domain. Do not mix other
-            // libraries' headers into this photo's graph or report them unsaved.
-            Ok(super::storage::CleanupReport { pending: true, removed: 0, protected: false })
-        } else {
-            retained.extend(readers.headers.values().filter(|h| h.photo_id == photo).cloned());
-            super::storage::collect(store, photo, retained, 2)
-        };
+        retained.extend(readers.headers.values().filter(|h| h.photo_id == photo).cloned());
+        let result = super::storage::collect(store, photo, retained, 2);
         match result {
             Ok(report) => {
                 if !report.pending {

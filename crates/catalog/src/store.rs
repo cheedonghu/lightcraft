@@ -59,6 +59,12 @@ pub trait Store: Send {
     fn retention_namespace(&self) -> Option<String> {
         None
     }
+    /// Require a shared process-wide physical-reclamation pause while any
+    /// conservative reader lives. Ownership/debt still uses retention_namespace;
+    /// wrappers must forward both properties, never use a global owner identity.
+    fn conservative_retention(&self) -> bool {
+        false
+    }
     /// Another handle on the same files that a worker thread can write `catalog.snap` through
     /// while this one keeps appending to the log (background compaction). `None` (the default):
     /// snapshots are written synchronously.
@@ -253,15 +259,20 @@ impl Store for FsStore {
         }
         #[cfg(windows)]
         {
-            // Stable std file IDs are unavailable. Share a conservative process
-            // domain: physical reclamation waits until every native reader drops.
-            // This handles directory aliases without guessing path identity.
-            Some("native-windows-protected".into())
+            // Safe directory-handle identity routes only this library's debt,
+            // including case/symlink aliases. Unavailable/partial IDs protect GC.
+            let handle = winapi_util::Handle::from_path_any(&self.dir).ok()?;
+            let info = winapi_util::file::information(&handle).ok()?;
+            let (volume, index) = (info.volume_serial_number(), info.file_index());
+            (volume != 0 && index != 0).then(|| format!("native-windows-directory:{volume}:{index}"))
         }
         #[cfg(not(any(unix, windows)))]
         {
             None
         }
+    }
+    fn conservative_retention(&self) -> bool {
+        cfg!(windows)
     }
     #[cfg(not(target_arch = "wasm32"))]
     fn background_writer(&self) -> Option<Box<dyn Store>> {
@@ -329,11 +340,23 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
 }
 
 /// In-memory files. Clones share the same files (so a test can "reopen" or corrupt them).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MemStore {
+    namespace: u64,
     pub files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     /// Offer a [`Store::background_writer`] (off by default: snapshots stay synchronous).
     pub background: bool,
+}
+
+impl Default for MemStore {
+    fn default() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Never wrap/reuse identity while a retired debt registry may outlive
+        // the backing allocation. Clones carry the same namespace and files.
+        let namespace = NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).expect("memory Store identity exhausted");
+        Self { namespace, files: Arc::default(), background: false }
+    }
 }
 
 impl MemStore {
@@ -401,7 +424,7 @@ impl Store for MemStore {
         "memory".into()
     }
     fn retention_namespace(&self) -> Option<String> {
-        Some(format!("memory-store:{:p}", Arc::as_ptr(&self.files)))
+        Some(format!("memory-store:{}", self.namespace))
     }
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         self.background.then(|| Box::new(self.clone()) as Box<dyn Store>)

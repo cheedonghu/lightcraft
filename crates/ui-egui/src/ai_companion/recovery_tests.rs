@@ -45,6 +45,9 @@ impl Store for Storage {
     fn retention_namespace(&self) -> Option<String> {
         self.memory.retention_namespace()
     }
+    fn conservative_retention(&self) -> bool {
+        self.memory.conservative_retention()
+    }
 }
 fn outgoing(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>, suffix: &str) -> network::Request {
     let deadline = Instant::now() + Duration::from_secs(30);

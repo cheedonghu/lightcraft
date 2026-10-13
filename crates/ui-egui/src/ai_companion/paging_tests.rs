@@ -128,6 +128,9 @@ fn cancelling_blocked_native_style_history_preflight_never_enqueues_creation_or_
         fn retention_namespace(&self) -> Option<String> {
             self.files.retention_namespace()
         }
+        fn conservative_retention(&self) -> bool {
+            self.files.conservative_retention()
+        }
         fn background_writer(&self) -> Option<Box<dyn Store>> {
             Some(Box::new(Self { files: self.files.clone(), gate: self.gate.clone(), reader: true }))
         }
@@ -225,7 +228,9 @@ fn bounded_history_buttons_show_older_and_newer_pages_in_both_languages() {
 
 #[test]
 fn async_preflight_enqueue_failure_releases_the_local_lease_without_uncertain_admission() {
-    let mut app = app(Box::new(MemStore { background: true, ..MemStore::new() }));
+    let mut files = MemStore::new();
+    files.background = true;
+    let mut app = app(Box::new(files));
     let photo = app.session.active().unwrap();
     app.session
         .save_companion_tail(photo, None, &[json!({"role":"user","text":"old exact history"})], &[], &[], &json!({"schema_version":2}))
@@ -269,7 +274,9 @@ fn async_preflight_enqueue_failure_releases_the_local_lease_without_uncertain_ad
 
 #[test]
 fn retired_history_worker_with_lost_completion_releases_the_local_lease() {
-    let mut app = app(Box::new(MemStore { background: true, ..MemStore::new() }));
+    let mut files = MemStore::new();
+    files.background = true;
+    let mut app = app(Box::new(files));
     let photo = app.session.active().unwrap();
     app.session
         .save_companion_tail(photo, None, &[json!({"role":"user","text":"old exact history"})], &[], &[], &json!({"schema_version":2}))
@@ -404,6 +411,9 @@ fn cold_native_history_command_and_rapid_requests_keep_the_latest_explicit_curso
         }
         fn retention_namespace(&self) -> Option<String> {
             self.files.retention_namespace()
+        }
+        fn conservative_retention(&self) -> bool {
+            self.files.conservative_retention()
         }
         fn background_writer(&self) -> Option<Box<dyn Store>> {
             Some(Box::new(Self { files: self.files.clone(), gate: self.gate.clone(), reader: true }))

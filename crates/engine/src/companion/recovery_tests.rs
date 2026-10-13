@@ -68,6 +68,43 @@ impl<S: Store> Store for FaultStore<S> {
     fn retention_namespace(&self) -> Option<String> {
         self.memory.retention_namespace()
     }
+    fn conservative_retention(&self) -> bool {
+        self.memory.conservative_retention()
+    }
+}
+#[derive(Clone)]
+struct ConservativeFiles(MemStore);
+impl Store for ConservativeFiles {
+    fn read(&mut self, k: &str) -> std::io::Result<Option<Vec<u8>>> {
+        self.0.read(k)
+    }
+    fn read_limited(&mut self, k: &str, n: u64) -> std::io::Result<Option<Vec<u8>>> {
+        self.0.read_limited(k, n)
+    }
+    fn read_range(&mut self, k: &str, o: u64, n: usize) -> std::io::Result<Vec<u8>> {
+        self.0.read_range(k, o, n)
+    }
+    fn write_atomic(&mut self, k: &str, b: &[u8]) -> std::io::Result<()> {
+        self.0.write_atomic(k, b)
+    }
+    fn remove(&mut self, k: &str) -> std::io::Result<()> {
+        self.0.remove(k)
+    }
+    fn append(&mut self, k: &str, b: &[u8]) -> std::io::Result<()> {
+        self.0.append(k, b)
+    }
+    fn truncate(&mut self, k: &str, n: u64) -> std::io::Result<()> {
+        self.0.truncate(k, n)
+    }
+    fn describe(&self) -> String {
+        "conservative physical-filesystem adapter".into()
+    }
+    fn retention_namespace(&self) -> Option<String> {
+        self.0.retention_namespace().map(|id| format!("conservative:{id}"))
+    }
+    fn conservative_retention(&self) -> bool {
+        true
+    }
 }
 fn open(files: impl Store + 'static) -> Session {
     let mut s = Session::new();
@@ -82,11 +119,11 @@ struct IoCount {
     largest_read: u64,
     unbounded_reads: usize,
 }
-struct MeterStore {
-    inner: FaultStore,
+struct MeterStore<S = MemStore> {
+    inner: FaultStore<S>,
     meter: Arc<Mutex<IoCount>>,
 }
-impl Store for MeterStore {
+impl<S: Store> Store for MeterStore<S> {
     fn read(&mut self, key: &str) -> std::io::Result<Option<Vec<u8>>> {
         self.meter.lock().unwrap().unbounded_reads += 1;
         self.inner.read(key)
@@ -124,6 +161,9 @@ impl Store for MeterStore {
     }
     fn retention_namespace(&self) -> Option<String> {
         self.inner.retention_namespace()
+    }
+    fn conservative_retention(&self) -> bool {
+        self.inner.conservative_retention()
     }
 }
 
@@ -497,6 +537,142 @@ fn retired_namespace_debt_survives_reopen_without_scheduling_a_different_library
     persist_to_idle(&mut reopened, &meter);
     assert!(!reopened.companion_cleanup_pending());
     assert_eq!(other.companion_messages_page(photo, 0, 1).unwrap().records[0]["text"], "independent library");
+}
+
+#[test]
+fn implicit_archive_retirement_resumes_its_cached_prefix_debt_after_switch_or_reload() {
+    for reload in [false, true] {
+        let files = MemStore::new();
+        let meter = Arc::new(Mutex::new(IoCount::default()));
+        let mut s = open(MeterStore { inner: FaultStore { memory: files.clone(), plan: FaultPlan::default() }, meter: meter.clone() });
+        let photo = s.active().unwrap();
+        s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"old retained-release graph"}],"rounds":[]})).unwrap();
+        let old = s.companion_photo_header(photo).unwrap().unwrap();
+        s.pin_companion_prefix(photo, Some(old.clone())).unwrap();
+        s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"current retained-release graph"}],"rounds":[]})).unwrap();
+        let current = s.companion_photo_header(photo).unwrap().unwrap();
+        persist_to_idle(&mut s, &meter);
+        assert!(s.companion_messages_bounded(&old, 0, 1, 1024).is_ok());
+        let other_meter = Arc::new(Mutex::new(IoCount::default()));
+        if !reload {
+            s.open_library_in(
+                LibraryStores {
+                    catalog: Box::new(MemStore::new()),
+                    files: Box::new(MeterStore {
+                        inner: FaultStore { memory: MemStore::new(), plan: FaultPlan::default() },
+                        meter: other_meter.clone(),
+                    }),
+                    dir: "other".into(),
+                    on_disk: false,
+                },
+                true,
+            )
+            .unwrap();
+            s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"independent library"}],"rounds":[]})).unwrap();
+            persist_to_idle(&mut s, &other_meter);
+            assert!(!s.companion_cleanup_pending(), "A's implicit release cannot enter B's queue");
+            *other_meter.lock().unwrap() = IoCount::default();
+            s.persist_if_dirty();
+            assert_eq!(other_meter.lock().unwrap().calls, 0);
+            assert_eq!(s.companion_messages_page(photo, 0, 1).unwrap().records[0]["text"], "independent library");
+        }
+        s.open_library_in(
+            LibraryStores {
+                catalog: Box::new(MemStore::new()),
+                files: Box::new(MeterStore { inner: FaultStore { memory: files, plan: FaultPlan::default() }, meter: meter.clone() }),
+                dir: "ux09".into(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+        assert!(s.companion_cleanup_pending(), "actual Archive replacement must hand off debt without a HEAD read");
+        persist_until_old_reclaimed(&mut s, &meter, &old, &current);
+        persist_to_idle(&mut s, &meter);
+        assert!(!s.companion_cleanup_pending());
+        assert!(s.unsaved().is_none());
+    }
+}
+
+#[test]
+fn conservative_readers_pause_physical_cleanup_but_route_reopen_debt_only_to_their_library() {
+    let a_files = ConservativeFiles(MemStore::new());
+    let a_meter = Arc::new(Mutex::new(IoCount::default()));
+    let b_files = ConservativeFiles(MemStore::new());
+    let b_meter = Arc::new(Mutex::new(IoCount::default()));
+    let mut s = open(MeterStore { inner: FaultStore { memory: a_files.clone(), plan: FaultPlan::default() }, meter: a_meter.clone() });
+    let photo = s.active().unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"old retained-release graph"}],"rounds":[]})).unwrap();
+    let a_old = s.companion_photo_header(photo).unwrap().unwrap();
+    let guard = s.retain_companion_history(&a_old).unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"current retained-release graph"}],"rounds":[]})).unwrap();
+    let a_current = s.companion_photo_header(photo).unwrap().unwrap();
+    persist_to_idle(&mut s, &a_meter);
+    s.open_library_in(
+        LibraryStores {
+            catalog: Box::new(MemStore::new()),
+            files: Box::new(MeterStore { inner: FaultStore { memory: b_files.clone(), plan: FaultPlan::default() }, meter: b_meter.clone() }),
+            dir: "conservative-B".into(),
+            on_disk: false,
+        },
+        true,
+    )
+    .unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"old retained-release graph"}],"rounds":[]})).unwrap();
+    let b_old = s.companion_photo_header(photo).unwrap().unwrap();
+    s.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"current retained-release graph"}],"rounds":[]})).unwrap();
+    let b_current = s.companion_photo_header(photo).unwrap().unwrap();
+    persist_to_idle(&mut s, &b_meter);
+    assert!(s.companion_messages_bounded(&b_old, 0, 1, 1024).is_ok(), "a real A reader must pause physical GC in B without mixing A headers");
+    *a_meter.lock().unwrap() = IoCount::default();
+    *b_meter.lock().unwrap() = IoCount::default();
+    std::thread::spawn(move || drop(guard)).join().unwrap();
+    assert_eq!(a_meter.lock().unwrap().calls + b_meter.lock().unwrap().calls, 0);
+    persist_until_old_reclaimed(&mut s, &b_meter, &b_old, &b_current);
+    persist_to_idle(&mut s, &b_meter);
+    assert!(!s.companion_cleanup_pending(), "A debt never becomes B photo debt");
+    s.open_library_in(
+        LibraryStores {
+            catalog: Box::new(MemStore::new()),
+            files: Box::new(MeterStore { inner: FaultStore { memory: a_files, plan: FaultPlan::default() }, meter: a_meter.clone() }),
+            dir: "ux09".into(),
+            on_disk: false,
+        },
+        true,
+    )
+    .unwrap();
+    assert!(s.companion_cleanup_pending(), "Archive retirement preserves owning A debt after its reader drops");
+    persist_until_old_reclaimed(&mut s, &a_meter, &a_old, &a_current);
+    persist_to_idle(&mut s, &a_meter);
+    assert!(!s.companion_cleanup_pending());
+    let mut other = open(MeterStore { inner: FaultStore { memory: b_files, plan: FaultPlan::default() }, meter: b_meter.clone() });
+    persist_to_idle(&mut other, &b_meter);
+    assert!(!other.companion_cleanup_pending());
+    assert!(other.companion_messages_bounded(&b_current, 0, 1, 1024).is_ok());
+}
+
+#[test]
+fn retired_memory_backing_debt_never_enters_a_fresh_ephemeral_library() {
+    let meter = Arc::new(Mutex::new(IoCount::default()));
+    let mut old = open(MeterStore { inner: FaultStore { memory: MemStore::new(), plan: FaultPlan::default() }, meter: meter.clone() });
+    let photo = old.active().unwrap();
+    old.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"old retained-release graph"}],"rounds":[]})).unwrap();
+    let header = old.companion_photo_header(photo).unwrap().unwrap();
+    let guard = old.retain_companion_history(&header).unwrap();
+    old.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"text":"current retained-release graph"}],"rounds":[]})).unwrap();
+    persist_to_idle(&mut old, &meter);
+    old.close_library().unwrap();
+    drop(old);
+    drop(guard); // no backing Store handle remains; registry still owns debt
+    for _ in 0..32 {
+        let fresh_meter = Arc::new(Mutex::new(IoCount::default()));
+        let mut fresh = open(MeterStore { inner: FaultStore { memory: MemStore::new(), plan: FaultPlan::default() }, meter: fresh_meter.clone() });
+        assert!(!fresh.companion_cleanup_pending(), "fresh empty library never inherits retired backing's maintenance");
+        *fresh_meter.lock().unwrap() = IoCount::default();
+        fresh.persist_if_dirty();
+        assert_eq!(fresh_meter.lock().unwrap().calls, 0);
+        assert!(fresh.unsaved().is_none());
+    }
 }
 
 #[test]
