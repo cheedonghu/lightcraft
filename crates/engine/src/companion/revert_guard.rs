@@ -225,12 +225,12 @@ impl Session {
                 return Err(e);
             }
         };
-        if let Some(bytes) = bytes {
-            if let Err(e) = lib.files.remove(CORE_PENDING) {
-                // Core and its continuity anchor are acknowledged. An uncertain
-                // deletion is cleanup debt; a still-present intent stays conservative.
-                self.companion_archive.marker_cleanup_failed(CORE_PENDING.into(), None, &bytes, e.to_string());
-            }
+        if let Some(bytes) = bytes
+            && let Err(e) = lib.files.remove(CORE_PENDING)
+        {
+            // Core and its continuity anchor are acknowledged. An uncertain
+            // deletion is cleanup debt; a still-present intent stays conservative.
+            self.companion_archive.marker_cleanup_failed(CORE_PENDING.into(), None, &bytes, e.to_string());
         }
         // The core log may already be acknowledged while this independent
         // continuity write is not. Clear its recovery state only after retry
@@ -585,7 +585,7 @@ impl Session {
             mutation_epoch: epoch,
             conversation_epoch: h.conversation_epoch,
             core_seq: seq,
-            association: Some(LocalRoundId::new().map_err(error)?),
+            association: Some(proof.round.clone()),
             record: ordinal,
             original_digest: digest(&proof.original)?,
             result_digest: digest(&proof.expected)?,
@@ -605,13 +605,15 @@ impl Session {
             certificate_digest: certificate_digest(&cert)?,
         };
         let id = cert.association.as_ref().ok_or_else(|| error("association missing"))?;
-        lib.files.write_atomic(&association_key(id)?, &serde_json::to_vec(&association).map_err(error)?).map_err(error)?;
         guard["mutation_epoch"] = json!(epoch);
         guard["certificate"] = json!(cert);
         let _ = seal_pending(lib.files.as_mut(), proof.photo)?;
         let stamp = json!({"version":1,"photo":proof.photo.0,"certificate_digest":lightcraft_preview::hash_bytes(&serde_json::to_vec(&cert).map_err(error)?).to_string()});
         let stamp_bytes = serde_json::to_vec(&stamp).map_err(error)?;
         lib.files.write_atomic(&seal_key(proof.photo), &stamp_bytes).map_err(error)?;
+        // Reuse this logical round's owning slot on every retry/reseal. Fence
+        // first: replacing its association alone cannot qualify an old guard.
+        lib.files.write_atomic(&association_key(id)?, &serde_json::to_vec(&association).map_err(error)?).map_err(error)?;
         write_guard(lib.files.as_mut(), proof.photo, &guard)?;
         // Association, complete certificate and both saves are acknowledged.
         // Marker retirement is now independent cleanup, not a failed certificate.

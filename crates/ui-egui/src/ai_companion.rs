@@ -2195,9 +2195,13 @@ fn save_recovery(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
         || app.ai.local_save_retry_at.is_some()
         || app.ai.conversations.get(&photo).is_some_and(|c| c.storage_notice);
     let cause = protection_error.unwrap_or("Local saving needs attention. Photo changes are kept.");
-    // A failure arriving between press and release must not move the controls
-    // under that pointer. Existing recovery geometry stays until acknowledgment.
-    if unsaved && !app.ai.save_retry_feedback.contains_key(&photo) && ui.input(|input| input.pointer.any_down() || input.pointer.any_released()) {
+    // New recovery geometry must not move a held control or squeeze out the
+    // first cancellation feedback, including discarded reruns of that frame.
+    // Existing recovery geometry stays until acknowledgment.
+    if unsaved
+        && !app.ai.save_retry_feedback.contains_key(&photo)
+        && (app.ai.feedback_needs_paint(ui.ctx()) || ui.input(|input| input.pointer.any_down() || input.pointer.any_released()))
+    {
         ui.ctx().request_repaint();
         return;
     }

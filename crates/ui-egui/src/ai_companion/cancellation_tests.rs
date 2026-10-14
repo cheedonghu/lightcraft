@@ -419,8 +419,20 @@ fn full_production_feedback_barrier(route: &str, prior_dirty: bool) {
         assert!(gate.load(Ordering::Relaxed));
         assert!(app.ai.jobs.is_empty());
         assert_eq!(app.ai.consent, !revoke);
-        assert!(view.painted_text().iter().any(|t| t.contains("Keeping the latest complete result")));
+        let painted_text = view.painted_text();
+        assert!(painted_text.iter().any(|t| t.contains("Keeping the latest complete result")), "route={route}; painted={painted_text:?}");
         assert!(entered_rx.try_recv().is_err(), "no storage started in the feedback frame");
+        if let Ok(dir) = std::env::var("UX18_FEEDBACK_SCREENSHOT_DIR") {
+            let frame = view.paint(&std::collections::HashMap::new());
+            let image = lightcraft_raster::Rgba8::from_fn(frame.size[0], frame.size[1], |x, y| frame.pixels[y * frame.size[0] + x].to_array());
+            let bytes = lightcraft_engine::export::encode_image(
+                &image,
+                &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+            )
+            .unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(std::path::Path::new(&dir).join(format!("{route}-feedback.png")), bytes).unwrap();
+        }
         painted.store(true, Ordering::Relaxed);
         let monitor = std::thread::spawn(move || {
             entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();

@@ -1611,3 +1611,54 @@ fn continuity_intent_read_failure_reports_pending_until_storage_only_retry() {
     assert_eq!(cold.develop_of(a).unwrap(), start);
     assert_eq!(cold.catalog.photo(b).unwrap().rating, 4);
 }
+
+#[test]
+fn one_round_reuses_its_owned_association_across_failed_sealing_and_unrelated_saves() {
+    for visible in [false, true] {
+        let (catalog, files) = (MemStore::new(), MemStore::new());
+        let fail = Arc::new(AtomicBool::new(false));
+        let mut s = Session::new();
+        s.open_library_in(
+            LibraryStores {
+                catalog: Box::new(catalog.clone()),
+                files: Box::new(FaultStore { memory: files.clone(), fail: fail.clone(), visible }),
+                dir: "association-owner".into(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+        let a = s.active().unwrap();
+        let b = s.catalog.photos().find(|p| p.id != a).unwrap().id;
+        let start = s.develop_of(a).unwrap();
+        let round = publish(&mut s, a);
+        let association_files = || files.files.lock().unwrap().keys().filter(|key| key.starts_with("companion/v2/revert-associations/")).count();
+        fail.store(true, Ordering::Relaxed);
+        s.execute("photo.rate", &json!({"ids":[b.0],"rating":3})).unwrap();
+        for _ in 0..8 {
+            assert!(s.persist().is_err());
+            assert_eq!(association_files(), 1, "retry one logical publication without accumulating untracked copies");
+            assert!(s.companion_photo_unsaved(a));
+        }
+        fail.store(false, Ordering::Relaxed);
+        s.persist().unwrap();
+        for index in 0..8 {
+            s.execute("photo.rate", &json!({"ids":[b.0],"rating":index%5})).unwrap();
+            s.persist().unwrap();
+            assert_eq!(association_files(), 1, "ordinary metadata saves must reuse the owning round association");
+        }
+        for _ in 0..64 {
+            if !s.collect_companion(a, 32).unwrap().pending {
+                break;
+            }
+        }
+        assert_eq!(association_files(), 1);
+        s.close_library().unwrap();
+        drop(s);
+        let mut cold = open(&catalog, &files);
+        let permit = cold.verify_round_revert(a, &round).unwrap();
+        cold.commit_verified_round_revert(permit).unwrap();
+        assert_eq!(cold.develop_of(a).unwrap(), start);
+        assert_eq!(cold.catalog.photo(b).unwrap().rating, 2);
+    }
+}
