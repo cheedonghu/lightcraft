@@ -228,3 +228,7 @@ A center `move` can include `before` (panel ID or null to append) for tab order.
 The equivalent `{"action": ...}` form accepts a serialized shared docking action;
 this is also the form emitted by the renderer. Protected-canvas and app-specific panel
 rules apply equally to both forms.
+
+Protected AI storage exposes `button:aiCopyStorageDiagnostic` in the message area. The real clipboard receives a JSON diagnostic with `kind`, current `library_generation`, viewed `photo` and the observed `reason`/source key. Unknown outer or per-photo ownership rejects `ai.clear` before confirmation; a verified owning HEAD with unsupported inner data still supports confirmed, version-bound clear. `ai.start` loads/verifies the owning history before connecting and rejects incomplete history locally. Repairs must retain existing protection records and restore only diagnosed files from a verified backup of the same library, then reopen; full-folder replacement or marker deletion is not a supported recovery step.
+
+`ai.status.historyError` is null for a healthy loaded history or a localized recovery instruction for protected/incomplete history. Status queries remain available when history load fails and keep task/save fields; the default protected text is human guidance, with the observed technical cause available through explicit diagnostic copy.

@@ -29,10 +29,18 @@ impl State {
             ..Default::default()
         };
         let header = if app.session.library.is_some() {
-            match app.session.companion_photo_header(photo).map_err(|e| e.to_string())? {
-                Some(header) => Some(header),
-                None if pending => app.session.companion_legacy_photo_header(photo).map_err(|e| e.to_string())?,
-                None => None,
+            match app.session.companion_photo_header(photo) {
+                Ok(Some(header)) => Some(header),
+                Ok(None) if pending => app.session.companion_legacy_photo_header(photo).map_err(|e| e.to_string())?,
+                Ok(None) => None,
+                Err(error) => {
+                    // No field from an unverified HEAD can select another photo's
+                    // graph or supply an epoch for replacement. Keep only the draft.
+                    conversation.history_error = Some(HistoryError::Ownership(format!("companion/v2/photos/{}/HEAD.json: {error}", photo.0)));
+                    self.conversations.insert(photo, conversation);
+                    self.prune_cache(app, photo);
+                    return Ok(());
+                }
             }
         } else {
             None
@@ -43,7 +51,7 @@ impl State {
                 Err(error) => {
                     // The owning manifest is verified independently. Its good
                     // message blocks remain readable when inner metadata fails.
-                    conversation.history_error = Some(format!("{}: {error}", header.metadata));
+                    conversation.history_error = Some(HistoryError::Data(format!("{}: {error}", header.metadata)));
                     None
                 }
             };
@@ -60,7 +68,7 @@ impl State {
         if let Some(archive) = archive {
             if !matches!(archive.get("schema_version").and_then(Value::as_u64), Some(1 | 2)) {
                 let source = conversation.prefix.as_ref().map(|header| header.metadata.as_str()).unwrap_or("companion/state.json");
-                conversation.history_error = Some(format!("{source}: unsupported conversation schema"));
+                conversation.history_error = Some(HistoryError::Data(format!("{source}: unsupported conversation schema")));
             }
             conversation.schema_version = archive["schema_version"].as_u64().unwrap_or(0);
             if conversation.history_error.is_none() {

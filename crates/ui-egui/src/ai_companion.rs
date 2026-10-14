@@ -170,13 +170,39 @@ struct HistoryView {
     card_owners: VecDeque<u64>,
     card_scan: Option<lightcraft_engine::companion::storage::DisplayScan>,
 }
+const ROOT_RECOVERY_GUIDANCE: &str =
+    "AI history is protected. Original files are kept. Back up the library, restore a verified companion backup, then reopen it.";
+enum HistoryError {
+    Data(String),
+    Ownership(String),
+}
+impl HistoryError {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Data(reason) | Self::Ownership(reason) => reason,
+        }
+    }
+    fn ownership_unknown(&self) -> bool {
+        matches!(self, Self::Ownership(_))
+    }
+    fn guidance(&self) -> &'static str {
+        match self {
+            Self::Data(_) => {
+                "Some AI history could not be verified. Readable records are kept. Repair the damaged data or delete this conversation before submitting again."
+            }
+            Self::Ownership(_) => {
+                "This photo's AI history cannot be verified. Original files are kept. Repair it from this library's verified backup, then reopen the library."
+            }
+        }
+    }
+}
 struct Conversation {
     scope: Option<PhotoScope>,
     schema_version: u64,
     legacy_cursor: u64,
     preview_cursor: u64,
     legacy_readonly: bool,
-    history_error: Option<String>,
+    history_error: Option<HistoryError>,
     prefix: Option<lightcraft_engine::companion::storage::PhotoHeader>,
     view: Option<HistoryView>,
     dirty: bool,
@@ -1840,13 +1866,23 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         })(),
         "ai.status" => {
             let viewed_photo = if params.get("photo").is_some() { photo } else { state.displayed_photo(app) };
-            if let Some(photo) = viewed_photo
+            let root_protected = app.session.companion_archive_protected_reason().is_some();
+            if !root_protected
+                && let Some(photo) = viewed_photo
                 && let Err(error) = state.load(app, photo)
             {
-                app.ai = state;
-                return Some(Err(error));
+                let conversation = state.conversations.entry(photo).or_insert_with(|| Conversation {
+                    scope: Some(PhotoScope { photo, library_generation: app.session.library_generation() }),
+                    ..Default::default()
+                });
+                conversation.history_error.get_or_insert(HistoryError::Data(error));
             }
             let conversation = viewed_photo.and_then(|p| state.conversations.get(&p));
+            let history_error = if root_protected {
+                Some(tr(ROOT_RECOVERY_GUIDANCE))
+            } else {
+                conversation.and_then(|conversation| conversation.history_error.as_ref()).map(|error| tr(error.guidance()))
+            };
             Ok(json!({
                 "readonlyPhoto": state.readonly_task.map(|scope| scope.photo.0),
                 "viewedPhoto": viewed_photo.map(|p| p.0),
@@ -1866,7 +1902,8 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                     "backendRoundId": (!j.round.is_empty()).then_some(j.round.as_str()),
                 })).collect::<Vec<_>>(),
                 "round": photo.and_then(|p| state.jobs.get(&p)).map(|j| j.round.clone()),
-                "text": conversation.map(display_text).unwrap_or_else(|| state.text.clone()),
+                "text": if root_protected { tr(ROOT_RECOVERY_GUIDANCE).to_owned() } else { conversation.map(display_text).unwrap_or_else(|| state.text.clone()) },
+                "historyError": history_error,
                 "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().chain(c.records.iter().filter_map(|r|card::from_record(r,None))).map(|card| present_card(app,&state,viewed_photo.unwrap_or(PhotoId(0)),card)).collect::<Vec<_>>()).unwrap_or_default(),
                 "historyLoading": state.paging.busy() || viewed_photo.is_some_and(|photo| state.paging.awaiting_page(photo)) || conversation.and_then(|c| c.view.as_ref()).is_some_and(|v|v.card_cursor.is_some()),
                 "migrationPending": app.session.companion_migration_pending(),
@@ -2021,6 +2058,9 @@ fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, params: &Va
     }
     if app.session.companion_archive_protected_reason().is_some() {
         return Err(tr("This conversation format is protected. Original history is retained.").into());
+    }
+    if state.conversations.get(&photo).and_then(|conversation| conversation.history_error.as_ref()).is_some_and(HistoryError::ownership_unknown) {
+        return Err(tr("This photo's AI history cannot be verified. Original files are kept. Repair it from this library's verified backup, then reopen the library.").into());
     }
     if state.jobs.contains_key(&photo) || state.worker_busy(photo) {
         return Err(tr("Stop the AI task and wait for it to finish before deleting its conversation.").into());
@@ -2327,13 +2367,10 @@ fn save_recovery(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
 }
 fn storage_recovery(app: &LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) -> bool {
     let outer = app.session.companion_archive_protected_reason();
-    let inner = app.ai.conversations.get(&photo).and_then(|conversation| conversation.history_error.as_deref());
-    let Some(reason) = outer.or(inner) else { return false };
-    ui.label(tr(if outer.is_some() {
-        "AI history is protected. Original files are kept. Back up the library, restore a verified companion backup, then reopen it."
-    } else {
-        "Some AI history could not be verified. Readable records are kept. Repair the damaged data or delete this conversation before submitting again."
-    }));
+    let inner = app.ai.conversations.get(&photo).and_then(|conversation| conversation.history_error.as_ref());
+    let Some(reason) = outer.or_else(|| inner.map(HistoryError::reason)) else { return false };
+    let guidance = if outer.is_some() { ROOT_RECOVERY_GUIDANCE } else { inner.map(HistoryError::guidance).unwrap_or(ROOT_RECOVERY_GUIDANCE) };
+    ui.label(tr(guidance));
     let copy = ui.button(tr("Copy Storage Diagnostic"));
     composer_widget(ui, "button:aiCopyStorageDiagnostic", copy.rect);
     if !ui.is_sizing_pass() && copy.clicked() {
@@ -2598,7 +2635,15 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
         }
         ui.horizontal_wrapped(|ui| {
             let button = ui.add_enabled(
-                !worker && !app.session.companion_migration_pending() && app.session.companion_archive_protected_reason().is_none(),
+                !worker
+                    && !app.session.companion_migration_pending()
+                    && app.session.companion_archive_protected_reason().is_none()
+                    && !app
+                        .ai
+                        .conversations
+                        .get(&photo)
+                        .and_then(|conversation| conversation.history_error.as_ref())
+                        .is_some_and(HistoryError::ownership_unknown),
                 egui::Button::new(tr("Delete Conversation")),
             );
             composer_widget(ui, "button:aiClear", button.rect);

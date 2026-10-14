@@ -195,3 +195,121 @@ fn missing_identity_with_a_saved_core_anchor_is_protected_until_repair_and_does_
         assert!(repaired.acquire_companion_lease(photo, LocalRoundId::new().unwrap()).is_ok());
     }
 }
+
+use lightcraft_catalog::{FsStore, SourceSnapshot};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+struct FenceFiles {
+    inner: Box<dyn Store>,
+    fail: Arc<AtomicBool>,
+    tripped: Arc<AtomicBool>,
+    after_visible: bool,
+}
+impl Store for FenceFiles {
+    fn read(&mut self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        self.inner.read(key)
+    }
+    fn read_limited(&mut self, key: &str, maximum: u64) -> io::Result<Option<Vec<u8>>> {
+        self.inner.read_limited(key, maximum)
+    }
+    fn read_range(&mut self, key: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        self.inner.read_range(key, offset, length)
+    }
+    fn source_snapshot(&mut self, key: &str) -> io::Result<Option<Box<dyn SourceSnapshot>>> {
+        self.inner.source_snapshot(key)
+    }
+    fn write_atomic(&mut self, key: &str, bytes: &[u8]) -> io::Result<()> {
+        if key == "companion/v2/load-proof.json" && self.fail.load(Ordering::Relaxed) {
+            self.tripped.store(true, Ordering::Relaxed);
+            if self.after_visible {
+                self.inner.write_atomic(key, bytes)?;
+            }
+            return Err(io::Error::other("uncertainty fence acknowledgement unavailable"));
+        }
+        self.inner.write_atomic(key, bytes)
+    }
+    fn append(&mut self, key: &str, bytes: &[u8]) -> io::Result<()> {
+        self.inner.append(key, bytes)
+    }
+    fn truncate(&mut self, key: &str, length: u64) -> io::Result<()> {
+        self.inner.truncate(key, length)
+    }
+    fn remove(&mut self, key: &str) -> io::Result<()> {
+        self.inner.remove(key)
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn retention_namespace(&self) -> Option<String> {
+        self.inner.retention_namespace()
+    }
+    fn conservative_retention(&self) -> bool {
+        self.inner.conservative_retention()
+    }
+}
+struct TemporaryLibrary(std::path::PathBuf);
+impl Drop for TemporaryLibrary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn unacknowledged_uncertainty_fence_never_opens_or_replays_core_on_memory_or_native_storage() {
+    for native in [false, true] {
+        for after_visible in [false, true] {
+            let directory = std::env::temp_dir().join(format!("lightcraft-ux14-fence-{}", LocalRoundId::new().unwrap().as_str()));
+            std::fs::create_dir(&directory).unwrap();
+            let temporary = TemporaryLibrary(directory);
+            let (catalog, files) = (MemStore::new(), MemStore::new());
+            let fail = Arc::new(AtomicBool::new(false));
+            let tripped = Arc::new(AtomicBool::new(false));
+            let catalog_handle =
+                || -> Box<dyn Store> { if native { Box::new(FsStore::open(&temporary.0).unwrap()) } else { Box::new(catalog.clone()) } };
+            let file_handle = || -> Box<dyn Store> { if native { Box::new(FsStore::open(&temporary.0).unwrap()) } else { Box::new(files.clone()) } };
+            let stores = || LibraryStores {
+                catalog: catalog_handle(),
+                files: Box::new(FenceFiles { inner: file_handle(), fail: fail.clone(), tripped: tripped.clone(), after_visible }),
+                dir: temporary.0.clone(),
+                on_disk: native,
+            };
+            let mut session = Session::new();
+            session.open_library_in(stores(), true).unwrap();
+            let photo = session.active().unwrap();
+            let round = publish(&mut session, photo);
+            let expected_core = serde_json::to_value(&session.catalog).unwrap();
+            session.close_library().unwrap();
+            drop(session);
+            let original = b"{protected native or memory identity";
+            let mut observed_files = file_handle();
+            observed_files.write_atomic("companion/v2/store-identity.json", original).unwrap();
+            let mut observed_catalog = catalog_handle();
+            let snapshot = observed_catalog.read("catalog.snap").unwrap();
+            let log = observed_catalog.read("catalog.log").unwrap();
+
+            fail.store(true, Ordering::Relaxed);
+            let mut cold = Session::new();
+            let error = cold.open_library_in(stores(), false).unwrap_err().to_string();
+            assert!(error.contains("uncertainty fence acknowledgement unavailable"));
+            assert!(tripped.load(Ordering::Relaxed));
+            assert!(cold.library.is_none());
+            assert_eq!(cold.catalog.photos().count(), 0);
+            assert_eq!(observed_catalog.read("catalog.snap").unwrap(), snapshot);
+            assert_eq!(observed_catalog.read("catalog.log").unwrap(), log);
+            assert_eq!(observed_files.read("companion/v2/store-identity.json").unwrap().unwrap(), original);
+
+            fail.store(false, Ordering::Relaxed);
+            cold.open_library_in(stores(), false).unwrap();
+            assert_eq!(serde_json::to_value(&cold.catalog).unwrap(), expected_core);
+            assert!(cold.companion_archive_protected_reason().is_some());
+            assert!(cold.verify_round_revert(photo, &round).is_err());
+            assert_eq!(observed_files.read("companion/v2/store-identity.json").unwrap().unwrap(), original);
+            cold.close_library().unwrap();
+        }
+    }
+}

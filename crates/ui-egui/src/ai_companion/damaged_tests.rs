@@ -65,6 +65,9 @@ fn protected_storage_shows_localized_repair_guidance_and_copies_an_owning_diagno
                 _ => "AI 历史处于保护状态，原文件已保留。请先备份图库，恢复已验证的 companion 备份，再重新打开图库。",
             };
             assert!(h.painted_text().iter().any(|text| text == guidance), "actual localized recovery outlet {layout}/{}", language.code());
+            let status = h.app.run("ai.status", json!({})).expect("protected archive diagnostics must remain queryable");
+            assert_eq!(status["historyError"], guidance);
+            assert_eq!(status["text"], guidance);
             assert!(h.painted_text().iter().any(|text| text == "Keep this visible unsent 草稿"), "verified independent draft is visible");
             super::panel_tests::reachable(&mut h, "button:aiCopyStorageDiagnostic", -1.0);
             assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiCopyStorageDiagnostic"}), Duration::from_secs(10))["ok"], true);
@@ -172,6 +175,14 @@ fn cold_damaged_inner_history_keeps_verified_text_blocks_submission_and_confirms
             let mut app = LightcraftApp::new(cold, Services::default());
             app.ui.language = language;
             app.ui.settings.gpu = false;
+            app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+            app.services.png = Some(Box::new(|image| {
+                lightcraft_engine::export::encode_image(
+                    image,
+                    &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+                )
+                .unwrap()
+            }));
             let mut h = Headless::new(app, [1400.0, 1000.0], 1.0);
             h.app.run("ai.open", json!({})).unwrap();
             for _ in 0..8 {
@@ -188,6 +199,16 @@ fn cold_damaged_inner_history_keeps_verified_text_blocks_submission_and_confirms
                 tr("The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.")
             );
             assert_eq!(h.app.run("ai.status", json!({})).unwrap()["busy"], false);
+            if let Ok(directory) = std::env::var("UX14_SCREENSHOT_DIR") {
+                assert_eq!(
+                    h.request(
+                        "ui.screenshot",
+                        json!({"path":format!("{directory}/inner-{}-{}.png",if bad_metadata {"metadata"}else{"schema"},language.code()),"headless":true}),
+                        Duration::from_secs(30)
+                    )["ok"],
+                    true
+                );
+            }
             super::panel_tests::reachable(&mut h, "button:aiClear", -1.0);
             assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClear"}), Duration::from_secs(10))["ok"], true);
             assert!(h.painted_text().iter().any(|text| {
@@ -208,6 +229,81 @@ fn cold_damaged_inner_history_keeps_verified_text_blocks_submission_and_confirms
             assert_eq!(h.app.session.companion_editor(b).unwrap().draft, "Keep B unsent request");
             assert_eq!(serde_json::to_value(&h.app.session.catalog).unwrap(), expected_core);
             assert!(h.app.session.acquire_companion_lease(a, LocalRoundId::new().unwrap()).is_ok());
+        }
+    }
+}
+
+#[test]
+fn unverified_photo_head_has_owning_repair_diagnostics_and_never_reads_or_clears_another_photos_history() {
+    for language in [Locale::En, Locale::ZhHans] {
+        let (catalog, mut files) = (MemStore::new(), MemStore::new());
+        let mut session = open(&catalog, &files);
+        let a = session.active().unwrap();
+        let b = session.catalog.photos().find(|photo| photo.id != a).unwrap().id;
+        for photo in [a, b] {
+            session
+                .save_companion_conversation(
+                    photo,
+                    json!({"schema_version":2,"messages":[{"role":"user","text":if photo==a {"A original history"}else{"B original history"}}],"rounds":[],"round_records":[]}),
+                )
+                .unwrap();
+        }
+        session.set_companion_editor(a, EditorState { draft: "A owned unsent draft".into(), ..Default::default() }).unwrap();
+        session.close_library().unwrap();
+        drop(session);
+        let a_head = format!("companion/v2/photos/{}/HEAD.json", a.0);
+        let b_head = format!("companion/v2/photos/{}/HEAD.json", b.0);
+        let unrelated = files.read(&b_head).unwrap().unwrap();
+        files.set(&a_head, unrelated.clone());
+        let cold = open(&catalog, &files);
+        let expected_core = serde_json::to_value(&cold.catalog).unwrap();
+        let mut app = LightcraftApp::new(cold, Services::default());
+        app.ui.language = language;
+        app.ui.settings.gpu = false;
+        app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+        app.services.png = Some(Box::new(|image| {
+            lightcraft_engine::export::encode_image(
+                image,
+                &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+            )
+            .unwrap()
+        }));
+        let mut h = Headless::new(app, [1400.0, 1000.0], 1.0);
+        h.app.run("ai.open", json!({})).unwrap();
+        for _ in 0..5 {
+            h.step();
+        }
+        assert_eq!(h.app.session.active(), Some(a));
+        let guidance = match language {
+            Locale::En => {
+                "This photo's AI history cannot be verified. Original files are kept. Repair it from this library's verified backup, then reopen the library."
+            }
+            _ => "此照片的 AI 历史无法验证，原文件已保留。请从该图库已验证的备份修复，再重新打开图库。",
+        };
+        assert!(h.painted_text().iter().any(|text| text == guidance));
+        assert_eq!(h.app.run("ai.status", json!({})).unwrap()["historyError"], guidance);
+        assert!(!h.painted_text().iter().any(|text| text == "B original history"));
+        super::panel_tests::reachable(&mut h, "button:aiCopyStorageDiagnostic", -1.0);
+        assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiCopyStorageDiagnostic"}), Duration::from_secs(10))["ok"], true);
+        assert!(h.view.clipboard.contains(&a_head));
+        assert!(h.app.run("ai.clear", json!({"photo":a.0})).is_err());
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiClearConfirm"));
+        let generation = h.app.session.library_generation();
+        assert!(h.app.run("ai.clear", json!({"photo":a.0,"confirm":true,"expected_epoch":0,"library_generation":generation})).is_err());
+        assert_eq!(files.read(&a_head).unwrap().unwrap(), unrelated);
+        assert_eq!(files.read(&b_head).unwrap().unwrap(), unrelated);
+        assert_eq!(h.app.session.companion_messages_page(b, 0, 32).unwrap().records[0]["text"], "B original history");
+        assert_eq!(h.app.session.companion_editor(a).unwrap().draft, "A owned unsent draft");
+        assert_eq!(serde_json::to_value(&h.app.session.catalog).unwrap(), expected_core);
+        if let Ok(directory) = std::env::var("UX14_SCREENSHOT_DIR") {
+            assert_eq!(
+                h.request(
+                    "ui.screenshot",
+                    json!({"path":format!("{directory}/ownership-{}.png",language.code()),"headless":true}),
+                    Duration::from_secs(30)
+                )["ok"],
+                true
+            );
         }
     }
 }
