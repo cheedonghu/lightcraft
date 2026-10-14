@@ -1,4 +1,5 @@
 {
+  "Message unavailable. Original data is retained.": "消息不可用，原始数据已保留。",
   "This photo's AI history cannot be verified. Original files are kept. Repair it from this library's verified backup, then reopen the library.": "此照片的 AI 历史无法验证，原文件已保留。请从该图库已验证的备份修复，再重新打开图库。",
   "Some AI history could not be verified. Readable records are kept. Repair the damaged data or delete this conversation before submitting again.": "部分 AI 历史无法验证，已保留可读内容。请修复损坏的数据，或删除此对话后重新提交。",
   "AI history is protected. Original files are kept. Back up the library, restore a verified companion backup, then reopen it.": "AI 历史处于保护状态，原文件已保留。请先备份图库，恢复已验证的 companion 备份，再重新打开图库。",

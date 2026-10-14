@@ -15,6 +15,109 @@ fn open(catalog: &MemStore, files: &MemStore) -> Session {
 }
 
 #[test]
+fn corrupt_owned_message_shows_a_localized_placeholder_keeps_neighbors_and_blocks_submission() {
+    for language in [Locale::En, Locale::ZhHans] {
+        for background in [false, true] {
+            let (catalog, mut files) = (MemStore::new(), MemStore::new());
+            files.background = background;
+            let mut session = open(&catalog, &files);
+            let photo = session.active().unwrap();
+            let mut messages = vec![
+                json!({"role":"user","text":"INTACT BEFORE"}),
+                json!({"role":"assistant","text":"DAMAGED MIDDLE"}),
+                json!({"role":"user","text":"INTACT AFTER"}),
+            ];
+            if background {
+                messages.extend((3..40).map(|_| json!({"role":"assistant","text":"LATER VERIFIED"})));
+            }
+            session.save_companion_conversation(photo, json!({"schema_version":2,"messages":messages,"rounds":[],"round_records":[]})).unwrap();
+            session.set_companion_editor(photo, EditorState { draft: "Keep the unsent draft".into(), ..Default::default() }).unwrap();
+            let header = session.companion_photo_header(photo).unwrap().unwrap();
+            session.close_library().unwrap();
+            drop(session);
+            let mut index: Value = serde_json::from_slice(&files.get(&header.message_root.as_ref().unwrap().key).unwrap()).unwrap();
+            while index["start"].as_u64().unwrap() > 1 {
+                index = serde_json::from_slice(&files.get(index["previous"]["key"].as_str().unwrap()).unwrap()).unwrap();
+            }
+            let entry = &index["entries"][1];
+            let key = entry["block"].as_str().unwrap();
+            let offset = entry["offset"].as_u64().unwrap() as usize;
+            let length = entry["length"].as_u64().unwrap() as usize;
+            let mut block = files.get(key).unwrap();
+            let relative = block[offset..offset + length].windows(b"DAMAGED MIDDLE".len()).position(|b| b == b"DAMAGED MIDDLE").unwrap();
+            block[offset + relative] = b'X';
+            files.set(key, block.clone());
+            let mut app = LightcraftApp::new(open(&catalog, &files), Services::default());
+            app.ui.language = language;
+            app.ui.settings.gpu = false;
+            app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+            app.services.png = Some(Box::new(|image| {
+                lightcraft_engine::export::encode_image(
+                    image,
+                    &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+                )
+                .unwrap()
+            }));
+            let mut h = Headless::new(app, [1400.0, 1000.0], 1.0);
+            h.app.run("ai.open", json!({})).unwrap();
+            h.app.run("ai.history", json!({"photo":photo.0,"record":0})).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                h.step();
+                let status = h.app.run("ai.status", json!({})).unwrap();
+                if status["historyLoading"] == false {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "actual page did not retire");
+                std::thread::yield_now();
+            }
+            for _ in 0..5 {
+                h.step();
+            }
+            assert!(h.painted_text().iter().any(|text| text == "INTACT BEFORE"));
+            assert!(h.painted_text().iter().any(|text| text == "INTACT AFTER"));
+            let placeholder = match language {
+                Locale::En => "Message unavailable. Original data is retained.",
+                _ => "消息不可用，原始数据已保留。",
+            };
+            assert!(h.painted_text().iter().any(|text| text == placeholder));
+            assert!(!h.painted_text().iter().any(|text| text.contains("MIDDLE")));
+            assert!(h.app.run("ai.status", json!({})).unwrap()["historyError"].is_string());
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
+            assert_eq!(
+                h.app.run("ai.start", json!({"photo":photo.0})).unwrap_err(),
+                tr("The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.")
+            );
+            super::panel_tests::reachable(&mut h, "button:aiCopyStorageDiagnostic", -1.0);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiCopyStorageDiagnostic"}), Duration::from_secs(10))["ok"], true);
+            assert!(h.view.clipboard.contains(key));
+            assert!(h.view.clipboard.contains("record 1"));
+            assert_eq!(h.app.session.companion_editor(photo).unwrap().draft, "Keep the unsent draft");
+            assert_eq!(files.get(key).unwrap(), block);
+            if let Ok(directory) = std::env::var("UX14_SCREENSHOT_DIR") {
+                assert_eq!(h.request("ui.screenshot", json!({"path":format!("{directory}/neighbor-{}-{}.png",if background {"threaded"} else {"sync"},language.code()),"headless":true}), Duration::from_secs(30))["ok"], true);
+            }
+            if background {
+                assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryNewer"}), Duration::from_secs(10))["ok"], true);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    h.step();
+                    let status = h.app.run("ai.status", json!({})).unwrap();
+                    if status["historyLoading"] == false && status["text"].as_str().unwrap().starts_with("LATER VERIFIED\n") {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "Newer must reach verified records beyond the damaged page: {status}");
+                    std::thread::yield_now();
+                }
+                assert!(h.app.run("ai.status", json!({})).unwrap()["historyError"].is_string());
+                assert_eq!(h.app.session.companion_editor(photo).unwrap().draft, "Keep the unsent draft");
+                assert_eq!(files.get(key).unwrap(), block);
+            }
+        }
+    }
+}
+
+#[test]
 fn protected_storage_shows_localized_repair_guidance_and_copies_an_owning_diagnostic_with_the_draft_kept() {
     for language in [Locale::En, Locale::ZhHans] {
         for (layout, size) in [("normal", [1400.0, 1000.0]), ("narrow", [640.0, 900.0])] {

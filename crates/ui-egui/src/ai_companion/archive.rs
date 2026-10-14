@@ -259,6 +259,9 @@ impl State {
             .collect();
         let total = if prefix.record_count > 0 { prefix.record_count } else { prefix.round_count };
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+        if !page.errors.is_empty() {
+            conversation.history_error = Some(HistoryError::Data(page.errors.join("\n")));
+        }
         conversation.view = Some(HistoryView {
             captured_header: prefix.clone(),
             _retention: retention,

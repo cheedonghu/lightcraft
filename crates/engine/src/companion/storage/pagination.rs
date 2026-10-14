@@ -9,8 +9,19 @@ pub struct HistoryCursor {
 /// Ordered references into a slice's owned buffers; no text/body is duplicated.
 #[derive(Clone, Copy, Debug)]
 pub enum HistoryItem {
-    Record { record: u64, index: usize },
-    Fragment { record: u64, offset: u64, index: usize },
+    Record {
+        record: u64,
+        index: usize,
+    },
+    Fragment {
+        record: u64,
+        offset: u64,
+        index: usize,
+    },
+    /// An owned, indexed record whose payload could not be verified.
+    Unavailable {
+        record: u64,
+    },
 }
 #[derive(Debug)]
 pub struct HistorySlice {
@@ -18,6 +29,8 @@ pub struct HistorySlice {
     pub records: Vec<Value>,
     /// Oversize message text remains readable as consecutive decoded UTF-8 fragments.
     pub fragments: Vec<String>,
+    /// Bounded owning diagnostics for unavailable display records; never model input.
+    pub errors: Vec<String>,
     pub next: Option<HistoryCursor>,
     pub bytes: usize,
 }
@@ -114,109 +127,145 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
     if !(1024..=256 * 1024).contains(&byte_budget) {
         return Err(error("history byte budget must be 1 KiB..256 KiB"));
     }
-    let mut result = HistorySlice { items: Vec::new(), records: Vec::new(), fragments: Vec::new(), next: None, bytes: 0 };
-    let mut scanned = 0usize;
-    while cursor.record < h.message_count && scanned < 32 {
-        scanned += 1;
+    let mut result = HistorySlice { items: Vec::new(), records: Vec::new(), fragments: Vec::new(), errors: Vec::new(), next: None, bytes: 0 };
+    for _ in 0..32 {
+        if cursor.record >= h.message_count || byte_budget.saturating_sub(result.bytes) < 1024 {
+            break;
+        }
+        // Ownership, index integrity and entry bounds remain strict. Only a
+        // payload selected through that verified index can become a placeholder.
         let entry = entry(store, h.photo_id, h.message_root.as_ref(), h.message_count, cursor.record)?;
         if cursor.offset >= entry.length as u64 {
             return Err(error("fragment offset outside record"));
         }
-        let oversized = entry.length > byte_budget.saturating_sub(result.bytes) || cursor.offset > 0;
-        if oversized && entry.chunk_payload.is_none() {
-            if entry.length as u64 > BLOCK {
-                return Err(error("unverified legacy chunk layout; original history retained"));
-            }
-            let complete = range(store, h.photo_id, &entry, 0, entry.length)?;
-            if digest(&complete) != entry.digest {
-                return Err(error("record digest mismatch"));
-            }
-        }
-        let text_end = if oversized && let Some([start, end]) = entry.text_range {
-            if start > end || end > entry.length as u64 {
-                return Err(error("invalid message text range"));
-            }
-            cursor.offset = cursor.offset.max(start);
-            if entry.text_range_version == Some(1) && cursor.offset >= end {
-                if start == end {
-                    result.items.push(HistoryItem::Fragment { record: cursor.record, offset: start, index: result.fragments.len() });
-                    result.fragments.push(String::new());
+        let record = cursor.record;
+        let lengths = (result.items.len(), result.records.len(), result.fragments.len());
+        match slice_record(store, h, &entry, &mut cursor, &mut result, byte_budget) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(cause) => {
+                result.items.truncate(lengths.0);
+                result.records.truncate(lengths.1);
+                result.fragments.truncate(lengths.2);
+                let mut diagnostic = format!("{} record {record}: {cause}", entry.block);
+                if diagnostic.len() > 512 {
+                    let mut boundary = 512;
+                    while !diagnostic.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    diagnostic.truncate(boundary);
                 }
-                cursor.record += 1;
-                cursor.offset = 0;
-                continue;
+                result.bytes += diagnostic.len();
+                result.errors.push(diagnostic);
+                result.items.push(HistoryItem::Unavailable { record });
+                cursor = HistoryCursor { record: record + 1, offset: 0 };
             }
-            Some(if entry.text_range_version == Some(1) { end } else { entry.length as u64 })
-        } else {
-            None
-        };
-        let remaining = text_end.unwrap_or(entry.length as u64) - cursor.offset;
-        let available = byte_budget.saturating_sub(result.bytes);
-        if available < 1024 {
-            break;
-        }
-        let length = usize::try_from(remaining.min(available as u64)).map_err(error)?;
-        let mut bytes = range(store, h.photo_id, &entry, cursor.offset, length)?;
-        // Old hints encoded a content heuristic, not the complete authored span.
-        // Keep the known string start and discover its closing quote within this
-        // one bounded slice. Never hydrate or rewrite the giant model record.
-        let old_string_end = text_end.is_some() && entry.text_range_version != Some(1);
-        let quote = old_string_end.then(|| string_end(&bytes)).flatten();
-        if let Some(end) = quote {
-            bytes.truncate(end);
-        }
-        if old_string_end && quote == Some(0) {
-            result.items.push(HistoryItem::Fragment { record: cursor.record, offset: cursor.offset, index: result.fragments.len() });
-            result.fragments.push(String::new());
-            cursor.record += 1;
-            cursor.offset = 0;
-            continue;
-        }
-        if cursor.offset > 0 {
-            let skip = bytes.iter().take(3).take_while(|b| **b & 0xc0 == 0x80).count();
-            if skip > 0 {
-                bytes.drain(..skip);
-                cursor.offset = cursor.offset.checked_add(skip as u64).ok_or_else(|| error("UTF-8 cursor overflow"))?;
-            }
-        }
-        if text_end.is_none() && cursor.offset == 0 && remaining == length as u64 {
-            if digest(&bytes) != entry.digest {
-                return Err(error("record digest mismatch"));
-            }
-            result.items.push(HistoryItem::Record { record: cursor.record, index: result.records.len() });
-            result.records.push(scan::selected(&bytes)?);
-        } else {
-            // Keep boundaries on complete UTF-8 scalars; the subsequent fragment resumes
-            // at the exact remaining byte. No content or message is discarded.
-            if let Err(e) = std::str::from_utf8(&bytes) {
-                if e.error_len().is_some() {
-                    return Err(error("invalid UTF-8 history fragment"));
-                }
-                bytes.truncate(e.valid_up_to());
-            }
-            result.items.push(HistoryItem::Fragment { record: cursor.record, offset: cursor.offset, index: result.fragments.len() });
-            if text_end.is_some() {
-                let safe = complete_escape_prefix(&bytes);
-                bytes.truncate(safe);
-                let encoded = String::from_utf8(bytes.clone()).map_err(error)?;
-                let decoded: String = serde_json::from_str(&format!("\"{encoded}\"")).map_err(error)?;
-                result.fragments.push(decoded);
-            } else {
-                result.fragments.push(String::from_utf8(bytes.clone()).map_err(error)?);
-            }
-        }
-        result.bytes += bytes.len();
-        cursor.offset = cursor.offset.checked_add(bytes.len() as u64).ok_or_else(|| error("fragment cursor overflow"))?;
-        if quote.is_some() || cursor.offset == text_end.unwrap_or(entry.length as u64) {
-            cursor.record += 1;
-            cursor.offset = 0;
-        }
-        if result.bytes >= byte_budget {
-            break;
         }
     }
     result.next = (cursor.record < h.message_count).then_some(cursor);
     Ok(result)
+}
+fn slice_record(
+    store: &mut dyn Store,
+    h: &PhotoHeader,
+    entry: &Entry,
+    cursor: &mut HistoryCursor,
+    result: &mut HistorySlice,
+    byte_budget: usize,
+) -> Result<bool> {
+    let oversized = entry.length > byte_budget.saturating_sub(result.bytes) || cursor.offset > 0;
+    if oversized && entry.chunk_payload.is_none() {
+        if entry.length as u64 > BLOCK {
+            return Err(error("unverified legacy chunk layout; original history retained"));
+        }
+        let complete = range(store, h.photo_id, entry, 0, entry.length)?;
+        if digest(&complete) != entry.digest {
+            return Err(error("record digest mismatch"));
+        }
+    }
+    let text_end = if oversized && let Some([start, end]) = entry.text_range {
+        if start > end || end > entry.length as u64 {
+            return Err(error("invalid message text range"));
+        }
+        cursor.offset = cursor.offset.max(start);
+        if entry.text_range_version == Some(1) && cursor.offset >= end {
+            if start == end {
+                result.items.push(HistoryItem::Fragment { record: cursor.record, offset: start, index: result.fragments.len() });
+                result.fragments.push(String::new());
+            }
+            cursor.record += 1;
+            cursor.offset = 0;
+            return Ok(true);
+        }
+        Some(if entry.text_range_version == Some(1) { end } else { entry.length as u64 })
+    } else {
+        None
+    };
+    let remaining = text_end.unwrap_or(entry.length as u64) - cursor.offset;
+    let available = byte_budget.saturating_sub(result.bytes);
+    if available < 1024 {
+        return Ok(false);
+    }
+    let length = usize::try_from(remaining.min(available as u64)).map_err(error)?;
+    let mut bytes = range(store, h.photo_id, entry, cursor.offset, length)?;
+    // Old hints encoded a content heuristic, not the complete authored span.
+    // Keep the known string start and discover its closing quote within this
+    // one bounded slice. Never hydrate or rewrite the giant model record.
+    let old_string_end = text_end.is_some() && entry.text_range_version != Some(1);
+    let quote = old_string_end.then(|| string_end(&bytes)).flatten();
+    if let Some(end) = quote {
+        bytes.truncate(end);
+    }
+    if old_string_end && quote == Some(0) {
+        result.items.push(HistoryItem::Fragment { record: cursor.record, offset: cursor.offset, index: result.fragments.len() });
+        result.fragments.push(String::new());
+        cursor.record += 1;
+        cursor.offset = 0;
+        return Ok(true);
+    }
+    if cursor.offset > 0 {
+        let skip = bytes.iter().take(3).take_while(|b| **b & 0xc0 == 0x80).count();
+        if skip > 0 {
+            bytes.drain(..skip);
+            cursor.offset = cursor.offset.checked_add(skip as u64).ok_or_else(|| error("UTF-8 cursor overflow"))?;
+        }
+    }
+    if text_end.is_none() && cursor.offset == 0 && remaining == length as u64 {
+        if digest(&bytes) != entry.digest {
+            return Err(error("record digest mismatch"));
+        }
+        result.items.push(HistoryItem::Record { record: cursor.record, index: result.records.len() });
+        result.records.push(scan::selected(&bytes)?);
+    } else {
+        // Keep boundaries on complete UTF-8 scalars; the subsequent fragment resumes
+        // at the exact remaining byte. No content or message is discarded.
+        if let Err(e) = std::str::from_utf8(&bytes) {
+            if e.error_len().is_some() {
+                return Err(error("invalid UTF-8 history fragment"));
+            }
+            bytes.truncate(e.valid_up_to());
+        }
+        result.items.push(HistoryItem::Fragment { record: cursor.record, offset: cursor.offset, index: result.fragments.len() });
+        if text_end.is_some() {
+            let safe = complete_escape_prefix(&bytes);
+            bytes.truncate(safe);
+            let encoded = String::from_utf8(bytes.clone()).map_err(error)?;
+            let decoded: String = serde_json::from_str(&format!("\"{encoded}\"")).map_err(error)?;
+            result.fragments.push(decoded);
+        } else {
+            result.fragments.push(String::from_utf8(bytes.clone()).map_err(error)?);
+        }
+    }
+    result.bytes += bytes.len();
+    cursor.offset = cursor.offset.checked_add(bytes.len() as u64).ok_or_else(|| error("fragment cursor overflow"))?;
+    if quote.is_some() || cursor.offset == text_end.unwrap_or(entry.length as u64) {
+        cursor.record += 1;
+        cursor.offset = 0;
+    }
+    if result.bytes >= byte_budget {
+        return Ok(false);
+    }
+    Ok(true)
 }
 pub(super) fn metadata_raw(store: &mut dyn Store, h: &PhotoHeader) -> Result<Value> {
     if h.metadata_length > SMALL {

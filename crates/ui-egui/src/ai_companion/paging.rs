@@ -90,6 +90,9 @@ impl State {
             self.paging.completed = message.request;
             match message.result {
                 ReadContent::Page(Ok((page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages))) => {
+                    if !page.errors.is_empty() {
+                        conversation.history_error = Some(HistoryError::Data(page.errors.join("\n")));
+                    }
                     if let Some(notice) = notice {
                         conversation.notice = notice;
                     }
@@ -135,6 +138,7 @@ impl State {
                     }
                 }
                 ReadContent::Page(Err(error)) => {
+                    conversation.history_error = Some(HistoryError::Data(error.clone()));
                     conversation.notice = error;
                     conversation.view = Some(HistoryView {
                         captured_header: message.header,
@@ -438,6 +442,7 @@ impl State {
                 items: view.items.clone(),
                 records: view.messages.clone(),
                 fragments: view.fragments.clone(),
+                errors: Vec::new(),
                 next: view.next,
                 bytes: view.bytes,
             });

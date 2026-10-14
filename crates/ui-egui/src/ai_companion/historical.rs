@@ -50,6 +50,7 @@ pub(super) fn read_native(reader: &mut HistoryReader, page: &HistorySlice, posit
     for item in &page.items {
         let record = match *item {
             HistoryItem::Record { record, .. } | HistoryItem::Fragment { record, .. } => record,
+            HistoryItem::Unavailable { .. } => continue,
         };
         if record >= reader.header().original_message_count() {
             continue;
@@ -64,6 +65,7 @@ pub(super) fn read_native(reader: &mut HistoryReader, page: &HistorySlice, posit
                 )
             }
             HistoryItem::Fragment { .. } => reader.original_image_reference(record, index).ok()?,
+            HistoryItem::Unavailable { .. } => continue,
         };
         if selected.is_none()
             && position >= total

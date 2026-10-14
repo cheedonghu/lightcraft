@@ -5,6 +5,13 @@ pub(super) fn show(ui: &mut egui::Ui, conversation: &Conversation, attachments: 
     if let Some(view) = &conversation.view {
         for item in &view.items {
             match *item {
+                lightcraft_engine::companion::storage::HistoryItem::Unavailable { record } => {
+                    ui.push_id(("unavailable-message", record), |ui| {
+                        ui.group(|ui| {
+                            ui.label(tr("Message unavailable. Original data is retained."));
+                        });
+                    });
+                }
                 lightcraft_engine::companion::storage::HistoryItem::Record { record, index } => {
                     if let Some(message) = view.messages.get(index) {
                         message_row(ui, message, &format!("record-{record}"), attachments);

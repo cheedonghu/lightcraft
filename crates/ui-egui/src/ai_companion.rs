@@ -2133,6 +2133,7 @@ fn display_text(conversation: &Conversation) -> String {
     if let Some(view) = &conversation.view {
         for item in &view.items {
             match *item {
+                lightcraft_engine::companion::storage::HistoryItem::Unavailable { .. } => {}
                 lightcraft_engine::companion::storage::HistoryItem::Record { index, .. } => {
                     if let Some(message) = view.messages.get(index) {
                         append_visible_message(&mut text, message);

@@ -13,6 +13,63 @@ fn open(catalog: &MemStore, files: &MemStore) -> Session {
     session
 }
 
+#[test]
+fn damaged_owned_message_keeps_verified_neighbors_readable_but_never_enters_model_history() {
+    use lightcraft_engine::companion::storage::HistoryCursor;
+    for count in [3, 40] {
+        let (catalog, mut files) = (MemStore::new(), MemStore::new());
+        files.background = true;
+        let mut session = open(&catalog, &files);
+        let photo = session.active().unwrap();
+        let mut messages = vec![
+            json!({"role":"user","text":"INTACT BEFORE"}),
+            json!({"role":"assistant","text":"DAMAGED MIDDLE"}),
+            json!({"role":"user","text":"INTACT AFTER"}),
+        ];
+        messages.extend((3..count).map(|_| json!({"role":"assistant","text":"LATER VERIFIED"})));
+        session.save_companion_conversation(photo, json!({"schema_version":2,"messages":messages,"rounds":[],"round_records":[]})).unwrap();
+        let header = session.companion_photo_header(photo).unwrap().unwrap();
+        session.close_library().unwrap();
+        drop(session);
+        let mut index: serde_json::Value = serde_json::from_slice(&files.get(&header.message_root.as_ref().unwrap().key).unwrap()).unwrap();
+        while index["start"].as_u64().unwrap() > 1 {
+            index = serde_json::from_slice(&files.get(index["previous"]["key"].as_str().unwrap()).unwrap()).unwrap();
+        }
+        let entry = &index["entries"][1];
+        let key = entry["block"].as_str().unwrap();
+        let offset = entry["offset"].as_u64().unwrap() as usize;
+        let length = entry["length"].as_u64().unwrap() as usize;
+        let mut block = files.get(key).unwrap();
+        let relative = block[offset..offset + length].windows(b"DAMAGED MIDDLE".len()).position(|b| b == b"DAMAGED MIDDLE").unwrap();
+        block[offset + relative] = b'X';
+        files.set(key, block.clone());
+        let mut cold = open(&catalog, &files);
+        let page = cold
+            .companion_history_slice_at(&header, HistoryCursor::default(), 256 * 1024)
+            .expect("display retains independently verified neighbors of a damaged owned message");
+        assert_eq!(page.records[0]["text"], "INTACT BEFORE");
+        assert_eq!(page.records[1]["text"], "INTACT AFTER");
+        assert!(page.errors[0].contains(key));
+        assert!(page.bytes <= 256 * 1024);
+        assert_eq!(page.items.len(), count.min(32), "damaged message retains its position within bounded work");
+        if count == 3 {
+            assert!(page.next.is_none());
+        } else {
+            let next = page.next.expect("a damaged record does not strand later pages");
+            assert_eq!(next, HistoryCursor { record: 32, offset: 0 });
+            let later = cold.companion_history_slice_at(&header, next, 256 * 1024).unwrap();
+            assert_eq!(later.records.len(), 8);
+            assert!(later.records.iter().all(|record| record["text"] == "LATER VERIFIED"));
+            assert!(later.next.is_none());
+        }
+        let mut reader = cold.companion_reader(&header).unwrap().expect("actual background reader");
+        assert_eq!(reader.slice(HistoryCursor::default(), 256 * 1024).unwrap().records[1]["text"], "INTACT AFTER");
+        assert!(reader.protocol_messages(0, 3, 256 * 1024).is_err());
+        assert!(cold.companion_protocol_messages_bounded(&header, 0, 3, 256 * 1024).is_err());
+        assert_eq!(files.get(key).unwrap(), block, "reading never rewrites damaged original data");
+    }
+}
+
 fn publish(session: &mut Session, photo: PhotoId) -> LocalRoundId {
     let round = LocalRoundId::new().unwrap();
     let start = session.develop_of(photo).unwrap();
