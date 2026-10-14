@@ -556,6 +556,26 @@ fn archived_comparison(bounded: bool) {
     let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1400.0, 1000.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     h.app.run("ai.compare", json!({"local_round_id":round})).unwrap();
+    if bounded {
+        // Publication may advance while the captured comparison still has
+        // bounded reads outstanding. Its old graph must remain readable.
+        let header = h.app.session.companion_photo_header(photo).unwrap().unwrap();
+        let mut messages = h.app.session.companion_messages_page(photo, 0, 2).unwrap().records;
+        let record = h.app.session.companion_round(photo, round.as_str()).unwrap().unwrap();
+        messages.push(json!({"role":"assistant","text":"A later saved response while historical reads are pending."}));
+        h.app
+            .session
+            .save_companion_conversation(photo, json!({"schema_version":2,"messages":messages,"rounds":[],"round_records":[record]}))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.app.session.collect_companion(photo, 32).unwrap().pending {
+            assert!(Instant::now() < deadline);
+        }
+        assert!(
+            h.app.session.companion_messages_bounded(&header, 0, 1, 256 * 1024).is_ok(),
+            "the captured comparison graph must survive later publication and actual reclamation"
+        );
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         h.step();

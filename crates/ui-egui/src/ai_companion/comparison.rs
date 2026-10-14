@@ -80,6 +80,7 @@ pub(super) fn enter(state: &mut State, app: &mut LightcraftApp, params: &Value) 
         receiver: None,
         cancel: Arc::new(AtomicBool::new(false)),
     });
+    let retention = if native.is_none() { Some(app.session.retain_companion_history(&header).map_err(|e| e.to_string())?) } else { None };
     state.comparison = Some(Comparison {
         scope: PhotoScope { photo, library_generation: app.session.library_generation() },
         round: round.into(),
@@ -91,7 +92,7 @@ pub(super) fn enter(state: &mut State, app: &mut LightcraftApp, params: &Value) 
         before: Picture::default(),
         after: Picture::default(),
         native,
-        _retention: None,
+        _retention: retention,
     });
     Ok(json!({"opened":true,"photo":photo.0}))
 }
