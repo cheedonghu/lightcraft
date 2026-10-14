@@ -916,6 +916,7 @@ impl LightcraftApp {
         view.run(headless::HeadlessView::raw_input(size, ppp, time, vec![]), |ui| self.ui(ui));
         let img = capture.then(|| {
             let mut tex = self.renderer.cpu_textures();
+            ai_companion::cpu_textures(&self.ai, &mut tex);
             if let (Some((t, ..)), Some(px)) = (&self.merge.preview, &self.merge.preview_pixels) {
                 tex.insert(t.id(), crate::softpaint::CpuTexture::linear(px.clone()));
             }

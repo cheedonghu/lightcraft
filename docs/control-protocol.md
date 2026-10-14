@@ -11,6 +11,8 @@
 
 Requests are answered on the UI thread between frames (timeout 60 s).
 
+Companion preview textures retain bounded shared CPU pixels for the window's offscreen screenshot path: up to eight visible-history cache entries and the two captured comparison sides, each decoded within 640 by 640. The compositor fallback uses the same recorded JPEG pixels instead of blank texture placeholders. A just-published v2 live-tail image captures an owned committed-head reader before sidebar prefix loading; it never goes through the v1-only attachment reader. This adds no synchronous preview decode or image-file read to screenshot capture.
+
 **Only requests are read.** Every line must be a JSON object with a string `method` (`id` and `params` are
 optional; blank lines are skipped). Anything else — text that isn't JSON, a JSON array or number, an object without
 `method`, invalid UTF-8, or a line longer than 4 MiB — gets one error reply

@@ -21,9 +21,14 @@ impl Drop for Native {
 #[derive(Default)]
 struct Picture {
     texture: Option<egui::TextureHandle>,
+    pixels: Option<Arc<egui::ColorImage>>,
     matches: u64,
 }
 impl Picture {
+    fn set_image(&mut self, ctx: &egui::Context, image: Option<egui::ColorImage>, name: &str) {
+        self.pixels = image.map(Arc::new);
+        self.texture = self.pixels.as_ref().map(|image| ctx.load_texture(name, image.clone(), egui::TextureOptions::LINEAR));
+    }
     fn status(&self) -> Value {
         self.texture.as_ref().map_or_else(
             || json!({"available":false}),
@@ -96,7 +101,7 @@ pub(super) fn enter(state: &mut State, app: &mut LightcraftApp, params: &Value) 
     });
     Ok(json!({"opened":true,"photo":photo.0}))
 }
-fn picture(app: &mut LightcraftApp, ctx: &egui::Context, photo: PhotoId, message: &Value) -> Option<egui::TextureHandle> {
+fn picture(app: &mut LightcraftApp, photo: PhotoId, message: &Value) -> Option<egui::ColorImage> {
     let images = message["images"].as_array()?;
     if images.len() != 1 || images.first()?["mime_type"] != "image/jpeg" {
         return None;
@@ -104,8 +109,7 @@ fn picture(app: &mut LightcraftApp, ctx: &egui::Context, photo: PhotoId, message
     let image = images.first()?;
     let bytes = app.session.read_companion_historical_preview(photo, image).ok()?;
     lightcraft_engine::companion::validate_history_image("image/jpeg", &bytes).ok()?;
-    let image = decode(&bytes)?;
-    Some(ctx.load_texture("ai-round-comparison", image, egui::TextureOptions::LINEAR))
+    decode(&bytes)
 }
 fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
     lightcraft_engine::companion::validate_history_image("image/jpeg", bytes).ok()?;
@@ -199,8 +203,8 @@ fn poll_native(state: &mut State, view: &mut Comparison, ctx: &egui::Context) {
     {
         match receiver.try_recv() {
             Ok(loaded) => {
-                view.before.texture = loaded.before.map(|image| ctx.load_texture("ai-comparison-before", image, egui::TextureOptions::LINEAR));
-                view.after.texture = loaded.after.map(|image| ctx.load_texture("ai-comparison-after", image, egui::TextureOptions::LINEAR));
+                view.before.set_image(ctx, loaded.before, "ai-comparison-before");
+                view.after.set_image(ctx, loaded.after, "ai-comparison-after");
                 view._retention = Some(loaded.retention);
                 native.receiver = None;
                 view.loading = false;
@@ -258,7 +262,8 @@ pub(super) fn poll(state: &mut State, app: &mut LightcraftApp, ctx: &egui::Conte
                         };
                         if let Some(slot) = slot {
                             slot.matches = slot.matches.saturating_add(1);
-                            slot.texture = if slot.matches == 1 { picture(app, ctx, view.scope.photo, &record) } else { None };
+                            let image = if slot.matches == 1 { picture(app, view.scope.photo, &record) } else { None };
+                            slot.set_image(ctx, image, "ai-round-comparison");
                         }
                     }
                     let next = index.saturating_add(1);
@@ -276,6 +281,15 @@ pub(super) fn poll(state: &mut State, app: &mut LightcraftApp, ctx: &egui::Conte
         ctx.request_repaint();
     }
     state.comparison = Some(view);
+}
+pub(super) fn cpu_textures(state: &State, textures: &mut std::collections::HashMap<egui::TextureId, crate::softpaint::CpuTexture>) {
+    if let Some(view) = &state.comparison {
+        for picture in [&view.before, &view.after] {
+            if let (Some(texture), Some(image)) = (&picture.texture, &picture.pixels) {
+                textures.insert(texture.id(), crate::softpaint::CpuTexture::linear(image.clone()));
+            }
+        }
+    }
 }
 pub(super) fn return_button(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let button = ui.button(tr("Return to Current Photo"));

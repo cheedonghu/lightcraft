@@ -22,7 +22,7 @@ enum Source {
     Inline,
 }
 enum Preview {
-    Ready(egui::TextureHandle, Retention),
+    Ready(egui::TextureHandle, Arc<egui::ColorImage>, Retention),
     Missing,
 }
 struct Completed {
@@ -107,7 +107,7 @@ impl Attachments {
         let id = format!("{:032x}", lightcraft_preview::hash_bytes(&bytes).0);
         self.visible.insert(id.clone());
         match self.cache.get(&id) {
-            Some(Preview::Ready(texture, _retention)) => {
+            Some(Preview::Ready(texture, _pixels, _retention)) => {
                 let size = texture.size_vec2();
                 let fitted = size * (rect.width() / size.x).min(rect.height() / size.y);
                 let image_rect = egui::Rect::from_center_size(rect.center(), fitted);
@@ -133,6 +133,13 @@ impl Attachments {
                     self.pending.push_back(Request { scope, id, image: image.clone() });
                     ui.ctx().request_repaint();
                 }
+            }
+        }
+    }
+    pub(super) fn cpu_textures(&self, textures: &mut std::collections::HashMap<egui::TextureId, crate::softpaint::CpuTexture>) {
+        for preview in self.cache.values() {
+            if let Preview::Ready(texture, pixels, _) = preview {
+                textures.insert(texture.id(), crate::softpaint::CpuTexture::linear(pixels.clone()));
             }
         }
     }
@@ -169,7 +176,12 @@ impl Attachments {
             self.in_flight = None;
             let preview = match message.result {
                 Ok((image, retention)) => {
-                    Preview::Ready(ctx.load_texture(format!("ai-preview-{}", message.request.id), image, egui::TextureOptions::LINEAR), retention)
+                    let image = Arc::new(image);
+                    Preview::Ready(
+                        ctx.load_texture(format!("ai-preview-{}", message.request.id), image.clone(), egui::TextureOptions::LINEAR),
+                        image,
+                        retention,
+                    )
                 }
                 Err(_) => Preview::Missing,
             };
@@ -184,8 +196,16 @@ impl Attachments {
         }
         let source = if request.image["data"].is_string() {
             Some(Source::Inline)
-        } else if let Some(header) = request.scope.header.as_ref() {
-            app.session.companion_owned_history_reader(header).ok().flatten().map(|reader| Source::History(Box::new(reader)))
+        } else if let Some(header) = request.scope.header.clone().or_else(|| {
+            // A freshly persisted live tail has v2 references before the
+            // sidebar owns a saved prefix. Capture its actual committed head;
+            // the legacy reader only accepts v1 companion/preview paths.
+            request.image["attachment"]
+                .as_str()
+                .filter(|name| name.starts_with("companion/v2/"))
+                .and_then(|_| app.session.companion_photo_header(request.scope.photo).ok().flatten())
+        }) {
+            app.session.companion_owned_history_reader(&header).ok().flatten().map(|reader| Source::History(Box::new(reader)))
         } else {
             app.session.companion_attachment_reader(request.scope.photo).ok().flatten().map(Source::Legacy)
         };

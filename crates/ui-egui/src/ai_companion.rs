@@ -1732,6 +1732,10 @@ pub fn show_task_entry(app: &mut LightcraftApp, ui: &mut egui::Ui) {
 pub fn show_comparison(app: &mut LightcraftApp, ui: &mut egui::Ui) -> bool {
     comparison::show(app, ui)
 }
+pub(crate) fn cpu_textures(state: &State, textures: &mut std::collections::HashMap<egui::TextureId, crate::softpaint::CpuTexture>) {
+    comparison::cpu_textures(state, textures);
+    state.attachments.cpu_textures(textures);
+}
 
 pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
     let mut state = std::mem::take(&mut app.ai);

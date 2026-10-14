@@ -116,6 +116,29 @@ fn actual_crop_case(missing: bool) {
             "a historical canvas must not consume a newly completed task reminder without showing its conversation"
         );
         h.app.run("ai.returnCurrent", json!({})).unwrap();
+        h.app.run("ai.bottom", json!({})).unwrap();
+        let preview = format!("image:aiAttachment:{}-correction:0", creation.identity.local_round_id.as_str());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !h.app.widgets.iter().any(|(id, _)| id == &preview) {
+            assert!(Instant::now() < deadline, "the actually saved current-tail correction JPEG must remain viewable before a cold history reload");
+            h.step();
+            assert!(
+                !h.painted_text().iter().any(|text| text == tr("Historical preview unavailable")),
+                "a valid just-published preview must not be routed through a legacy/base-prefix reader"
+            );
+        }
+        let shadow = h.app.headless_screenshot(&h.view.ctx, true).unwrap();
+        let center = h.app.widgets.iter().find(|(id, _)| id == &preview).unwrap().1.center();
+        let actual = shadow.pixels[center.y as usize * shadow.size[0] + center.x as usize];
+        let bytes = Base64::decode_vec(execution.body["preview"]["data_base64"].as_str().unwrap()).unwrap();
+        let decoded = lightcraft_codecs::decode(&bytes, lightcraft_codecs::DecodeOptions { max_size: Some((640, 640)), max_pixels: 640 * 640 })
+            .unwrap()
+            .to_srgb8();
+        let raw = decoded.as_bytes();
+        let index = ((decoded.height / 2) * decoded.width + decoded.width / 2) as usize * 4;
+        for (got, wanted) in [actual.r(), actual.g(), actual.b()].into_iter().zip(&raw[index..index + 3]) {
+            assert!(got.abs_diff(*wanted) <= 12, "native screenshot shadow must preserve the actually sent current-tail JPEG: {actual:?}");
+        }
     }
     h.app.run("crop.reset", json!({})).unwrap();
     h.app.run("develop.set", json!({"control":"light.exposure","value":0.8})).unwrap();
@@ -597,6 +620,14 @@ fn archived_comparison(bounded: bool) {
     assert_eq!(h.app.session.develop_of(photo).unwrap(), current);
     assert!(h.app.widgets.iter().any(|(id, _)| id == "image:aiCompareBefore"));
     assert!(h.app.widgets.iter().any(|(id, _)| id == "image:aiCompareAfter"));
+    let shadow = h.app.headless_screenshot(&h.view.ctx, true).unwrap();
+    for (id, expected) in [("image:aiCompareBefore", [210u8, 40, 40]), ("image:aiCompareAfter", [40u8, 40, 210])] {
+        let center = h.app.widgets.iter().find(|(key, _)| key == id).unwrap().1.center();
+        let pixel = shadow.pixels[center.y as usize * shadow.size[0] + center.x as usize];
+        for (got, wanted) in [pixel.r(), pixel.g(), pixel.b()].into_iter().zip(expected) {
+            assert!(got.abs_diff(wanted) <= 3, "native screenshot shadow must preserve captured JPEG pixels: {pixel:?}");
+        }
+    }
     for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
         h.app.ui.language = language;
         for (name, width, height) in [("normal", 1400, 1000), ("narrow", 620, 520)] {
