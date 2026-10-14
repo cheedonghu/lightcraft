@@ -46,7 +46,7 @@ pub(super) fn show(ui: &mut egui::Ui, conversation: &Conversation, attachments: 
     }
     if !conversation.notice.is_empty() {
         ui.label(egui::RichText::new(tr("System")).strong());
-        ui.label(&conversation.notice);
+        ui.label(super::errors::display_notice(&conversation.notice));
     }
 }
 

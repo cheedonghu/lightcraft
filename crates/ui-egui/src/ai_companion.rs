@@ -573,7 +573,7 @@ impl State {
         conversation.records.push(json!({"local_round_id":identity.local_round_id,"photo_id":photo.0,"request_text":prompt,"submission_seq":identity.submission_seq,"connection_generation":identity.connection_generation,"runtime_library_generation":identity.scope.library_generation,"original":self.jobs.get(&photo).map(|j| &j.checkpoint.original),"stages":[],"phase":"submitting"}));
         conversation.messages.push(json!({"role":"user","text":prompt,"local_round_id":identity.local_round_id,"local_message_id":format!("{}-user",identity.local_round_id.as_str()),"complete_state":"complete","display_kind":"request"}));
         conversation.storage_notice = false;
-        conversation.notice = tr("Submitting…").into();
+        conversation.notice = "Submitting…".into();
         if let Err(error) = self.save(app, photo) {
             if reader.is_some() {
                 self.mark_failure(photo, &error);
@@ -680,7 +680,7 @@ impl State {
                 job.cancel.store(true, Ordering::Relaxed);
                 job.stopped = true;
             }
-            self.finish(photo, "已停止，未发送模型请求。");
+            self.finish(photo, "Stopped before sending a model request.");
             return Ok(json!({"stopped":true}));
         }
         let round = if let Some(job) = self.jobs.get_mut(&photo) {
@@ -703,11 +703,11 @@ impl State {
             if let Some(conversation) = self.conversations.get_mut(&photo) {
                 conversation.pending.clear();
                 close_pending_tools(&mut conversation.messages, "cancelled");
-                conversation.notice = tr("Stopped generating. Confirming cancellation of the submission…").into();
+                conversation.notice = "Stopped generating. Confirming cancellation of the submission…".into();
             }
             return Ok(Value::Null);
         }
-        self.finish(photo, tr("Stopped generating. Keeping the latest complete result."));
+        self.finish(photo, "Stopped generating. Keeping the latest complete result.");
         Ok(Value::Null)
     }
     fn disconnected(&mut self, photo: PhotoId, diagnostic: &str) {
@@ -811,7 +811,7 @@ impl State {
                 if self.send(format!("/v1/rounds/{round}/stop"), json!({"reason":"user_stop"}), 0, round.into()).is_err() {
                     self.close_connection();
                 }
-                self.finish(photo, tr("Stopped generating. Keeping the latest complete result."));
+                self.finish(photo, "Stopped generating. Keeping the latest complete result.");
                 self.save(app, photo)?;
                 return Ok(());
             }
@@ -841,7 +841,7 @@ impl State {
                     task.phase = state.clone();
                 }
                 if let Some(conversation) = self.conversations.get_mut(&photo) {
-                    conversation.notice = tr(phase_text(&state)).into();
+                    conversation.notice = phase_text(&state).into();
                 }
 
                 if let Some(record) = self
@@ -958,7 +958,7 @@ impl State {
                     .get(&photo)
                     .and_then(|c| c.records.iter().find(|r| r["backend_round_id"] == round))
                     .is_some_and(errors::published);
-                let notice = if state == "completed" { tr("This round is complete.").to_owned() } else { errors::notice(reason, published) };
+                let notice = if state == "completed" { "This round is complete.".to_owned() } else { errors::notice(reason, published) };
                 if let Some(record) = self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["backend_round_id"] == round)) {
                     record["local_terminal"] = json!(state);
                     record["backend_terminal"] = json!(payload);
@@ -1257,7 +1257,7 @@ impl State {
             let photos: Vec<_> = self.jobs.keys().copied().collect();
             for photo in photos {
                 let _ = self.stop(photo);
-                self.finish(photo, "图库已关闭，保留最近一次完整结果。");
+                self.finish(photo, "The library was closed. Keeping the latest complete result.");
             }
             self.retire_connection();
             self.paging.cancel();
@@ -1305,7 +1305,7 @@ impl State {
         comparison::poll(self, app, ctx);
         for (photo, c) in &mut self.conversations {
             if c.storage_notice && !app.session.companion_history_unsaved(*photo) && !self.pending_local_saves.contains(photo) {
-                c.notice = tr("AI history saved. Photo changes are kept.").into();
+                c.notice = "AI history saved. Photo changes are kept.".into();
                 c.storage_notice = false;
             }
             if c.schema_version == 2 && c.dirty && c.dirty_queued && !app.session.companion_tail_unsaved(*photo) {
@@ -1414,7 +1414,7 @@ impl State {
                     }
                     if let Err(error) = result {
                         if submission != 0 && error.cancelled_before_send {
-                            self.finish(identity.scope.photo, tr("Stopped generating. Keeping the latest complete result."));
+                            self.finish(identity.scope.photo, "Stopped generating. Keeping the latest complete result.");
                             let _ = self.save(app, identity.scope.photo);
                             continue;
                         }
@@ -1445,7 +1445,7 @@ impl State {
                                 }
                                 if let Some(c) = self.conversations.get_mut(&identity.scope.photo) {
                                     c.pending.clear();
-                                    c.notice = tr("Cancelling… Waiting for the AI connection to close safely.").into();
+                                    c.notice = "Cancelling… Waiting for the AI connection to close safely.".into();
                                 }
                                 let _ = self.save(app, identity.scope.photo);
                                 continue;
@@ -1627,7 +1627,7 @@ impl State {
         let _ = self.stop(photo);
         if let Some(c) = self.conversations.get_mut(&photo) {
             c.storage_notice = app.session.companion_history_unsaved(photo);
-            c.notice = if c.storage_notice { tr("Photo changes are kept. AI history is not saved; saving will retry.").into() } else { notice };
+            c.notice = if c.storage_notice { "Photo changes are kept. AI history is not saved; saving will retry.".into() } else { notice };
         }
         let _ = self.save(app, photo);
     }
@@ -1771,7 +1771,7 @@ pub fn cancel_for_library_change(app: &mut LightcraftApp) {
     state.pending_local_saves.extend(state.conversations.iter().filter_map(|(photo, c)| c.dirty.then_some(*photo)));
     for photo in photos {
         let _ = state.stop(photo);
-        state.finish(photo, "图库已关闭，保留最近一次完整结果。");
+        state.finish(photo, "The library was closed. Keeping the latest complete result.");
     }
     state.paging.cancel();
     // Closing the transport also cancels unsent content for already-completed
@@ -1830,7 +1830,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
         let photos: Vec<_> = state.jobs.keys().copied().collect();
         for photo in photos {
             let _ = state.stop(photo);
-            state.finish(photo, "图库已关闭，保留最近一次完整结果。");
+            state.finish(photo, "The library was closed. Keeping the latest complete result.");
         }
         state.retire_connection();
         state.paging.cancel();
@@ -1933,7 +1933,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             state.local_save_retry_at = None;
             if let Some(photo) = viewed_photo {
                 let conversation = state.conversations.entry(photo).or_default();
-                conversation.notice = tr("Saved. Retry the edit explicitly when ready.").into();
+                conversation.notice = "Saved. Retry the edit explicitly when ready.".into();
                 conversation.storage_notice = false;
                 state.save_retry_feedback.remove(&photo);
             }
@@ -2120,7 +2120,7 @@ fn undo(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, round: &str)
         c.eligible = false;
     }
     conversation.messages.push(json!({"role":"user","display_kind":"round_reverted","complete_state":"complete","local_round_id":round,"local_message_id":format!("{round}-reverted"),"text":"This round's edits were reverted. The photo was restored to its round starting state."}));
-    conversation.notice = tr("This round was reverted. The conversation was kept.").into();
+    conversation.notice = "This round was reverted. The conversation was kept.".into();
     if let Some(record) = conversation.records.iter_mut().find(|r| r["local_round_id"] == round) {
         record["revert_state"] = json!("reverted");
     }
@@ -2158,14 +2158,14 @@ fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, params: &Va
     let receipt = match app.session.companion_clear(scope, expected_epoch) {
         Ok(receipt) => receipt,
         Err(_) => {
-            let message = tr(if app.session.companion_history_unsaved(photo) {
+            let source = if app.session.companion_history_unsaved(photo) {
                 "Conversation deletion has not been saved. Check storage, then retry saving."
             } else {
                 "This conversation could not be deleted. Original history is retained."
-            })
-            .to_owned();
+            };
+            let message = tr(source).to_owned();
             let conversation = state.conversations.entry(photo).or_default();
-            conversation.notice = message.clone();
+            conversation.notice = source.into();
             conversation.storage_notice = app.session.companion_history_unsaved(photo);
             state.text = message.clone();
             return Err(message);
@@ -2200,8 +2200,7 @@ fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, params: &Va
     if state.readonly_task == Some(scope) {
         state.leave_task_view();
     }
-    state.conversations.entry(photo).or_default().notice =
-        tr("The old conversation is cleared. Future requests start from the current photo.").into();
+    state.conversations.entry(photo).or_default().notice = "The old conversation is cleared. Future requests start from the current photo.".into();
     if matches!(&app.ui.dialog, Some(crate::state::Dialog::ConfirmCompanionClear { photo: target, library_generation, expected_epoch: epoch }) if *target == photo.0 && *library_generation == scope.library_generation && *epoch == expected_epoch)
     {
         app.ui.dialog = None;
@@ -2238,7 +2237,7 @@ fn display_text(conversation: &Conversation) -> String {
     for value in conversation.pending.values() {
         text.push_str(value);
     }
-    text.push_str(&conversation.notice);
+    text.push_str(&errors::display_notice(&conversation.notice));
     text
 }
 /// Shared Tools body; the host supplies its viewport, so only messages scroll.
@@ -2450,7 +2449,7 @@ fn save_recovery(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
         {
             app.ai.conversations.entry(photo).or_default().notice = error;
         }
-    } else if app.ai.conversations.get(&photo).is_some_and(|c| c.notice == tr("Saved. Retry the edit explicitly when ready.")) {
+    } else if app.ai.conversations.get(&photo).is_some_and(|c| c.notice == "Saved. Retry the edit explicitly when ready.") {
         ui.label(tr("Saved. Retry the edit explicitly when ready."));
     }
 }

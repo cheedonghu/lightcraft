@@ -185,6 +185,15 @@ fn cancelling_blocked_native_style_history_preflight_never_enqueues_creation_or_
     assert!(requests.try_recv().is_err());
     assert_eq!(app.session.develop_of(photo).unwrap(), initial);
     assert!(state.conversations[&photo].records[0]["local_terminal"] == "cancelled");
+    app.ai = state;
+    let status = app.run("ai.status", json!({})).unwrap();
+    assert!(status["text"].as_str().unwrap().contains("Stopped before sending a model request."), "{status}");
+    app.run("app.language.simplifiedChinese", json!({})).unwrap();
+    let status = app.run("ai.status", json!({})).unwrap();
+    assert!(status["text"].as_str().unwrap().contains("已停止，未发送模型请求。"), "{status}");
+    app.run("app.language.english", json!({})).unwrap();
+    let status = app.run("ai.status", json!({})).unwrap();
+    assert!(status["text"].as_str().unwrap().contains("Stopped before sending a model request."), "{status}");
 }
 
 #[test]

@@ -408,6 +408,14 @@ fn confirmation_and_failed_deletion_are_localized_and_reachable_in_small_tools()
                     true
                 );
             }
+            let next = if language == Locale::En { Locale::ZhHans } else { Locale::En };
+            h.app.run(if next == Locale::En { "app.language.english" } else { "app.language.simplifiedChinese" }, json!({})).unwrap();
+            let status = h.app.run("ai.status", json!({})).unwrap();
+            assert!(
+                status["text"].as_str().unwrap().contains(next.tr("Conversation deletion has not been saved. Check storage, then retry saving.")),
+                "failure notice follows live language selection: {status}"
+            );
+            assert!(status["text"].as_str().unwrap().contains("Original conversation"), "authored text stays unchanged");
         }
     }
 }

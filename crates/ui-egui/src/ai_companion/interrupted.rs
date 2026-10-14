@@ -92,7 +92,7 @@ impl State {
         let Some(record) = record else {
             return;
         };
-        conversation.notice = tr("The previous task was interrupted. It was not resumed.").into();
+        conversation.notice = "The previous task was interrupted. It was not resumed.".into();
         let mut task =
             task_entry::Task::new(record.identity, app.session.catalog.photo(photo).map(|photo| photo.file_name.clone()).unwrap_or_default());
         task.phase = record.phase;

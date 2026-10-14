@@ -1891,6 +1891,8 @@
   "Metadata read": "已读取元数据",
   "Failed": "失败",
   "Stopped": "已停止",
+  "Stopped before sending a model request.": "已停止，未发送模型请求。",
+  "The library was closed. Keeping the latest complete result.": "图库已关闭，保留最近一次完整结果。",
   "Stopped by an error (see the log)": "因错误而停止（见日志）",
   "Not saved": "未保存",
   "A folder is being synchronized": "正在同步文件夹",

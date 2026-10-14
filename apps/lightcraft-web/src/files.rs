@@ -175,6 +175,21 @@ impl Store for FilesStore {
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
         Ok(self.0.get(name))
     }
+    fn read_limited(&mut self, name: &str, max: u64) -> io::Result<Option<Vec<u8>>> {
+        let mirror = self.0.lock();
+        let Some(bytes) = mirror.files.get(name) else { return Ok(None) };
+        if bytes.len() as u64 > max {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "browser file exceeds bounded read limit"));
+        }
+        Ok(Some(bytes.clone()))
+    }
+    fn read_range(&mut self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        let start = usize::try_from(offset).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "browser file offset is too large"))?;
+        let end = start.checked_add(length).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "browser file range overflow"))?;
+        let mirror = self.0.lock();
+        let bytes = mirror.files.get(name).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "browser file is missing"))?;
+        Ok(bytes.get(start..end).ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "browser file range is short"))?.to_vec())
+    }
     fn write_atomic(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
         self.writable()?;
         self.0.write(name, data);
@@ -204,6 +219,20 @@ mod tests {
     use lightcraft_engine::Session;
     use lightcraft_engine::library::LibraryStores;
     use serde_json::json;
+
+    #[test]
+    fn bounded_reader_refuses_oversized_and_out_of_range_requests() {
+        let files = Files::default();
+        files.preload("catalog.snap", b"abcd".to_vec());
+        let mut store = files.store();
+        assert_eq!(store.read_limited("catalog.snap", 4).unwrap(), Some(b"abcd".to_vec()));
+        assert_eq!(store.read_limited("catalog.snap", 3).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(store.read_limited("missing", 1).unwrap(), None);
+        assert_eq!(store.read_range("catalog.snap", 1, 2).unwrap(), b"bc");
+        assert_eq!(store.read_range("catalog.snap", 3, 2).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(store.read_range("catalog.snap", u64::MAX, 2).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(store.read_range("missing", 0, 1).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
 
     /// Apply flush ops to a "disk" map, as the backend would.
     fn flush(files: &Files, disk: &mut BTreeMap<String, Vec<u8>>) {

@@ -27,11 +27,7 @@ pub(super) fn notice(reason: &str, published: bool) -> String {
         "execution_failed" => "This edit could not be completed. Start a new request from the current photo.",
         _ => "This AI task could not finish. Start a new request from the current photo.",
     };
-    format!(
-        "{}\n{}",
-        tr(cause),
-        tr(if published { "The latest complete edit is kept." } else { "The photo remains at this round's starting settings." })
-    )
+    format!("{}\n{}", cause, if published { "The latest complete edit is kept." } else { "The photo remains at this round's starting settings." })
 }
 pub(super) fn published(record: &serde_json::Value) -> bool {
     record.get("stages").and_then(serde_json::Value::as_array).is_some_and(|stages| stages.iter().any(|s| s["execution_outcome"] == "succeeded"))
@@ -53,8 +49,13 @@ pub(super) fn local_notice(error: &str, published: bool) -> String {
         "AI history preparation failed. Try again.",
     ] {
         if error == cause || error == tr(cause) {
-            return format!("{}\n{}", tr(cause), notice("client_failure", published));
+            return format!("{}\n{}", cause, notice("client_failure", published));
         }
     }
     notice(if error == "AI 方案与当前照片状态不匹配。" { "invalid_plan" } else { "client_failure" }, published)
+}
+
+/// Translate only app-owned system notices; authored/model messages use separate rows.
+pub(super) fn display_notice(source: &str) -> String {
+    source.lines().map(tr).collect::<Vec<_>>().join("\n")
 }
