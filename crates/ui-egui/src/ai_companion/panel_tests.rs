@@ -179,9 +179,10 @@ fn narrow_shared_panel_keeps_all_composer_controls_inside_tools() {
         h.app.run("ai.open", json!({})).unwrap();
         frames(&mut h);
         let tools = rect(&h, "panel:right_panel");
-        for id in ["ai:stage", "field:aiPrompt", "checkbox:aiConsent", "button:aiStart", "button:aiUndo", "button:aiClear"] {
+        for id in ["ai:stage", "field:aiPrompt", "checkbox:aiConsent", "button:aiStart", "button:aiClear"] {
             assert!(tools.contains_rect(rect(&h, id)), "{id} in {language:?}: {:?} within {tools:?}", rect(&h, id));
         }
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiUndo"), "Undo belongs to an explicit result card, not the composer");
         if let Ok(dir) = std::env::var("UX06_SCREENSHOT_DIR") {
             let shot =
                 h.request("ui.screenshot", json!({"path":format!("{dir}/narrow-{}.png",language.code()),"headless":true}), Duration::from_secs(20));
@@ -266,10 +267,11 @@ fn multiline_draft_scrolls_inside_a_fixed_composer_without_sizing_consuming_inpu
     assert_eq!(rect(&h, "field:aiPrompt"), input);
     assert_eq!(rect(&h, "ai:stage"), stage);
     let tools = rect(&h, "panel:right_panel");
-    for id in ["field:aiPrompt", "checkbox:aiConsent", "button:aiStart", "button:aiUndo", "button:aiClear"] {
+    for id in ["field:aiPrompt", "checkbox:aiConsent", "button:aiStart", "button:aiClear"] {
         assert_eq!(h.app.widgets.iter().filter(|(key, _)| key == id).count(), 1, "only the visible pass registers {id}");
         assert!(tools.contains_rect(rect(&h, id)));
     }
+    assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiUndo"), "a draft alone never supplies an implicit round target");
 }
 
 pub(super) fn short_tools(h: &mut Headless, stacked: bool, height: f32) {
@@ -347,11 +349,13 @@ fn supported_short_floating_and_stacked_tools_keep_active_controls_on_their_own_
             short_tools(&mut h, stacked, height);
             let zoom = h.app.ui.zoom;
             let tools = rect(&h, "panel:right_panel");
-            for (id, target) in
-                h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:ai") || id.starts_with("checkbox:ai") || id == "field:aiPrompt")
-            {
+            for (id, target) in h.app.widgets.iter().filter(|(id, _)| {
+                id != "button:aiTaskEntry" && (id.starts_with("button:ai") || id.starts_with("checkbox:ai") || id == "field:aiPrompt")
+            }) {
                 assert!(tools.contains_rect(*target), "{id} clips outside {tools:?}: {target:?}");
             }
+            let global_entry = rect(&h, "button:aiTaskEntry");
+            assert!(!global_entry.intersects(tools), "global task entry remains outside short Tools");
             reachable(&mut h, "checkbox:aiConsent", -1.0);
             short_snapshot(&mut h, &format!("short-active-{}-{}-{}", if stacked { "stack" } else { "float" }, height as usize, language.code()));
             assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
@@ -393,6 +397,8 @@ fn supported_short_tools_allow_idle_draft_clear_and_start_through_visible_widget
             reachable(&mut h, "button:aiClear", -1.0);
             short_snapshot(&mut h, &format!("short-idle-{}-{}-{}", if stacked { "stack" } else { "float" }, height as usize, language.code()));
             assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClear"}), timeout)["ok"], true);
+            assert!(h.app.session.photo_companion(photo).unwrap().is_some(), "original context remains until confirmation");
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClearConfirm"}), timeout)["ok"], true);
             assert!(h.app.session.photo_companion(photo).unwrap().is_none());
             assert_eq!(h.app.ai.prompt, "Please keep natural colors.");
             reachable(&mut h, "checkbox:aiConsent", 1.0);
@@ -480,7 +486,7 @@ fn real_reading_offset_is_photo_scoped_and_user_scroll_stops_tail_following() {
     h.app.ai.next_connection = Some(connection);
     h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
     h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout);
-    let creation = requests.try_recv().unwrap();
+    let creation = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
     events.try_send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"reading-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":a.0,"library_generation":creation.identity.scope.library_generation},"state":"queued"}}) }).unwrap();
     frames(&mut h);
     let messages = rect(&h, "ai:messages");
@@ -692,6 +698,52 @@ fn wait_painted(h: &mut Headless, literal: &str) {
         std::thread::sleep(Duration::from_millis(2));
     }
 }
+fn wait_position_page(h: &mut Headless) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        h.step();
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["historyLoading"] == false
+            && status["text"].as_str().unwrap().contains("position row 196")
+            && h.painted_text().iter().any(|text| text.contains("position row "))
+        {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "saved page not displayed: {status}; {:?}", h.painted_text());
+        std::thread::yield_now();
+    }
+}
+
+fn position_anchor(h: &Headless) -> Option<(String, f32)> {
+    let viewport = h.app.widgets.iter().find(|(id, _)| id == "ai:messages")?.1;
+    h.view.painted_shapes().iter().find_map(|shape| match shape {
+        egui::epaint::Shape::Text(text)
+            if text.galley.text().contains("position row ") && viewport.contains(text.visual_bounding_rect().center()) =>
+        {
+            Some((text.galley.text().to_owned(), text.visual_bounding_rect().top() - viewport.top()))
+        }
+        _ => None,
+    })
+}
+fn wait_position_anchor(h: &mut Headless, anchor: &(String, f32)) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        h.step();
+        if let Some(current) = position_anchor(h)
+            && current.0 == anchor.0
+            && (current.1 - anchor.1).abs() < 2.0
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "same visible saved text and position not restored: expected {anchor:?}, actual {:?}",
+            position_anchor(h)
+        );
+        std::thread::yield_now();
+    }
+}
+
 #[test]
 fn native_saved_older_page_and_scroll_return_after_photo_tool_switch_and_reopen() {
     let dir = std::env::temp_dir().join(format!("lc-ux12-paged-{}", LocalRoundId::new().unwrap().as_str()));
@@ -712,21 +764,26 @@ fn native_saved_older_page_and_scroll_return_after_photo_tool_switch_and_reopen(
     assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryOlder"}), timeout)["ok"], true);
     wait_painted(&mut h, "position row 196");
     h.request("ui.hoverWidget", json!({"id":"ai:messages"}), timeout);
-    h.request("ui.scroll", json!({"dy":180.0}), timeout);
+    h.request("ui.scroll", json!({"dy":-180.0}), timeout);
     for _ in 0..20 {
         h.step();
     }
+    wait_position_page(&mut h);
     let saved = h.app.session.companion_editor(a).unwrap();
+    assert_eq!(saved.reading_cursor.unwrap().record, 196);
+    assert_eq!(saved.reading_count, Some(260));
+    assert_eq!(saved.reading_epoch, Some(h.app.session.companion_photo_header(a).unwrap().unwrap().conversation_epoch));
+    let anchor = position_anchor(&h).expect("fixture must capture an actually visible same-page text anchor");
     assert!(saved.scroll_offset > 0.0);
     assert!(!saved.follow_tail);
     h.app.run("panel.edit", json!({})).unwrap();
     frames(&mut h);
     h.app.run("ai.open", json!({})).unwrap();
-    wait_painted(&mut h, "position row 196");
+    wait_position_anchor(&mut h, &anchor);
     h.app.run("library.select", json!({"ids":[b.0],"active":b.0})).unwrap();
     wait_painted(&mut h, "other row 259");
     h.app.run("library.select", json!({"ids":[a.0],"active":a.0})).unwrap();
-    wait_painted(&mut h, "position row 196");
+    wait_position_anchor(&mut h, &anchor);
     h.app.session.persist().unwrap();
     h.app.session.close_library().unwrap();
     drop(h);
@@ -735,9 +792,12 @@ fn native_saved_older_page_and_scroll_return_after_photo_tool_switch_and_reopen(
     let mut h = Headless::new(LightcraftApp::new(session, Services::default()), [1000.0, 680.0], 1.0);
     h.app.run("library.select", json!({"ids":[a.0],"active":a.0})).unwrap();
     h.app.run("ai.open", json!({})).unwrap();
-    wait_painted(&mut h, "position row 196");
+    wait_position_anchor(&mut h, &anchor);
     frames(&mut h);
     let restored = h.app.session.companion_editor(a).unwrap();
+    assert_eq!(restored.reading_cursor, saved.reading_cursor);
+    assert_eq!(restored.reading_epoch, saved.reading_epoch);
+    assert_eq!(restored.reading_count, saved.reading_count);
     assert!((restored.scroll_offset - saved.scroll_offset).abs() < 2.0);
     assert!(!restored.follow_tail);
     h.app.session.close_library().unwrap();
@@ -795,6 +855,12 @@ fn native_pending_older_intent_survives_switching_away_before_the_reader_retires
         }
         fn describe(&self) -> String {
             "native page read barrier".into()
+        }
+        fn retention_namespace(&self) -> Option<String> {
+            self.inner.retention_namespace()
+        }
+        fn conservative_retention(&self) -> bool {
+            self.inner.conservative_retention()
         }
         fn background_writer(&self) -> Option<Box<dyn Store>> {
             Some(Box::new(Self { inner: FsStore::open(&self.dir).unwrap(), dir: self.dir.clone(), gate: self.gate.clone(), reader: true }))

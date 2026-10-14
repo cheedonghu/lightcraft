@@ -3108,8 +3108,10 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "web-time",
+ "winapi-util",
 ]
 
 [[package]]

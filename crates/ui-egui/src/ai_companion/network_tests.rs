@@ -261,17 +261,27 @@ fn real_connection_discards_cancelled_queue_but_delivers_priority_stop_and_heart
         .unwrap();
     release_tx.send(()).unwrap();
     assert!(matches!(connection.events.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Connected { .. }));
-    for i in 0..9 {
-        let Event::Response { path, result, .. } = connection.events.recv_timeout(Duration::from_secs(3)).unwrap() else {
-            panic!("unexpected transport event");
-        };
-        if i == 0 {
-            assert!(path.ends_with("/stop"));
-            assert!(result.is_ok());
-        } else {
-            assert!(result.unwrap_err().cancelled_before_send);
+    let mut responses = 0;
+    let mut heartbeat = false;
+    while responses < 9 || !heartbeat {
+        match connection.events.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Event::Heartbeat { sequence } => {
+                assert_eq!(sequence, 1);
+                heartbeat = true;
+            }
+            Event::Response { path, result, .. } => {
+                if responses == 0 {
+                    assert!(path.ends_with("/stop"));
+                    assert!(result.is_ok());
+                } else {
+                    assert!(result.unwrap_err().cancelled_before_send);
+                }
+                responses += 1;
+            }
+            _ => panic!("unexpected transport event"),
         }
     }
+    assert_eq!(responses, 9);
     verified_tx.send(()).unwrap();
     server.join().unwrap();
     connection.close();

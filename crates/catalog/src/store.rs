@@ -4,6 +4,8 @@
 //! memory (tests, ephemeral sessions) and lets tests simulate crashes by editing the bytes. A web
 //! host can implement [`Store`] over OPFS.
 
+pub mod source;
+use source::{SourceIdentity, SourceSnapshot};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,6 +26,35 @@ pub trait Store: Send {
     /// return `UnexpectedEof`, and arithmetic overflow returns `InvalidInput`.
     fn read_range(&mut self, _name: &str, _offset: u64, _length: usize) -> io::Result<Vec<u8>> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "range reads are unsupported by this store"))
+    }
+    /// Capture a bounded reader tied to this exact source; changes are errors,
+    /// never mixed reads. Native and memory adapters support it; custom adapters
+    /// must opt in rather than using a whole-file fallback.
+    fn source_snapshot(&mut self, _name: &str) -> io::Result<Option<Box<dyn SourceSnapshot>>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "source snapshots are unsupported by this store"))
+    }
+    /// Stream a verified source into a durable atomic destination. Unlike the
+    /// general write_atomic_with default this has no whole-source fallback.
+    fn copy_source_atomic(&mut self, _name: &str, _source: &mut dyn SourceSnapshot) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "streamed source copying is unsupported by this store"))
+    }
+    /// Replace the original source only while its identity still matches.
+    /// Callers coordinate all ordinary writers across verification/publication.
+    fn replace_source_atomic(&mut self, _name: &str, _expected: &SourceIdentity, _data: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "verified source replacement is unsupported by this store"))
+    }
+    /// Conditional source publication with caller-owned revocable authority.
+    /// Expensive fresh identity proofs may run on an owned worker; adapters
+    /// recheck authority immediately before the atomic publication. Unsupported
+    /// adapters must not weaken this to a pre-check plus an unchecked writer.
+    fn replace_source_atomic_authorized(
+        &mut self,
+        _name: &str,
+        _expected: &SourceIdentity,
+        _data: &[u8],
+        _authorized: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "revocable source publication is unsupported by this store"))
     }
     /// Durably remove a file. Removing a missing file succeeds.
     fn remove(&mut self, _name: &str) -> io::Result<()> {
@@ -53,6 +84,24 @@ pub trait Store: Send {
     fn truncate(&mut self, name: &str, len: u64) -> io::Result<()>;
     /// Human-readable location (diagnostics).
     fn describe(&self) -> String;
+    /// Stable process-local identity for reader retention across close/reopen.
+    /// Native aliases must identify the same physical directory; wrappers forward
+    /// their adapter's identity. Unknown adapters cannot offer retained readers.
+    fn retention_namespace(&self) -> Option<String> {
+        None
+    }
+    /// Require a shared process-wide physical-reclamation pause while any
+    /// conservative reader lives. Ownership/debt still uses retention_namespace;
+    /// wrappers must forward both properties, never use a global owner identity.
+    fn conservative_retention(&self) -> bool {
+        false
+    }
+    /// An owned adapter for potentially large source migrations. Custom stores
+    /// may reuse their background writer; memory migrations do not change the
+    /// journal compaction background preference.
+    fn migration_writer(&self) -> Option<Box<dyn Store>> {
+        self.background_writer()
+    }
     /// Another handle on the same files that a worker thread can write `catalog.snap` through
     /// while this one keeps appending to the log (background compaction). `None` (the default):
     /// snapshots are written synchronously.
@@ -117,6 +166,31 @@ impl FsStore {
 }
 
 impl Store for FsStore {
+    fn source_snapshot(&mut self, name: &str) -> io::Result<Option<Box<dyn SourceSnapshot>>> {
+        source::native_snapshot(self.path(name)?)
+    }
+    fn copy_source_atomic(&mut self, name: &str, source: &mut dyn SourceSnapshot) -> io::Result<()> {
+        self.write_atomic_with(name, &mut |writer| source::copy(source, writer)).map(|_| ())
+    }
+    fn replace_source_atomic(&mut self, name: &str, expected: &SourceIdentity, data: &[u8]) -> io::Result<()> {
+        self.replace_source_atomic_authorized(name, expected, data, &|| true)
+    }
+    fn replace_source_atomic_authorized(
+        &mut self,
+        name: &str,
+        expected: &SourceIdentity,
+        data: &[u8],
+        authorized: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        source::authority(authorized)?;
+        let path = self.path(name)?;
+        let mut check = || {
+            source::check_native(&path, expected)?;
+            source::authority(authorized)
+        };
+        crate::safe_file::write_atomic_checked(&path, data, &mut check)?;
+        sync_directory(path.parent().unwrap_or(&self.dir))
+    }
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
         match std::fs::read(self.path(name)?) {
             Ok(b) => Ok(Some(b)),
@@ -235,6 +309,33 @@ impl Store for FsStore {
         self.dir.display().to_string()
     }
 
+    fn retention_namespace(&self) -> Option<String> {
+        let metadata = std::fs::metadata(&self.dir).ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(format!("native-directory:{}:{}", metadata.dev(), metadata.ino()))
+        }
+        #[cfg(windows)]
+        {
+            // Safe directory-handle identity routes only this library's debt,
+            // including case/symlink aliases. Unavailable/partial IDs protect GC.
+            let handle = winapi_util::Handle::from_path_any(&self.dir).ok()?;
+            let info = winapi_util::file::information(&handle).ok()?;
+            let (volume, index) = (info.volume_serial_number(), info.file_index());
+            (volume != 0 && index != 0).then(|| format!("native-windows-directory:{volume}:{index}"))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
+    }
+    fn conservative_retention(&self) -> bool {
+        cfg!(windows)
+    }
     #[cfg(not(target_arch = "wasm32"))]
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         Some(Box::new(FsStore { dir: self.dir.clone(), appender: None }))
@@ -300,12 +401,49 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
     } // Windows directory handles are not available through std.
 }
 
+/// Shared immutable bytes for one memory-file revision. Captured readers keep
+/// this allocation alive; ordinary writes use copy-on-write and a fresh identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryFile {
+    bytes: Vec<u8>,
+    revision: Option<u64>,
+}
+impl MemoryFile {
+    fn next_revision() -> Option<u64> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).ok()
+    }
+    fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes, revision: Self::next_revision() }
+    }
+}
+impl std::ops::Deref for MemoryFile {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// In-memory files. Clones share the same files (so a test can "reopen" or corrupt them).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MemStore {
-    pub files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    namespace: Option<u64>,
+    pub files: Arc<Mutex<BTreeMap<String, Arc<MemoryFile>>>>,
     /// Offer a [`Store::background_writer`] (off by default: snapshots stay synchronous).
     pub background: bool,
+}
+
+impl Default for MemStore {
+    fn default() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Never wrap/reuse identity while a retired debt registry may outlive
+        // the backing allocation. Exhaustion returns unknown/protected identity;
+        // clones carry the same namespace and files.
+        let namespace = NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).ok();
+        Self { namespace, files: Arc::default(), background: false }
+    }
 }
 
 impl MemStore {
@@ -313,14 +451,50 @@ impl MemStore {
         MemStore::default()
     }
     pub fn get(&self, name: &str) -> Option<Vec<u8>> {
-        self.files.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|file| file.to_vec())
     }
     pub fn set(&self, name: &str, data: Vec<u8>) {
-        self.files.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), data);
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), Arc::new(MemoryFile::new(data)));
     }
 }
 
 impl Store for MemStore {
+    fn migration_writer(&self) -> Option<Box<dyn Store>> {
+        Some(Box::new(self.clone()))
+    }
+    fn source_snapshot(&mut self, name: &str) -> io::Result<Option<Box<dyn SourceSnapshot>>> {
+        validate_name(name)?;
+        source::memory_snapshot(self, name)
+    }
+    fn copy_source_atomic(&mut self, name: &str, source: &mut dyn SourceSnapshot) -> io::Result<()> {
+        validate_name(name)?;
+        let mut bytes = Vec::new();
+        source::copy(source, &mut bytes)?;
+        self.set(name, bytes);
+        Ok(())
+    }
+    fn replace_source_atomic(&mut self, name: &str, expected: &SourceIdentity, data: &[u8]) -> io::Result<()> {
+        self.replace_source_atomic_authorized(name, expected, data, &|| true)
+    }
+    fn replace_source_atomic_authorized(
+        &mut self,
+        name: &str,
+        expected: &SourceIdentity,
+        data: &[u8],
+        authorized: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        source::authority(authorized)?;
+        validate_name(name)?;
+        let mut files = self.files.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = files.get(name).ok_or_else(source::changed)?;
+        if source::memory_identity(self, bytes)? != *expected {
+            return Err(source::changed());
+        }
+        let replacement = copy_bytes(data)?;
+        source::authority(authorized)?;
+        files.insert(name.to_owned(), Arc::new(MemoryFile::new(replacement)));
+        Ok(())
+    }
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
         validate_name(name)?;
         Ok(self.get(name))
@@ -359,18 +533,27 @@ impl Store for MemStore {
     }
     fn append(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
         validate_name(name)?;
-        self.files.lock().unwrap_or_else(|e| e.into_inner()).entry(name.to_string()).or_default().extend_from_slice(data);
+        let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        let file = files.entry(name.to_owned()).or_insert_with(|| Arc::new(MemoryFile::new(Vec::new())));
+        let file = Arc::make_mut(file);
+        file.bytes.extend_from_slice(data);
+        file.revision = MemoryFile::next_revision();
         Ok(())
     }
     fn truncate(&mut self, name: &str, len: u64) -> io::Result<()> {
         validate_name(name)?;
         if let Some(f) = self.files.lock().unwrap_or_else(|e| e.into_inner()).get_mut(name) {
-            f.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+            let file = Arc::make_mut(f);
+            file.bytes.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+            file.revision = MemoryFile::next_revision();
         }
         Ok(())
     }
     fn describe(&self) -> String {
         "memory".into()
+    }
+    fn retention_namespace(&self) -> Option<String> {
+        self.namespace.map(|id| format!("memory-store:{id}"))
     }
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         self.background.then(|| Box::new(self.clone()) as Box<dyn Store>)

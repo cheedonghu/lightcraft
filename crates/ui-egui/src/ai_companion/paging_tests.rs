@@ -44,13 +44,27 @@ fn service_overflow_refuses_submission_and_retains_all_local_records() {
     app.session.save_companion_tail(photo, None, &messages, &[], &[], &json!({"schema_version":2})).unwrap();
     let before = app.session.companion_photo_header(photo).unwrap().unwrap();
     let (connection, requests, _) = network::test_connection();
-    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
-    assert!(state.start(&mut app).is_err());
+    app.ai.next_connection = Some(connection);
+    let mut h = crate::headless::Headless::new(app, [1100., 750.], 1.);
+    h.app.run("ai.open", json!({})).unwrap();
+    h.step();
+    h.step();
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(5))["ok"], true);
+    h.app.run("ai.start", json!({"prompt":"new explicit request"})).unwrap();
+    let status = native_history_tests::wait_idle(&mut h, &requests);
+    assert!(status["text"].as_str().unwrap().contains("service limit"), "{status}");
     assert!(requests.try_recv().is_err());
-    assert!(state.jobs.is_empty());
-    assert_eq!(app.session.companion_photo_header(photo).unwrap().unwrap(), before);
-    assert_eq!(app.session.companion_messages_page(photo, 1024, 1).unwrap().records[0]["text"], "message 1024");
-    assert!(app.session.companion_task_photo().is_none());
+    // The failed local attempt may be recorded; the entire original prefix stays intact.
+    let mut cursor = 0;
+    let mut retained = Vec::new();
+    while cursor < before.message_count {
+        let page = h.app.session.companion_messages_bounded(&before, cursor, 128, 32 * 1024 * 1024).unwrap();
+        retained.extend(page.records);
+        cursor = page.next_cursor.unwrap_or(before.message_count);
+    }
+    assert_eq!(retained, messages);
+    assert_eq!(h.app.session.companion_messages_page(photo, 1024, 1).unwrap().records[0]["text"], "message 1024");
+    assert!(h.app.session.companion_task_photo().is_none());
 }
 #[test]
 fn oversized_unicode_history_can_be_paged_forward_and_back_without_retaining_the_record() {
@@ -124,6 +138,12 @@ fn cancelling_blocked_native_style_history_preflight_never_enqueues_creation_or_
         }
         fn describe(&self) -> String {
             "native-style reader barrier".into()
+        }
+        fn retention_namespace(&self) -> Option<String> {
+            self.files.retention_namespace()
+        }
+        fn conservative_retention(&self) -> bool {
+            self.files.conservative_retention()
         }
         fn background_writer(&self) -> Option<Box<dyn Store>> {
             Some(Box::new(Self { files: self.files.clone(), gate: self.gate.clone(), reader: true }))
@@ -222,7 +242,9 @@ fn bounded_history_buttons_show_older_and_newer_pages_in_both_languages() {
 
 #[test]
 fn async_preflight_enqueue_failure_releases_the_local_lease_without_uncertain_admission() {
-    let mut app = app(Box::new(MemStore { background: true, ..MemStore::new() }));
+    let mut files = MemStore::new();
+    files.background = true;
+    let mut app = app(Box::new(files));
     let photo = app.session.active().unwrap();
     app.session
         .save_companion_tail(photo, None, &[json!({"role":"user","text":"old exact history"})], &[], &[], &json!({"schema_version":2}))
@@ -266,7 +288,9 @@ fn async_preflight_enqueue_failure_releases_the_local_lease_without_uncertain_ad
 
 #[test]
 fn retired_history_worker_with_lost_completion_releases_the_local_lease() {
-    let mut app = app(Box::new(MemStore { background: true, ..MemStore::new() }));
+    let mut files = MemStore::new();
+    files.background = true;
+    let mut app = app(Box::new(files));
     let photo = app.session.active().unwrap();
     app.session
         .save_companion_tail(photo, None, &[json!({"role":"user","text":"old exact history"})], &[], &[], &json!({"schema_version":2}))
@@ -315,6 +339,11 @@ fn shared_tools_mixed_continuation_renders_old_fragment_before_newer_record_and_
             }
             let text = h.app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().to_owned();
             assert!(text.find("OLD_MESSAGE_END").unwrap() < text.find("NEWER_MESSAGE").unwrap(), "{current_tail}: {text}");
+            h.request("ui.hoverWidget", json!({"id":"ai:messages"}), timeout);
+            h.request("ui.scroll", json!({"dy":-100000.0}), timeout);
+            for _ in 0..12 {
+                h.step();
+            }
             let painted = h.painted_text().join("\n");
             assert!(painted.find("OLD_MESSAGE_END").unwrap() < painted.find("NEWER_MESSAGE").unwrap());
             assert!(h.app.ai.conversations[&photo].view.as_ref().unwrap().bytes <= 256 * 1024);
@@ -398,6 +427,12 @@ fn cold_native_history_command_and_rapid_requests_keep_the_latest_explicit_curso
         }
         fn describe(&self) -> String {
             "blocked native page".into()
+        }
+        fn retention_namespace(&self) -> Option<String> {
+            self.files.retention_namespace()
+        }
+        fn conservative_retention(&self) -> bool {
+            self.files.conservative_retention()
         }
         fn background_writer(&self) -> Option<Box<dyn Store>> {
             Some(Box::new(Self { files: self.files.clone(), gate: self.gate.clone(), reader: true }))

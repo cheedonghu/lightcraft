@@ -2,6 +2,15 @@
 use super::*;
 impl State {
     pub(super) fn load(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
+        let pending = app.session.companion_migration_pending();
+        if self.conversations.get(&photo).is_some_and(|c| c.legacy_readonly && c.prefix.is_none()) {
+            // A pre-stage source view is only a bounded compatibility cache; once
+            // a graph/activation is ready, reload it rather than freezing an empty view.
+            self.conversations.remove(&photo);
+        }
+        if !pending && let Some(conversation) = self.conversations.get_mut(&photo) {
+            conversation.legacy_readonly = false;
+        }
         if let Some(conversation) = self.conversations.get(&photo) {
             let prefix = conversation.prefix.clone();
             let loaded = conversation.view.as_ref().map(|view| view.cursor);
@@ -13,44 +22,67 @@ impl State {
             }
             return Ok(());
         }
-        let mut conversation =
-            Conversation { scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }), ..Default::default() };
-        let header = if app.session.library.is_some() { app.session.companion_photo_header(photo).map_err(|e| e.to_string())? } else { None };
-        let archive = if let Some(header) = header {
-            conversation.prefix = Some(header);
-            app.session.companion_metadata(photo).map_err(|e| e.to_string())?
+        let _ = app.session.prepare_companion_revert(photo);
+        let mut conversation = Conversation {
+            scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }),
+            legacy_readonly: pending,
+            ..Default::default()
+        };
+        let header = if app.session.library.is_some() {
+            match app.session.companion_photo_header(photo) {
+                Ok(Some(header)) => Some(header),
+                Ok(None) if pending => app.session.companion_legacy_photo_header(photo).map_err(|e| e.to_string())?,
+                Ok(None) => None,
+                Err(error) => {
+                    // No field from an unverified HEAD can select another photo's
+                    // graph or supply an epoch for replacement. Keep only the draft.
+                    conversation.history_error = Some(HistoryError::Ownership(format!("companion/v2/photos/{}/HEAD.json: {error}", photo.0)));
+                    self.conversations.insert(photo, conversation);
+                    self.prune_cache(app, photo);
+                    return Ok(());
+                }
+            }
         } else {
-            app.session.photo_companion(photo).map_err(|e| e.to_string())?.cloned()
+            None
+        };
+        let archive = if let Some(header) = header {
+            let metadata = match app.session.companion_metadata_at(&header) {
+                Ok(metadata) => Some(metadata),
+                Err(error) => {
+                    // The owning manifest is verified independently. Its good
+                    // message blocks remain readable when inner metadata fails.
+                    conversation.history_error = Some(HistoryError::Data(format!("{}: {error}", header.metadata)));
+                    None
+                }
+            };
+            conversation.prefix = Some(header);
+            metadata
+        } else if pending {
+            // The owning migration producer will publish a bounded completed
+            // header. Until then retain the independent editor and wait; never
+            // scan/materialize the original v1 conversation on a frame.
+            None
+        } else {
+            app.session.load_companion_conversation(photo).map_err(|e| e.to_string())?
         };
         if let Some(archive) = archive {
             if !matches!(archive.get("schema_version").and_then(Value::as_u64), Some(1 | 2)) {
-                return Err("AI 对话格式不支持，未删减历史。".into());
+                let source = conversation.prefix.as_ref().map(|header| header.metadata.as_str()).unwrap_or("companion/state.json");
+                conversation.history_error = Some(HistoryError::Data(format!("{source}: unsupported conversation schema")));
             }
-            conversation.schema_version = archive["schema_version"].as_u64().unwrap_or(1);
-            conversation.records = archive.get("round_records").and_then(Value::as_array).cloned().unwrap_or_default();
+            conversation.schema_version = archive["schema_version"].as_u64().unwrap_or(0);
+            if conversation.history_error.is_none() {
+                conversation.records = archive.get("round_records").and_then(Value::as_array).cloned().unwrap_or_default();
+                conversation.rounds = archive.get("rounds").and_then(Value::as_array).cloned().unwrap_or_default();
+            }
             conversation.messages = if conversation.prefix.is_some() {
                 Vec::new()
             } else {
                 archive.get("messages").and_then(Value::as_array).ok_or("AI 对话记录无效。")?.clone()
             };
-            conversation.rounds = archive.get("rounds").and_then(Value::as_array).cloned().unwrap_or_default();
-            if let Some(saved) = archive.get("checkpoint").filter(|v| !v.is_null()) {
-                let original: DevelopSettings =
-                    serde_json::from_value(saved.get("original").cloned().ok_or("AI 撤回起点缺失。")?).map_err(|_| "AI 撤回起点无效。")?;
-                let expected: DevelopSettings =
-                    serde_json::from_value(saved.get("expected").cloned().ok_or("AI 编辑结果缺失。")?).map_err(|_| "AI 编辑结果无效。")?;
-                let p = app.session.catalog.photo(photo).ok_or("照片不存在。")?;
-                conversation.checkpoint = Some(Checkpoint {
-                    photo,
-                    generation: app.session.library_generation(),
-                    original: Arc::new(original),
-                    expected: Arc::new(expected),
-                    revision: app.session.photo_revision(photo),
-                    content: lightcraft_engine::media::content_key(p),
-                    eligible: saved.get("eligible").and_then(Value::as_bool) == Some(true),
-                    local_round_id: saved.get("local_round_id").and_then(Value::as_str).map(str::to_owned),
-                });
-            }
+            // A disk record is historical display data. Runtime publication or a
+            // separately verified durable certificate must grant revert authority;
+            // never replace a saved version/source with the current photo's identity.
         }
         app.session.pin_companion_prefix(photo, conversation.prefix.clone()).map_err(|e| e.to_string())?;
         self.conversations.insert(photo, conversation);
@@ -67,6 +99,9 @@ impl State {
             self.pending_local_saves.remove(&photo);
             return Ok(());
         };
+        if conversation.history_error.is_some() {
+            return Err(projection::invalid());
+        }
         if conversation.scope.is_some_and(|scope| scope != PhotoScope { library_generation: app.session.library_generation(), photo }) {
             return Err("AI 会话属于已关闭的图库，未写入当前图库。".into());
         }
@@ -151,11 +186,14 @@ impl State {
         let conversation = self.conversations.get(&photo).ok_or("AI 会话不存在。")?;
         let tail = conversation.messages.clone();
         let prefix = conversation.prefix.clone();
+        if prefix.as_ref().is_some_and(|h| !h.history_complete()) {
+            return Err(projection::invalid());
+        }
         let mut projection = projection::HistoryProjection::new(photo);
         if let Some(prefix) = prefix {
             let mut cursor = 0;
             while cursor < prefix.message_count {
-                let page = app.session.companion_messages_bounded(&prefix, cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
+                let page = app.session.companion_protocol_messages_bounded(&prefix, cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
                 for message in &page.records {
                     projection.push(message, |picture| {
                         let name = picture.get("attachment").and_then(Value::as_str).ok_or("AI 预览附件无效。")?;
@@ -188,10 +226,71 @@ impl State {
         cursor: lightcraft_engine::companion::storage::HistoryCursor,
     ) -> Result<(), String> {
         let Some(prefix) = self.conversations.get(&photo).and_then(|c| c.prefix.clone()) else { return Ok(()) };
+        // Capture before the first fallback read, and keep it through all
+        // owner/round scans and inactive pauses until the actual view drops.
+        let retention = app.session.retain_companion_history(&prefix).map_err(|e| e.to_string())?;
         let page = app.session.companion_history_slice_at(&prefix, cursor, 256 * 1024).map_err(|e| e.to_string())?;
+        let cached = self
+            .conversations
+            .get(&photo)
+            .and_then(|c| c.view.as_ref())
+            .filter(|v| v.captured_header == prefix)
+            .map(|v| v.fragment_messages.clone())
+            .unwrap_or_default();
+        let mut wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
+        let mut presentation = BTreeMap::new();
+        let owners: VecDeque<_> = page
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                lightcraft_engine::companion::storage::HistoryItem::Fragment { record, .. } => {
+                    if let Some(message) = cached.get(record) {
+                        if let Some(id) = message["local_round_id"].as_str() {
+                            wanted.insert(id.to_owned());
+                        }
+                        presentation.insert(*record, message.clone());
+                        None
+                    } else {
+                        Some(*record)
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        let total = if prefix.record_count > 0 { prefix.record_count } else { prefix.round_count };
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
-        conversation.view =
-            Some(HistoryView { items: page.items, cursor, next: page.next, messages: page.records, fragments: page.fragments, bytes: page.bytes });
+        if !page.errors.is_empty() {
+            conversation.history_error = Some(HistoryError::Data(page.errors.join("\n")));
+        }
+        conversation.view = Some(HistoryView {
+            captured_header: prefix.clone(),
+            _retention: retention,
+            items: page.items,
+            cursor,
+            next: page.next,
+            messages: page.records,
+            fragments: page.fragments,
+            fragment_messages: presentation.clone(),
+            bytes: page.bytes,
+            cards: Vec::new(),
+            diagnostic: None,
+            legacy_plan: None,
+            legacy_scan: (prefix.legacy_plan_count() > 0).then(|| {
+                lightcraft_engine::companion::storage::DisplayScan::new(
+                    prefix.clone(),
+                    lightcraft_engine::companion::storage::DisplayRecord::LegacyPlan(conversation.legacy_cursor),
+                )
+            }),
+            preview: None,
+            cards_bytes: presentation
+                .values()
+                .map(|v| lightcraft_engine::companion::storage::record_size(v).unwrap_or(usize::MAX))
+                .fold(0usize, usize::saturating_add),
+            card_cursor: (!owners.is_empty() || (total > 0 && !wanted.is_empty())).then_some(0),
+            card_pending: wanted,
+            card_owners: owners,
+            card_scan: None,
+        });
         self.accept_page(app, photo, cursor);
         self.prune_cache(app, photo);
         Ok(())
@@ -204,7 +303,7 @@ impl State {
                 .conversations
                 .values()
                 .map(|c| {
-                    c.view.as_ref().map(|v| v.bytes).unwrap_or(0).saturating_add(
+                    c.view.as_ref().map(|v| v.bytes.saturating_add(v.cards_bytes)).unwrap_or(0).saturating_add(
                         c.messages
                             .iter()
                             .chain(c.records.iter())

@@ -10,11 +10,18 @@ use serde_json::{Value, json};
 const SMALL: u64 = 32 * 1024;
 const BLOCK: u64 = 4 * 1024 * 1024;
 const PAGE_ITEMS: usize = 128;
-const PACK_ITEMS: usize = 64;
+const PACK_ITEMS: usize = 32;
+pub(super) mod migration;
 mod pagination;
+pub(super) mod reader_pins;
+mod recovery;
+mod retirement;
 use pagination::load_index;
-pub use pagination::{HistoryCursor, HistoryItem, HistoryReader, HistorySlice, RoundSearch, record_size};
-pub(crate) use pagination::{TailUpdate, persist_tail};
+pub use pagination::{DisplayRecord, DisplayScan, HistoryCursor, HistoryItem, HistoryReader, HistorySlice, RoundSearch, record_size};
+pub(crate) use pagination::{RevertRecord, TailUpdate, persist_tail, retry_receipt, revert_record};
+pub use reader_pins::HistoryRetention;
+pub use retirement::CleanupReport;
+pub(crate) use retirement::collect;
 
 const FORMAT: &str = "lightcraft-companion";
 
@@ -36,6 +43,27 @@ pub struct PhotoHeader {
     pub metadata_chunk_payload: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_patch: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_migrated: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_history_incomplete: bool,
+    #[serde(default)]
+    pub legacy_round_count: u64,
+    #[serde(default)]
+    pub legacy_record_count: u64,
+    #[serde(default)]
+    pub legacy_message_count: u64,
+}
+impl PhotoHeader {
+    pub fn history_complete(&self) -> bool {
+        !self.legacy_history_incomplete
+    }
+    pub fn legacy_plan_count(&self) -> u64 {
+        self.legacy_round_count.saturating_add(self.legacy_record_count)
+    }
+    pub fn original_message_count(&self) -> u64 {
+        if self.legacy_message_count == 0 && self.legacy_migrated { self.message_count } else { self.legacy_message_count.min(self.message_count) }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRoot {
@@ -69,6 +97,10 @@ struct Entry {
     chunk_payload: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text_range: Option<[u64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_range_version: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preview_refs: Option<Vec<String>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Index {
@@ -83,11 +115,13 @@ struct Jump {
     root: IndexRoot,
     upper: u64,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingCommit {
     pub photo: PhotoId,
     pub transaction_id: String,
     pub expected_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publication_epoch: Option<u64>,
     old_head: Option<Head>,
     head: Head,
     /// Persisted before creating any file from this transaction's reserved range.
@@ -96,6 +130,10 @@ pub struct PendingCommit {
     reuse: Option<PhotoHeader>,
     #[serde(default)]
     revert_override: Option<Value>,
+    #[serde(default)]
+    content_digest: Option<String>,
+    #[serde(default)]
+    receipt: Option<Value>,
 }
 fn base(photo: PhotoId) -> String {
     format!("companion/v2/photos/{}", photo.0)
@@ -143,7 +181,7 @@ fn header(store: &mut dyn Store, photo: PhotoId) -> Result<Option<PhotoHeader>> 
     }
     Ok(Some(h))
 }
-fn page(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRoot>, count: u64, cursor: u64, budget: usize) -> Result<RecordPage> {
+pub(super) fn page(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRoot>, count: u64, cursor: u64, budget: usize) -> Result<RecordPage> {
     if budget == 0 || budget > PAGE_ITEMS {
         return Err(error("page budget must be 1..128"));
     }
@@ -238,6 +276,24 @@ fn read_blob(store: &mut dyn Store, photo: PhotoId, first: &str, mut offset: u64
     }
     Ok(bytes)
 }
+/// Small complete attachment inventories permit bounded reclamation without
+/// materializing arbitrarily long message JSON. Oversized/unknown inventories
+/// conservatively retain preview ownership, never impose a local history quota.
+fn preview_inventory(value: &Value) -> Option<Vec<String>> {
+    let Some(images) = value.get("images") else { return Some(Vec::new()) };
+    let images = images.as_array()?;
+    let mut refs = Vec::new();
+    let mut size = 2usize;
+    for image in images {
+        let key = image.get("attachment")?.as_str()?;
+        size = size.checked_add(key.len().checked_add(4)?)?;
+        if size > 256 {
+            return None;
+        }
+        refs.push(key.to_owned());
+    }
+    Some(refs)
+}
 struct Writer<'a> {
     store: &'a mut dyn Store,
     pending: PendingCommit,
@@ -281,13 +337,15 @@ impl Writer<'_> {
                 self.block(&mut bytes, &mut offsets, &mut entries)?;
                 let mut entry = pagination::stream_record(self, record, length)?;
                 entry.text_range = pagination::text_range(record, None)?;
+                entry.text_range_version = Some(1);
+                entry.preview_refs = preview_inventory(record);
                 entries.push(entry);
             } else {
                 let data = serde_json::to_vec(record).map_err(error)?;
                 if bytes.len().saturating_add(data.len()) as u64 > BLOCK {
                     self.block(&mut bytes, &mut offsets, &mut entries)?;
                 }
-                offsets.push((bytes.len() as u64, data.len(), digest(&data), pagination::text_range(record, None)?));
+                offsets.push((bytes.len() as u64, data.len(), digest(&data), pagination::text_range(record, None)?, preview_inventory(record)));
                 bytes.extend_from_slice(&data);
             }
             if offsets.len() + entries.len() >= PACK_ITEMS {
@@ -322,44 +380,63 @@ impl Writer<'_> {
         }
         Ok(jumps)
     }
-    fn block(&mut self, bytes: &mut Vec<u8>, offsets: &mut Vec<(u64, usize, String, Option<[u64; 2]>)>, entries: &mut Vec<Entry>) -> Result<()> {
+    fn block(
+        &mut self,
+        bytes: &mut Vec<u8>,
+        offsets: &mut Vec<(u64, usize, String, Option<[u64; 2]>, Option<Vec<String>>)>,
+        entries: &mut Vec<Entry>,
+    ) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         let key = self.file("blocks/", "bin", bytes)?;
-        for (offset, length, digest, text_range) in offsets.drain(..) {
-            entries.push(Entry { block: key.clone(), offset, length, digest, chunk_payload: None, text_range });
+        for (offset, length, digest, text_range, preview_refs) in offsets.drain(..) {
+            entries.push(Entry {
+                block: key.clone(),
+                offset,
+                length,
+                digest,
+                chunk_payload: None,
+                text_range,
+                text_range_version: Some(1),
+                preview_refs,
+            });
         }
         bytes.clear();
         Ok(())
     }
 }
 pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, expected_epoch: u64, conversation: &Value) -> Result<PendingCommit> {
+    stage_with_epoch(store, photo, expected_epoch, None, conversation)
+}
+fn stage_with_epoch(
+    store: &mut dyn Store,
+    photo: PhotoId,
+    expected_epoch: u64,
+    publication_epoch: Option<u64>,
+    conversation: &Value,
+) -> Result<PendingCommit> {
+    if publication_epoch.is_some_and(|epoch| expected_epoch.checked_add(1) != Some(epoch)) {
+        return Err(error("invalid conversation epoch transition"));
+    }
+    let pending_key = format!("{}/pending.json", base(photo));
     let old = header(store, photo)?;
     if old.as_ref().map(|h| h.conversation_epoch).unwrap_or(0) != expected_epoch {
         return Err(error("conversation epoch changed"));
     }
-    let pending_key = format!("{}/pending.json", base(photo));
-    let existing = read::<PendingCommit>(store, &pending_key, SMALL)?;
-    let actual: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
-    let reusable = existing.filter(|p| actual.as_ref().map(|h| &h.transaction_id) != Some(&p.transaction_id));
-    let pending = if let Some(p) = reusable {
-        if !valid_transaction(&p.transaction_id)
-            || p.head.transaction_id != p.transaction_id
-            || p.head.manifest != format!("{}/manifest-{}.json", base(photo), p.transaction_id)
-            || p.photo != photo
-            || p.expected_epoch != expected_epoch
-            || p.old_head != actual
-        {
-            return Err(error("unresolved archive transaction; recovery required"));
-        }
-        p
+    let fingerprint = if let Some(epoch) = publication_epoch {
+        recovery::fingerprint(&("confirmed-clear", expected_epoch, epoch, conversation))?
     } else {
-        let tx = super::LocalRoundId::new().map_err(error)?.as_str().to_owned();
-        let head = Head { manifest: format!("{}/manifest-{tx}.json", base(photo)), transaction_id: tx.clone(), manifest_digest: String::new() };
-        let old_head = actual;
-        PendingCommit { photo, transaction_id: tx, expected_epoch, old_head, head, reserved_files: 0, reuse: None, revert_override: None }
+        recovery::fingerprint(conversation)?
     };
+    let (mut pending, complete) = match publication_epoch {
+        Some(epoch) => recovery::prepare_clear(store, photo, expected_epoch, epoch, &fingerprint)?,
+        None => recovery::prepare(store, photo, expected_epoch, &fingerprint)?,
+    };
+    pending.publication_epoch = publication_epoch;
+    if complete {
+        return Ok(pending);
+    }
     write(store, &pending_key, &pending)?;
     let mut writer = Writer { store, pending, sequence: 0 };
     let mut normalized = conversation.clone();
@@ -411,7 +488,7 @@ pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, expected_epoch: u64, 
     let metadata = writer.blob(&metadata_bytes)?;
     let manifest = PhotoHeader {
         photo_id: photo,
-        conversation_epoch: expected_epoch,
+        conversation_epoch: publication_epoch.unwrap_or(expected_epoch),
         transaction_id: writer.pending.transaction_id.clone(),
         metadata,
         message_root,
@@ -424,6 +501,11 @@ pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, expected_epoch: u64, 
         metadata_length,
         metadata_chunk_payload: None,
         record_patch: None,
+        legacy_migrated: false,
+        legacy_history_incomplete: false,
+        legacy_round_count: 0,
+        legacy_record_count: 0,
+        legacy_message_count: 0,
     };
     write(writer.store, &writer.pending.head.manifest, &manifest)?;
     writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
@@ -440,7 +522,11 @@ fn verify_suffix(store: &mut dyn Store, manifest: &PhotoHeader, reuse: Option<&P
 fn verify_suffix_from(store: &mut dyn Store, manifest: &PhotoHeader, reuse: Option<&PhotoHeader>, from: Option<[u64; 3]>) -> Result<()> {
     validate_key(manifest.photo_id, &manifest.metadata, "blocks/")?;
     let entry = pagination::metadata_entry(manifest)?;
-    pagination::verify_record(store, manifest.photo_id, &entry)?;
+    if manifest.legacy_migrated {
+        migration::verify_record(store, manifest.photo_id, &entry)?;
+    } else {
+        pagination::verify_record(store, manifest.photo_id, &entry)?;
+    }
     for (ordinal, (root, count, messages, start)) in [
         (manifest.message_root.as_ref(), manifest.message_count, true, reuse.map(|h| h.message_count).unwrap_or(0)),
         (manifest.round_root.as_ref(), manifest.round_count, false, reuse.map(|h| h.round_count).unwrap_or(0)),
@@ -455,8 +541,15 @@ fn verify_suffix_from(store: &mut dyn Store, manifest: &PhotoHeader, reuse: Opti
         }
         while cursor < count {
             let entry = pagination::entry(store, manifest.photo_id, root, count, cursor)?;
-            pagination::verify_record(store, manifest.photo_id, &entry)?;
-            if messages && entry.length as u64 <= BLOCK {
+            if manifest.legacy_migrated {
+                migration::verify_record(store, manifest.photo_id, &entry)?;
+            } else {
+                pagination::verify_record(store, manifest.photo_id, &entry)?;
+            }
+            if messages && manifest.legacy_migrated {
+                migration::prove_references(store, manifest.photo_id, &entry)?;
+            }
+            if messages && !manifest.legacy_migrated && entry.length as u64 <= BLOCK {
                 let bytes = pagination::range(store, manifest.photo_id, &entry, 0, entry.length)?;
                 let message: Value = serde_json::from_slice(&bytes).map_err(error)?;
                 if let Some(images) = message.get("images").and_then(Value::as_array) {
@@ -480,14 +573,41 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
     {
         return Err(error("invalid pending transaction"));
     }
+    let persisted: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(pending.photo)), SMALL)?;
+    let visible: Option<Head> = read(store, &format!("{}/HEAD.json", base(pending.photo)), SMALL)?;
+    if persisted.as_ref().is_some_and(|p| p != pending) || (persisted.is_none() && visible.as_ref() != Some(&pending.head)) {
+        return Err(error("pending transaction changed before commit"));
+    }
+    // A visible final reservation may still be the result of a failed sync.
+    if persisted.is_some() {
+        write(store, &format!("{}/pending.json", base(pending.photo)), pending)?;
+    }
     validate_key(pending.photo, &pending.head.manifest, "manifest-")?;
     let bytes = store.read_limited(&pending.head.manifest, SMALL).map_err(error)?.ok_or_else(|| error("staged manifest missing"))?;
     if digest(&bytes) != pending.head.manifest_digest {
         return Err(error("staged manifest digest mismatch"));
     }
     let staged: PhotoHeader = serde_json::from_slice(&bytes).map_err(error)?;
-    if staged.photo_id != pending.photo || staged.transaction_id != pending.transaction_id || staged.conversation_epoch != pending.expected_epoch {
+    if staged.photo_id != pending.photo
+        || staged.transaction_id != pending.transaction_id
+        || staged.conversation_epoch != pending.publication_epoch.unwrap_or(pending.expected_epoch)
+    {
         return Err(error("staged identity mismatch"));
+    }
+    if let Some(epoch) = pending.publication_epoch
+        && (pending.expected_epoch.checked_add(1) != Some(epoch)
+            || pending.reuse.is_some()
+            || pending.receipt.is_some()
+            || staged.message_count != 0
+            || staged.round_count != 0
+            || staged.record_count != 0
+            || staged.message_root.is_some()
+            || staged.round_root.is_some()
+            || staged.record_root.is_some()
+            || staged.record_patch.is_some()
+            || staged.legacy_migrated)
+    {
+        return Err(error("invalid confirmed context replacement"));
     }
     if let Some(reuse) = pending.reuse.as_ref() {
         if reuse.photo_id != pending.photo
@@ -520,16 +640,16 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
     let head_key = format!("{}/HEAD.json", base(pending.photo));
     // Retrying the same transaction after an ambiguous fsync is idempotent.
     let visible: Option<Head> = read(store, &head_key, SMALL)?;
-    if visible.as_ref() != Some(&pending.head) {
-        if visible != pending.old_head {
-            return Err(error("HEAD changed before commit"));
-        }
-        write(store, &head_key, &pending.head)?;
+    if visible.as_ref() != Some(&pending.head) && visible != pending.old_head {
+        return Err(error("HEAD changed before commit"));
     }
+    retirement::own(store, pending)?;
+    // Equality only proves visibility. Repeating the bounded atomic write is the
+    // durability confirmation after a possible rename/directory-sync error.
+    write(store, &head_key, &pending.head)?;
     let manifest = header(store, pending.photo)?.ok_or_else(|| error("committed manifest missing"))?;
-    let metadata = pagination::metadata_raw(store, &manifest)?;
-    let live_revert: Option<Value> =
-        if pending.revert_override.is_some() { read(store, &format!("{}/revert.json", base(pending.photo)), SMALL)? } else { None };
+    let metadata = if manifest.legacy_migrated { json!({"checkpoint":null}) } else { pagination::metadata_raw(store, &manifest)? };
+    let live_revert = super::revert_guard::read_guard(store, pending.photo)?;
     let revert = pending.revert_override.as_ref();
     let override_eligible = revert.map(|r| {
         r["eligible"] == true
@@ -539,29 +659,230 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
                     && current["eligible"] == true
             })
     });
-    write(
-        store,
-        &format!("{}/revert.json", base(pending.photo)),
-        &json!({"transaction_id":pending.transaction_id,"local_round_id":revert.and_then(|r|r.get("local_round_id")).or_else(||metadata.pointer("/checkpoint/local_round_id")),"eligible":override_eligible.unwrap_or_else(||metadata.pointer("/checkpoint/eligible").and_then(Value::as_bool).unwrap_or(false))}),
-    )?;
-    // Cleanup cannot turn a visible valid commit into an archive-save error.
-    if let Err(e) = store.remove(&format!("{}/pending.json", base(pending.photo))) {
-        log::warn!("archive pending cleanup: {e}");
+    let local_round_id = revert.and_then(|r| r.get("local_round_id")).or_else(|| metadata.pointer("/checkpoint/local_round_id"));
+    let invalidated = live_revert.as_ref().is_some_and(|r| {
+        r["eligible"] == false
+            && r.get("local_round_id") == local_round_id
+            && (r["transaction_id"] == pending.transaction_id || pending.old_head.as_ref().is_some_and(|h| r["transaction_id"] == h.transaction_id))
+    });
+    let eligible = !staged.legacy_migrated
+        && !invalidated
+        && override_eligible.unwrap_or_else(|| metadata.pointer("/checkpoint/eligible").and_then(Value::as_bool).unwrap_or(false));
+    let mut guard = live_revert.unwrap_or_else(|| json!({}));
+    guard["transaction_id"] = json!(pending.transaction_id);
+    guard["local_round_id"] = json!(local_round_id);
+    guard["eligible"] = json!(eligible);
+    write(store, &format!("{}/revert.json", base(pending.photo)), &guard)?;
+    Ok(())
+}
+/// Ownership and HEAD are already durable. Pending removal is cleanup debt and
+/// can never reverse the accepted conversation commit.
+pub(crate) fn reconcile_visible_pending(store: &mut dyn Store, photo: PhotoId, known_published: Option<&str>) -> Result<()> {
+    let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    let Some(p) = p else { return Ok(()) };
+    let visible: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
+    recovery::validate(&p, photo, &visible)?;
+    if visible.as_ref() == Some(&p.head) {
+        let h = header(store, photo)?.ok_or_else(|| error("published manifest missing"))?;
+        if h.conversation_epoch != p.publication_epoch.unwrap_or(p.expected_epoch)
+            || (known_published != Some(p.transaction_id.as_str()) && !retirement::publication_confirmed(store, &p)?)
+        {
+            return Err(error("publication confirmation unavailable; pending graph protected"));
+        }
+        // Repeat the small proof write after an ambiguous directory-sync error.
+        retirement::confirm_publication(store, &p)?;
+        store.remove(&format!("{}/pending.json", base(photo))).map_err(error)?;
     }
     Ok(())
 }
+pub(crate) fn finish_pending(store: &mut dyn Store, photo: PhotoId) -> Result<()> {
+    let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    if let Some(p) = p {
+        retirement::confirm_publication(store, &p)?;
+    }
+    store.remove(&format!("{}/pending.json", base(photo))).map_err(error)
+}
+pub(crate) fn published_pending_transaction(store: &mut dyn Store, photo: PhotoId) -> Result<Option<String>> {
+    let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    Ok(p.filter(|p| !p.head.manifest_digest.is_empty()).map(|p| p.transaction_id))
+}
 pub(crate) fn activate(store: &mut dyn Store) -> Result<()> {
-    if let Some(root) = read::<Value>(store, STATE_FILE, SMALL)?
-        && (root["format"] != FORMAT || root["version"] != 2 || root["layout"] != "photo-head-v2")
-    {
-        return Err(error("activation refuses an existing legacy or unknown root"));
+    if let Some(bytes) = store.read_limited(STATE_FILE, SMALL).map_err(error)? {
+        if !super::migration::known_v2_root(&bytes)? {
+            return Err(error("activation refuses an existing legacy or unknown root"));
+        }
+        // Confirmation preserves all owned recoverability metadata, including
+        // the exact v1 backup proof. Repeating these same bytes proves durability.
+        return store.write_atomic(STATE_FILE, &bytes).map_err(error);
     }
     write(store, STATE_FILE, &json!({"format":FORMAT,"version":2,"layout":"photo-head-v2"}))
 }
+
 impl Session {
+    /// The persisted confirmed operation may outlive its original UI/session.
+    /// Discover only this photo's bounded intent; never scan a library's history.
+    pub fn pending_companion_clear_epoch(&mut self, photo: PhotoId) -> Result<Option<u64>> {
+        if self.library.is_none() {
+            return Ok(None);
+        }
+        let Some(pending) = self.companion_pending(photo)? else { return Ok(None) };
+        let Some(epoch) = pending.publication_epoch else { return Ok(None) };
+        if pending.expected_epoch.checked_add(1) != Some(epoch) {
+            return Err(error("invalid confirmed context replacement intent"));
+        }
+        let library = self.library.as_mut().ok_or_else(|| error("library closed"))?;
+        let visible = read(library.files.as_mut(), &format!("{}/HEAD.json", base(photo)), SMALL)?;
+        recovery::validate(&pending, photo, &visible)?;
+        if self.companion_archive.cleanup_published.get(&photo) == Some(&pending.transaction_id)
+            || (!pending.head.manifest_digest.is_empty() && retirement::publication_confirmed(library.files.as_mut(), &pending)?)
+        {
+            return Ok(None);
+        }
+        self.companion_archive
+            .clear_errors
+            .entry(photo)
+            .or_insert_with(|| "Conversation deletion is waiting for local saving. Retry deletion before starting a new AI task.".into());
+        Ok(Some(pending.expected_epoch))
+    }
+    /// The confirmation version also retains an interrupted confirmed clear's
+    /// original epoch, so retry cannot target its already-visible replacement.
+    pub fn companion_conversation_epoch(&mut self, photo: PhotoId) -> Result<u64> {
+        if self.library.is_none() {
+            return Ok(self.companion_archive.ephemeral_epochs.get(&photo).copied().unwrap_or(0));
+        }
+        if let Some(epoch) = self.pending_companion_clear_epoch(photo)? {
+            return Ok(epoch);
+        }
+        let header = self.companion_photo_header(photo)?;
+        if self.catalog.photo(photo).is_none() && header.is_none() {
+            return Err(error("no owned photo conversation"));
+        }
+        Ok(header.map(|header| header.conversation_epoch).unwrap_or(0))
+    }
+    /// Confirmed context replacement bound to the owning photo/library and old
+    /// conversation epoch. Effects, ordinary History and editor draft are kept.
+    pub fn companion_clear(&mut self, scope: super::PhotoScope, expected_epoch: u64) -> Result<CommitReceipt> {
+        if scope.library_generation != self.library_generation() {
+            return Err(error("conversation belongs to another or closed library"));
+        }
+        if self.library.is_none() {
+            if self.catalog.photo(scope.photo).is_none() && !self.companion_archive.photos.contains_key(&scope.photo) {
+                return Err(error("no owned photo conversation"));
+            }
+            if self.companion_conversation_epoch(scope.photo)? != expected_epoch {
+                return Err(error("conversation epoch changed"));
+            }
+            let epoch = expected_epoch.checked_add(1).ok_or_else(|| error("conversation epoch exhausted"))?;
+            self.retire_companion_revert(scope.photo)?;
+            self.companion_archive.photos.remove(&scope.photo);
+            self.companion_archive.ephemeral_epochs.insert(scope.photo, epoch);
+            return Ok(CommitReceipt {
+                photo: scope.photo,
+                conversation_epoch: epoch,
+                transaction_id: super::LocalRoundId::new().map_err(error)?.as_str().into(),
+            });
+        }
+        if self.companion_archive.blocked.is_some() || self.companion_archive.legacy || self.companion_migration_pending() {
+            return Err(error("conversation storage is protected or its producer is still active"));
+        }
+        if self.catalog.photo(scope.photo).is_none() && self.companion_photo_header(scope.photo)?.is_none() {
+            return Err(error("no owned photo conversation"));
+        }
+        let epoch = expected_epoch.checked_add(1).ok_or_else(|| error("conversation epoch exhausted"))?;
+        let resumed = self.companion_pending(scope.photo)?;
+        let ready =
+            resumed.filter(|p| p.expected_epoch == expected_epoch && p.publication_epoch == Some(epoch) && !p.head.manifest_digest.is_empty());
+        if ready.is_none() && self.companion_photo_header(scope.photo)?.map(|h| h.conversation_epoch).unwrap_or(0) != expected_epoch {
+            return Err(error("conversation epoch changed"));
+        }
+        self.retire_companion_revert(scope.photo)?;
+        let result = (|| {
+            let pending = match ready {
+                Some(pending) => pending,
+                None => stage_with_epoch(
+                    self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(),
+                    scope.photo,
+                    expected_epoch,
+                    Some(epoch),
+                    &json!({"schema_version":2,"messages":[],"rounds":[],"round_records":[]}),
+                )?,
+            };
+            self.companion_commit(&pending)
+        })();
+        let receipt = match result {
+            Ok(receipt) => {
+                self.companion_archive.clear_errors.remove(&scope.photo);
+                receipt
+            }
+            Err(e) => {
+                // Data/HEAD visibility is not acknowledgement. Keep this
+                // explicit confirmed operation in the local recovery outlet.
+                self.companion_archive.clear_errors.insert(scope.photo, e.to_string());
+                return Err(e);
+            }
+        };
+        self.companion_archive.photos.remove(&scope.photo);
+        self.companion_archive.tails.remove(&scope.photo);
+        self.companion_archive.dirty_photos.remove(&scope.photo);
+        self.companion_archive.receipts.remove(&scope.photo);
+        self.pin_companion_prefix(scope.photo, None)?;
+        Ok(receipt)
+    }
+    /// Retain a main-frame/resumable reader from capture until actual retirement.
+    pub fn retain_companion_history(&mut self, header: &PhotoHeader) -> Result<HistoryRetention> {
+        let library = self.library.as_mut().ok_or_else(|| error("library closed"))?;
+        let lock = library.retain_read_lock();
+        reader_pins::capture(&self.companion_archive.readers, library.files.as_mut(), header, lock)
+    }
+    /// A bounded cleanup timer needs future frames even after the last AI job ends.
+    pub fn companion_cleanup_pending(&self) -> bool {
+        !self.companion_archive.marker_cleanup.is_empty()
+            || !self.companion_archive.cleanup_photos.is_empty()
+            || !self.companion_archive.cleanup_waiting.is_empty()
+            || self.companion_archive.readers.has_releases()
+    }
+    pub fn companion_photo_cleanup_pending(&self, photo: PhotoId) -> bool {
+        self.companion_archive.marker_cleanup.values().any(|m| m.photo.is_none_or(|p| p == photo))
+            || self.companion_archive.cleanup_photos.contains(&photo)
+            || self.companion_archive.cleanup_waiting.contains(&photo)
+            || self.companion_archive.readers.photo_released(photo)
+    }
+    pub fn companion_cleanup_error(&self, photo: PhotoId) -> Option<&str> {
+        self.companion_archive
+            .cleanup_errors
+            .get(&photo)
+            .map(String::as_str)
+            .or_else(|| self.companion_archive.marker_cleanup.values().find(|m| m.photo.is_none_or(|p| p == photo)).map(|m| m.error.as_str()))
+    }
+    /// Explicit confirmed context replacement cannot be completed by ordinary
+    /// save backoff; callers must offer the owning storage-only retry.
+    pub fn companion_save_requires_explicit_retry(&self) -> bool {
+        !self.companion_archive.clear_errors.is_empty()
+    }
+    pub fn companion_photo_unsaved(&self, photo: PhotoId) -> bool {
+        self.companion_archive.core_save_error.is_some()
+            || self.companion_archive.editors.dirty_for(photo)
+            || self.companion_history_unsaved(photo)
+            || self.companion_archive.certificate_dirty.contains(&photo)
+    }
+    pub fn companion_history_unsaved(&self, photo: PhotoId) -> bool {
+        self.companion_archive.clear_errors.contains_key(&photo)
+            || self.companion_archive.tails.contains_key(&photo)
+            || self.companion_archive.dirty_photos.contains(&photo)
+            || self.companion_archive.revert_dirty.contains(&photo)
+            || self.companion_archive.receipts.contains_key(&photo)
+    }
     pub fn companion_photo_header(&mut self, photo: PhotoId) -> Result<Option<PhotoHeader>> {
+        if self.companion_archive.legacy || self.companion_archive.blocked.is_some() {
+            return Ok(None);
+        }
+        self.pending_companion_clear_epoch(photo)?;
         let lib = self.library.as_mut().ok_or_else(|| error("library closed"))?;
-        header(lib.files.as_mut(), photo)
+        let h = header(lib.files.as_mut(), photo)?;
+        if h.is_some() && self.companion_archive.v2 {
+            self.companion_archive.cleanup_photos.insert(photo);
+        }
+        Ok(h)
     }
     pub fn companion_messages_page(&mut self, photo: PhotoId, cursor: u64, budget: usize) -> Result<RecordPage> {
         let h = self.companion_photo_header(photo)?.ok_or_else(|| error("conversation missing"))?;
@@ -615,13 +936,25 @@ impl Session {
         stage(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), photo, expected_epoch, conversation)
     }
     pub fn companion_commit(&mut self, pending: &PendingCommit) -> Result<CommitReceipt> {
+        if self.companion_migration_pending() {
+            return Err(error("legacy migration pauses AI save and conversation deletion"));
+        }
         let store = self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut();
         commit(store, pending)?;
         if !self.companion_archive.v2 {
             activate(store)?;
             self.companion_archive.v2 = true;
         }
-        Ok(CommitReceipt { photo: pending.photo, conversation_epoch: pending.expected_epoch, transaction_id: pending.transaction_id.clone() })
+        self.companion_archive.cleanup_published.insert(pending.photo, pending.transaction_id.clone());
+        if let Err(e) = finish_pending(store, pending.photo) {
+            self.companion_archive.cleanup_errors.insert(pending.photo, e.to_string());
+        }
+        self.companion_archive.cleanup_photos.insert(pending.photo);
+        Ok(CommitReceipt {
+            photo: pending.photo,
+            conversation_epoch: pending.publication_epoch.unwrap_or(pending.expected_epoch),
+            transaction_id: pending.transaction_id.clone(),
+        })
     }
     pub fn save_companion_conversation(&mut self, photo: PhotoId, conversation: Value) -> Result<()> {
         if let Some(e) = &self.companion_archive.blocked {
@@ -641,14 +974,22 @@ impl Session {
         let result = self
             .companion_photo_header(photo)
             .and_then(|h| self.companion_stage(photo, h.map(|h| h.conversation_epoch).unwrap_or(0), &conversation))
-            .and_then(|p| self.companion_commit(&p).map(|_| ()));
+            .and_then(|p| self.companion_commit(&p));
         match result {
-            Ok(()) => {
+            Ok(receipt) => {
+                if let Some(records) = conversation.get("round_records").and_then(Value::as_array) {
+                    self.capture_companion_revert_record(photo, receipt.conversation_epoch, 0, records);
+                }
                 // Format 2 keeps graphs on disk; only failed writes own a retry
                 // payload. Successful full-value compatibility saves are not cached.
                 self.companion_archive.photos.remove(&photo);
                 self.companion_archive.dirty_photos.remove(&photo);
-                if self.companion_archive.dirty_photos.is_empty() && self.companion_archive.revert_dirty.is_empty() {
+                if self.companion_archive.dirty_photos.is_empty()
+                    && self.companion_archive.revert_dirty.is_empty()
+                    && self.companion_archive.certificate_dirty.is_empty()
+                    && self.companion_archive.tails.is_empty()
+                    && self.companion_archive.receipts.is_empty()
+                {
                     self.companion_archive.error = None;
                 }
                 Ok(())
@@ -668,6 +1009,9 @@ impl Session {
             return Ok(self.companion_archive.photos.get(&photo).cloned());
         }
         if !self.companion_archive.v2 {
+            if let Some(migration) = self.companion_archive.migration.as_mut() {
+                return migration.conversation(photo);
+            }
             return Ok(self.photo_companion(photo)?.cloned());
         }
         let Some(h) = self.companion_photo_header(photo)? else { return Ok(None) };
@@ -762,13 +1106,19 @@ pub(crate) fn invalidate_revert(store: &mut dyn Store, photos: &std::collections
     let mut failed = None;
     for photo in photos {
         let result = (|| {
-            if let Some(h) = header(store, *photo)? {
-                write(store, &format!("{}/revert.json", base(*photo)), &json!({"transaction_id":h.transaction_id,"eligible":false}))?;
+            let mut guard = super::revert_guard::read_guard(store, *photo)?.unwrap_or_else(|| json!({}));
+            let epoch = guard["mutation_epoch"].as_u64().unwrap_or(0).checked_add(1).ok_or_else(|| error("mutation epoch exhausted"))?;
+            guard["mutation_epoch"] = json!(epoch);
+            guard["eligible"] = json!(false);
+            if let Some(cert) = guard.get_mut("certificate") {
+                cert["eligible"] = json!(false);
             }
-            Ok(())
+            // Repeat the atomic write even if the previous failed write became
+            // visible. Visibility alone is never a durable invalidation receipt.
+            super::revert_guard::write_guard(store, *photo, &guard)
         })();
         if let Err(e) = result {
-            failed = Some(e);
+            failed = Some(e)
         }
     }
     failed.map_or(Ok(()), Err)

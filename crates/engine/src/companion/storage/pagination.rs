@@ -9,8 +9,19 @@ pub struct HistoryCursor {
 /// Ordered references into a slice's owned buffers; no text/body is duplicated.
 #[derive(Clone, Copy, Debug)]
 pub enum HistoryItem {
-    Record { record: u64, index: usize },
-    Fragment { record: u64, offset: u64, index: usize },
+    Record {
+        record: u64,
+        index: usize,
+    },
+    Fragment {
+        record: u64,
+        offset: u64,
+        index: usize,
+    },
+    /// An owned, indexed record whose payload could not be verified.
+    Unavailable {
+        record: u64,
+    },
 }
 #[derive(Debug)]
 pub struct HistorySlice {
@@ -18,6 +29,8 @@ pub struct HistorySlice {
     pub records: Vec<Value>,
     /// Oversize message text remains readable as consecutive decoded UTF-8 fragments.
     pub fragments: Vec<String>,
+    /// Bounded owning diagnostics for unavailable display records; never model input.
+    pub errors: Vec<String>,
     pub next: Option<HistoryCursor>,
     pub bytes: usize,
 }
@@ -54,6 +67,10 @@ pub(super) fn entry(store: &mut dyn Store, photo: PhotoId, root: Option<&IndexRo
                 || (record.length as u64 > BLOCK && record.offset != 0)
             {
                 return Err(error("invalid record bounds"));
+            }
+            let payload = record.chunk_payload.unwrap_or(BLOCK);
+            if payload == 0 || payload > BLOCK || (record.chunk_payload.is_some() && payload != BLOCK - 32) {
+                return Err(error("invalid chunk layout"));
             }
             return Ok(record);
         }
@@ -110,81 +127,145 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
     if !(1024..=256 * 1024).contains(&byte_budget) {
         return Err(error("history byte budget must be 1 KiB..256 KiB"));
     }
-    let mut result = HistorySlice { items: Vec::new(), records: Vec::new(), fragments: Vec::new(), next: None, bytes: 0 };
-    let mut scanned = 0usize;
-    while cursor.record < h.message_count && scanned < 32 {
-        scanned += 1;
+    let mut result = HistorySlice { items: Vec::new(), records: Vec::new(), fragments: Vec::new(), errors: Vec::new(), next: None, bytes: 0 };
+    for _ in 0..32 {
+        if cursor.record >= h.message_count || byte_budget.saturating_sub(result.bytes) < 1024 {
+            break;
+        }
+        // Ownership, index integrity and entry bounds remain strict. Only a
+        // payload selected through that verified index can become a placeholder.
         let entry = entry(store, h.photo_id, h.message_root.as_ref(), h.message_count, cursor.record)?;
         if cursor.offset >= entry.length as u64 {
             return Err(error("fragment offset outside record"));
         }
-        let oversized = entry.length > byte_budget.saturating_sub(result.bytes) || cursor.offset > 0;
-        let text_end = if oversized && let Some([start, end]) = entry.text_range {
-            if start > end || end > entry.length as u64 {
-                return Err(error("invalid message text range"));
-            }
-            cursor.offset = cursor.offset.max(start);
-            if cursor.offset >= end {
-                cursor.record += 1;
-                cursor.offset = 0;
-                continue;
-            }
-            Some(end)
-        } else {
-            None
-        };
-        let remaining = text_end.unwrap_or(entry.length as u64) - cursor.offset;
-        let available = byte_budget.saturating_sub(result.bytes);
-        if available < 1024 {
-            break;
-        }
-        let length = usize::try_from(remaining.min(available as u64)).map_err(error)?;
-        let mut bytes = range(store, h.photo_id, &entry, cursor.offset, length)?;
-        if cursor.offset > 0 {
-            let skip = bytes.iter().take(3).take_while(|b| **b & 0xc0 == 0x80).count();
-            if skip > 0 {
-                bytes.drain(..skip);
-                cursor.offset = cursor.offset.checked_add(skip as u64).ok_or_else(|| error("UTF-8 cursor overflow"))?;
-            }
-        }
-        if text_end.is_none() && cursor.offset == 0 && remaining == length as u64 {
-            if digest(&bytes) != entry.digest {
-                return Err(error("record digest mismatch"));
-            }
-            result.items.push(HistoryItem::Record { record: cursor.record, index: result.records.len() });
-            result.records.push(serde_json::from_slice(&bytes).map_err(error)?);
-        } else {
-            // Keep boundaries on complete UTF-8 scalars; the subsequent fragment resumes
-            // at the exact remaining byte. No content or message is discarded.
-            if let Err(e) = std::str::from_utf8(&bytes) {
-                if e.error_len().is_some() {
-                    return Err(error("invalid UTF-8 history fragment"));
+        let record = cursor.record;
+        let lengths = (result.items.len(), result.records.len(), result.fragments.len());
+        match slice_record(store, h, &entry, &mut cursor, &mut result, byte_budget) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(cause) => {
+                result.items.truncate(lengths.0);
+                result.records.truncate(lengths.1);
+                result.fragments.truncate(lengths.2);
+                let mut diagnostic = format!("{} record {record}: {cause}", entry.block);
+                if diagnostic.len() > 512 {
+                    let mut boundary = 512;
+                    while !diagnostic.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    diagnostic.truncate(boundary);
                 }
-                bytes.truncate(e.valid_up_to());
+                result.bytes += diagnostic.len();
+                result.errors.push(diagnostic);
+                result.items.push(HistoryItem::Unavailable { record });
+                cursor = HistoryCursor { record: record + 1, offset: 0 };
             }
-            result.items.push(HistoryItem::Fragment { record: cursor.record, offset: cursor.offset, index: result.fragments.len() });
-            if text_end.is_some() {
-                let safe = complete_escape_prefix(&bytes);
-                bytes.truncate(safe);
-                let encoded = String::from_utf8(bytes.clone()).map_err(error)?;
-                let decoded: String = serde_json::from_str(&format!("\"{encoded}\"")).map_err(error)?;
-                result.fragments.push(decoded);
-            } else {
-                result.fragments.push(String::from_utf8(bytes.clone()).map_err(error)?);
-            }
-        }
-        result.bytes += bytes.len();
-        cursor.offset = cursor.offset.checked_add(bytes.len() as u64).ok_or_else(|| error("fragment cursor overflow"))?;
-        if cursor.offset == text_end.unwrap_or(entry.length as u64) {
-            cursor.record += 1;
-            cursor.offset = 0;
-        }
-        if result.bytes >= byte_budget {
-            break;
         }
     }
     result.next = (cursor.record < h.message_count).then_some(cursor);
     Ok(result)
+}
+fn slice_record(
+    store: &mut dyn Store,
+    h: &PhotoHeader,
+    entry: &Entry,
+    cursor: &mut HistoryCursor,
+    result: &mut HistorySlice,
+    byte_budget: usize,
+) -> Result<bool> {
+    let oversized = entry.length > byte_budget.saturating_sub(result.bytes) || cursor.offset > 0;
+    if oversized && entry.chunk_payload.is_none() {
+        if entry.length as u64 > BLOCK {
+            return Err(error("unverified legacy chunk layout; original history retained"));
+        }
+        let complete = range(store, h.photo_id, entry, 0, entry.length)?;
+        if digest(&complete) != entry.digest {
+            return Err(error("record digest mismatch"));
+        }
+    }
+    let text_end = if oversized && let Some([start, end]) = entry.text_range {
+        if start > end || end > entry.length as u64 {
+            return Err(error("invalid message text range"));
+        }
+        cursor.offset = cursor.offset.max(start);
+        if entry.text_range_version == Some(1) && cursor.offset >= end {
+            if start == end {
+                result.items.push(HistoryItem::Fragment { record: cursor.record, offset: start, index: result.fragments.len() });
+                result.fragments.push(String::new());
+            }
+            cursor.record += 1;
+            cursor.offset = 0;
+            return Ok(true);
+        }
+        Some(if entry.text_range_version == Some(1) { end } else { entry.length as u64 })
+    } else {
+        None
+    };
+    let remaining = text_end.unwrap_or(entry.length as u64) - cursor.offset;
+    let available = byte_budget.saturating_sub(result.bytes);
+    if available < 1024 {
+        return Ok(false);
+    }
+    let length = usize::try_from(remaining.min(available as u64)).map_err(error)?;
+    let mut bytes = range(store, h.photo_id, entry, cursor.offset, length)?;
+    // Old hints encoded a content heuristic, not the complete authored span.
+    // Keep the known string start and discover its closing quote within this
+    // one bounded slice. Never hydrate or rewrite the giant model record.
+    let old_string_end = text_end.is_some() && entry.text_range_version != Some(1);
+    let quote = old_string_end.then(|| string_end(&bytes)).flatten();
+    if let Some(end) = quote {
+        bytes.truncate(end);
+    }
+    if old_string_end && quote == Some(0) {
+        result.items.push(HistoryItem::Fragment { record: cursor.record, offset: cursor.offset, index: result.fragments.len() });
+        result.fragments.push(String::new());
+        cursor.record += 1;
+        cursor.offset = 0;
+        return Ok(true);
+    }
+    if cursor.offset > 0 {
+        let skip = bytes.iter().take(3).take_while(|b| **b & 0xc0 == 0x80).count();
+        if skip > 0 {
+            bytes.drain(..skip);
+            cursor.offset = cursor.offset.checked_add(skip as u64).ok_or_else(|| error("UTF-8 cursor overflow"))?;
+        }
+    }
+    if text_end.is_none() && cursor.offset == 0 && remaining == length as u64 {
+        if digest(&bytes) != entry.digest {
+            return Err(error("record digest mismatch"));
+        }
+        result.items.push(HistoryItem::Record { record: cursor.record, index: result.records.len() });
+        result.records.push(scan::selected(&bytes)?);
+    } else {
+        // Keep boundaries on complete UTF-8 scalars; the subsequent fragment resumes
+        // at the exact remaining byte. No content or message is discarded.
+        if let Err(e) = std::str::from_utf8(&bytes) {
+            if e.error_len().is_some() {
+                return Err(error("invalid UTF-8 history fragment"));
+            }
+            bytes.truncate(e.valid_up_to());
+        }
+        result.items.push(HistoryItem::Fragment { record: cursor.record, offset: cursor.offset, index: result.fragments.len() });
+        if text_end.is_some() {
+            let safe = complete_escape_prefix(&bytes);
+            bytes.truncate(safe);
+            let encoded = String::from_utf8(bytes.clone()).map_err(error)?;
+            let decoded: String = serde_json::from_str(&format!("\"{encoded}\"")).map_err(error)?;
+            result.fragments.push(decoded);
+        } else {
+            result.fragments.push(String::from_utf8(bytes.clone()).map_err(error)?);
+        }
+    }
+    result.bytes += bytes.len();
+    cursor.offset = cursor.offset.checked_add(bytes.len() as u64).ok_or_else(|| error("fragment cursor overflow"))?;
+    if quote.is_some() || cursor.offset == text_end.unwrap_or(entry.length as u64) {
+        cursor.record += 1;
+        cursor.offset = 0;
+    }
+    if result.bytes >= byte_budget {
+        return Ok(false);
+    }
+    Ok(true)
 }
 pub(super) fn metadata_raw(store: &mut dyn Store, h: &PhotoHeader) -> Result<Value> {
     if h.metadata_length > SMALL {
@@ -197,6 +278,11 @@ pub(super) fn metadata_raw(store: &mut dyn Store, h: &PhotoHeader) -> Result<Val
     serde_json::from_slice(&bytes).map_err(error)
 }
 pub(super) fn metadata(store: &mut dyn Store, h: &PhotoHeader) -> Result<Value> {
+    if h.legacy_migrated {
+        return Ok(
+            json!({"schema_version":2,"checkpoint":null,"legacy_history":true,"legacy_history_complete":h.history_complete(),"metadata_retained":true}),
+        );
+    }
     let mut value = metadata_raw(store, h)?;
     if let Some(checkpoint) = value.get_mut("checkpoint").filter(|v| v.is_object()) {
         let revert: Option<Value> = read(store, &format!("{}/revert.json", base(h.photo_id)), SMALL)?;
@@ -246,27 +332,15 @@ pub(super) fn tail(
             return Err(error("immutable prefix changed"));
         }
     }
-    let old_head: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
     let epoch = header(store, photo)?.map(|h| h.conversation_epoch).unwrap_or(0);
     if prefix.is_some_and(|h| h.conversation_epoch != epoch) {
         return Err(error("conversation epoch changed"));
     }
-    let existing: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
-    let mut pending = if let Some(pending) = existing.filter(|p| old_head.as_ref() != Some(&p.head)) {
-        if pending.photo != photo
-            || pending.old_head != old_head
-            || pending.expected_epoch != epoch
-            || !valid_transaction(&pending.transaction_id)
-            || pending.head.manifest != format!("{}/manifest-{}.json", base(photo), pending.transaction_id)
-        {
-            return Err(error("unresolved tail transaction"));
-        }
-        pending
-    } else {
-        let tx = super::super::LocalRoundId::new().map_err(error)?.as_str().to_owned();
-        let head = Head { manifest: format!("{}/manifest-{tx}.json", base(photo)), transaction_id: tx.clone(), manifest_digest: String::new() };
-        PendingCommit { photo, transaction_id: tx, expected_epoch: epoch, old_head, head, reserved_files: 0, reuse: None, revert_override: None }
-    };
+    let fingerprint = recovery::fingerprint(&(prefix, messages, rounds, records, metadata))?;
+    let (mut pending, complete) = recovery::prepare(store, photo, epoch, &fingerprint)?;
+    if complete {
+        return Ok(pending);
+    }
     pending.reuse = prefix.cloned();
     pending.revert_override = None;
     write(store, &format!("{}/pending.json", base(photo)), &pending)?;
@@ -300,6 +374,9 @@ pub(super) fn tail(
             let length = serialized_length(&record)?;
             let mut entry = stream_record(&mut writer, &record, length)?;
             entry.text_range = text_range(record.source, record.images.as_ref())?;
+            entry.text_range_version = Some(1);
+            entry.preview_refs =
+                record.images.as_ref().map(|images| preview_inventory(&json!({"images":images}))).unwrap_or_else(|| preview_inventory(record.source));
             let jumps = writer.jumps(root.as_ref(), count)?;
             let index = Index { start: count, entries: vec![entry], previous: root, jumps };
             let bytes = serde_json::to_vec(&index).map_err(error)?;
@@ -333,7 +410,16 @@ pub(super) fn tail(
         stream_record(&mut writer, metadata, length)?
     } else {
         let bytes = serde_json::to_vec(metadata).map_err(error)?;
-        Entry { block: writer.blob(&bytes)?, offset: 0, length, digest: digest(&bytes), chunk_payload: None, text_range: None }
+        Entry {
+            block: writer.blob(&bytes)?,
+            offset: 0,
+            length,
+            digest: digest(&bytes),
+            chunk_payload: None,
+            text_range: None,
+            text_range_version: None,
+            preview_refs: Some(Vec::new()),
+        }
     };
     let manifest = PhotoHeader {
         photo_id: photo,
@@ -350,6 +436,11 @@ pub(super) fn tail(
         metadata_length: metadata_entry.length as u64,
         metadata_chunk_payload: metadata_entry.chunk_payload,
         record_patch: None,
+        legacy_migrated: false,
+        legacy_history_incomplete: prefix.is_some_and(|h| !h.history_complete()),
+        legacy_round_count: prefix.map_or(0, |h| h.legacy_round_count),
+        legacy_record_count: prefix.map_or(0, |h| h.legacy_record_count),
+        legacy_message_count: prefix.map_or(0, PhotoHeader::original_message_count),
     };
     write(writer.store, &writer.pending.head.manifest, &manifest)?;
     writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
@@ -365,6 +456,11 @@ impl Session {
     pub fn companion_metadata(&mut self, photo: PhotoId) -> Result<Option<Value>> {
         let Some(h) = self.companion_photo_header(photo)? else { return Ok(None) };
         metadata(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), &h).map(Some)
+    }
+    /// Metadata from an already captured immutable graph, including verified
+    /// read-only legacy graphs before root activation. No full source Value.
+    pub fn companion_metadata_at(&mut self, header: &PhotoHeader) -> Result<Value> {
+        metadata(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header)
     }
     pub fn save_companion_tail(
         &mut self,
@@ -384,10 +480,13 @@ impl Session {
                 .and_then(|_| self.companion_photo_header(photo)?.ok_or_else(|| error("committed header missing")));
         match result {
             Ok(header) => {
+                self.capture_companion_revert_record(photo, header.conversation_epoch, prefix.map(|p| p.record_count).unwrap_or(0), records);
                 self.companion_archive.tails.remove(&photo);
                 if self.companion_archive.tails.is_empty()
                     && self.companion_archive.dirty_photos.is_empty()
                     && self.companion_archive.revert_dirty.is_empty()
+                    && self.companion_archive.certificate_dirty.is_empty()
+                    && self.companion_archive.receipts.is_empty()
                 {
                     self.companion_archive.error = None;
                 }
@@ -471,6 +570,8 @@ pub(super) fn stream_record<T: Serialize + ?Sized>(writer: &mut Writer<'_>, valu
         digest: sink.hash.finish().to_string(),
         chunk_payload: Some(BLOCK - 32),
         text_range: None,
+        text_range_version: None,
+        preview_refs: None,
     })
 }
 struct RecordReader<'a> {
@@ -529,25 +630,93 @@ pub(super) fn verify_record(store: &mut dyn Store, photo: PhotoId, entry: &Entry
     Ok(())
 }
 
+/// Only the frozen effect is materialized; unrelated diagnostic/message fields
+/// are streamed and discarded. The complete logical record still verifies.
+#[derive(Deserialize)]
+pub(crate) struct RevertRecord {
+    pub local_round_id: String,
+    pub original: lightcraft_develop::DevelopSettings,
+    pub recent_complete_result: lightcraft_develop::DevelopSettings,
+}
+pub(crate) fn revert_record(store: &mut dyn Store, header: &PhotoHeader, ordinal: u64) -> Result<RevertRecord> {
+    let entry = entry(store, header.photo_id, header.record_root.as_ref(), header.record_count, ordinal)?;
+    let reader = RecordReader {
+        store,
+        photo: header.photo_id,
+        entry: &entry,
+        offset: 0,
+        hash: lightcraft_preview::Hasher128::new(),
+        cached: Vec::new(),
+        cached_start: 0,
+    };
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader);
+    let mut decoder = serde_json::Deserializer::from_reader(&mut reader);
+    let record = RevertRecord::deserialize(&mut decoder).map_err(error)?;
+    decoder.end().map_err(error)?;
+    let reader = reader.into_inner();
+    if reader.offset != entry.length as u64 || reader.hash.finish().to_string() != entry.digest {
+        return Err(error("record digest mismatch"));
+    }
+    Ok(record)
+}
+
 /// Read-only worker view of a captured immutable graph. It owns at most one
 /// native range handle at a time; each call has an explicit work/byte budget.
 pub struct HistoryReader {
+    _pin: reader_pins::HistoryRetention,
     store: Box<dyn Store>,
     header: PhotoHeader,
 }
 impl HistoryReader {
+    /// Transfer verified graph/OS-lock retention into the completed page/view.
+    /// The Store reader retires here; the graph retires when this guard drops.
+    pub fn into_retention(self) -> reader_pins::HistoryRetention {
+        self._pin
+    }
     pub fn header(&self) -> &PhotoHeader {
         &self.header
     }
     pub fn messages(&mut self, cursor: u64, count: usize, max_bytes: usize) -> Result<RecordPage> {
         bounded_messages(self.store.as_mut(), &self.header, cursor, count, max_bytes)
     }
+    /// Complete protocol fields from each captured record. Additive local data
+    /// remains stored and never consumes the service input materialization budget.
+    pub fn protocol_messages(&mut self, cursor: u64, count: usize, max_bytes: usize) -> Result<RecordPage> {
+        protocol_messages(self.store.as_mut(), &self.header, cursor, count, max_bytes)
+    }
     pub fn slice(&mut self, cursor: HistoryCursor, bytes: usize) -> Result<HistorySlice> {
         slice(self.store.as_mut(), &self.header, cursor, bytes)
     }
-    pub fn preview(&mut self, image: &Value) -> Result<Vec<u8>> {
-        read_preview_reference(self.store.as_mut(), image)
+    /// A selected original reference, with bounded work buffers and no array quota.
+    pub fn original_image_reference(&mut self, record: u64, index: u64) -> Result<(u64, Option<Value>)> {
+        let entry = entry(self.store.as_mut(), self.header.photo_id, self.header.message_root.as_ref(), self.header.message_count, record)?;
+        migration::image_reference(self.store.as_mut(), self.header.photo_id, &entry, index)
     }
+    pub fn preview(&mut self, image: &Value) -> Result<Vec<u8>> {
+        if image.get("data").is_some() || image.get("attachment").and_then(Value::as_str).is_some_and(|key| key.starts_with("companion/preview-")) {
+            migration::preview(self.store.as_mut(), self.header.photo_id, image)
+        } else {
+            read_preview_reference(self.store.as_mut(), image)
+        }
+    }
+}
+fn protocol_messages(store: &mut dyn Store, header: &PhotoHeader, cursor: u64, count: usize, max_bytes: usize) -> Result<RecordPage> {
+    if count == 0 || count > PAGE_ITEMS || max_bytes > 32 * 1024 * 1024 {
+        return Err(error("invalid protocol read budget"));
+    }
+    let end = cursor.checked_add(count as u64).ok_or_else(|| error("protocol cursor overflow"))?.min(header.message_count);
+    let mut records = Vec::new();
+    let mut bytes = 0usize;
+    for ordinal in cursor..end {
+        let entry = entry(store, header.photo_id, header.message_root.as_ref(), header.message_count, ordinal)?;
+        let value = migration::protocol_record(store, header.photo_id, &entry, max_bytes.saturating_sub(bytes))?;
+        bytes = bytes.checked_add(serialized_length(&value)?).ok_or_else(|| error("protocol size overflow"))?;
+        if bytes > max_bytes {
+            return Err(error("complete history exceeds service read budget; local history retained"));
+        }
+        records.push(value);
+    }
+    Ok(RecordPage { records, next_cursor: (end < header.message_count).then_some(end) })
 }
 fn bounded_messages(store: &mut dyn Store, header: &PhotoHeader, cursor: u64, budget: usize, max_bytes: usize) -> Result<RecordPage> {
     if budget == 0 || budget > PAGE_ITEMS || max_bytes > 32 * 1024 * 1024 {
@@ -573,7 +742,34 @@ fn bounded_messages(store: &mut dyn Store, header: &PhotoHeader, cursor: u64, bu
 impl Session {
     pub fn companion_reader(&self, header: &PhotoHeader) -> Result<Option<HistoryReader>> {
         let library = self.library.as_ref().ok_or_else(|| error("library closed"))?;
-        Ok(library.files.background_writer().map(|store| HistoryReader { store, header: header.clone() }))
+        let Some(mut store) = library.files.background_writer() else { return Ok(None) };
+        if library.files.retention_namespace().is_none() {
+            return Err(error("background history reader requires stable Store retention namespace"));
+        }
+        let pin = reader_pins::capture(&self.companion_archive.readers, store.as_mut(), header, library.retain_read_lock())?;
+        Ok(Some(HistoryReader { store, header: header.clone(), _pin: pin }))
+    }
+    /// Read-only captured selector on actual owned Fs/Mem handles, including
+    /// protocol preparation and attachments. Main page reading retains its
+    /// separate adapter policy; this never grants publication authority.
+    pub fn companion_owned_history_reader(&self, header: &PhotoHeader) -> Result<Option<HistoryReader>> {
+        let library = self.library.as_ref().ok_or_else(|| error("library closed"))?;
+        let Some(mut store) = library.files.migration_writer() else { return Ok(None) };
+        if library.files.retention_namespace().is_none() {
+            return Err(error("attachment selector requires stable Store retention namespace"));
+        }
+        let pin = reader_pins::capture(&self.companion_archive.readers, store.as_mut(), header, library.retain_read_lock())?;
+        Ok(Some(HistoryReader { store, header: header.clone(), _pin: pin }))
+    }
+    pub fn read_companion_historical_preview(&mut self, photo: PhotoId, image: &Value) -> Result<Vec<u8>> {
+        if self.catalog.photo(photo).is_none() {
+            return Err(error("no such photo"));
+        }
+        migration::preview(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), photo, image)
+    }
+    /// Complete verified protocol fields, excluding additive local metadata.
+    pub fn companion_protocol_messages_bounded(&mut self, header: &PhotoHeader, cursor: u64, count: usize, bytes: usize) -> Result<RecordPage> {
+        protocol_messages(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, cursor, count, bytes)
     }
     pub fn companion_messages_bounded(&mut self, header: &PhotoHeader, cursor: u64, count: usize, bytes: usize) -> Result<RecordPage> {
         bounded_messages(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, cursor, count, bytes)
@@ -600,9 +796,9 @@ pub(crate) struct TailUpdate {
     pub records: Vec<Value>,
     pub metadata: Value,
 }
-pub(crate) fn persist_tail(store: &mut dyn Store, photo: PhotoId, update: &TailUpdate) -> Result<()> {
+pub(crate) fn persist_tail(store: &mut dyn Store, photo: PhotoId, update: &TailUpdate) -> Result<String> {
     let pending = tail(store, photo, update.prefix.as_ref(), &update.messages, &update.rounds, &update.records, &update.metadata)?;
-    commit(store, &pending)
+    commit(store, &pending).map(|()| pending.transaction_id)
 }
 
 struct BorrowedMessage<'a> {
@@ -629,6 +825,8 @@ pub(super) fn metadata_entry(header: &PhotoHeader) -> Result<Entry> {
         digest: header.metadata_digest.clone(),
         chunk_payload: header.metadata_chunk_payload,
         text_range: None,
+        text_range_version: None,
+        preview_refs: None,
     })
 }
 
@@ -692,7 +890,16 @@ fn replace_recent(writer: &mut Writer<'_>, root: Option<IndexRoot>, count: u64, 
             stream_record(writer, value, length)?
         } else {
             let bytes = serde_json::to_vec(value).map_err(error)?;
-            Entry { block: writer.blob(&bytes)?, offset: 0, length, digest: digest(&bytes), chunk_payload: None, text_range: None }
+            Entry {
+                block: writer.blob(&bytes)?,
+                offset: 0,
+                length,
+                digest: digest(&bytes),
+                chunk_payload: None,
+                text_range: None,
+                text_range_version: None,
+                preview_refs: Some(Vec::new()),
+            }
         };
         *index.entries.get_mut(usize::try_from(ordinal - index.start).map_err(error)?).ok_or_else(|| error("round record absent"))? = replacement;
         index.jumps = writer.jumps(index.previous.as_ref(), index.start)?;
@@ -723,83 +930,157 @@ impl Session {
             return Ok(false);
         }
         let photo = identity.scope.photo;
-        let Some(h) = self.companion_photo_header(photo)? else { return Ok(false) };
-        let store = self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut();
-        let existing: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
-        let visible: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
-        if existing.is_some_and(|p| visible.as_ref() != Some(&p.head)) {
+        let receipt = json!({"local_round_id":identity.local_round_id,"submission_seq":identity.submission_seq,"connection_generation":identity.connection_generation,"runtime_library_generation":identity.scope.library_generation,"plan":plan});
+        let result = confirm_receipt(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), photo, &receipt);
+        match &result {
+            Ok(_) => {
+                self.companion_archive.cleanup_photos.insert(photo);
+                if let Ok(Some(p)) = self.companion_pending(photo)
+                    && !p.head.manifest_digest.is_empty()
+                {
+                    self.companion_archive.cleanup_published.insert(photo, p.transaction_id);
+                }
+                if let Some(queued) = self.companion_archive.receipts.get_mut(&photo) {
+                    queued.retain(|r| r != &receipt);
+                    if queued.is_empty() {
+                        self.companion_archive.receipts.remove(&photo);
+                    }
+                }
+                if self.companion_archive.receipts.is_empty()
+                    && self.companion_archive.tails.is_empty()
+                    && self.companion_archive.dirty_photos.is_empty()
+                    && self.companion_archive.revert_dirty.is_empty()
+                {
+                    self.companion_archive.error = None;
+                }
+            }
+            Err(e) => {
+                let queued = self.companion_archive.receipts.entry(photo).or_default();
+                if !queued.contains(&receipt) {
+                    queued.push(receipt);
+                }
+                self.companion_archive.error = Some(e.to_string());
+            }
+        }
+        result
+    }
+}
+/// A stored operation is replayed only into the archive. Runtime library identity
+/// still gates external confirmations in Session, while recovery preserves the
+/// original stored identity and cannot edit a photo or contact the backend.
+pub(super) fn recover_receipt(store: &mut dyn Store, photo: PhotoId) -> Result<bool> {
+    let p: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    if let Some(receipt) = p.and_then(|p| p.receipt) { confirm_receipt(store, photo, &receipt) } else { Ok(false) }
+}
+pub(crate) fn retry_receipt(store: &mut dyn Store, photo: PhotoId, receipt: &Value) -> Result<bool> {
+    confirm_receipt(store, photo, receipt)
+}
+fn confirm_receipt(store: &mut dyn Store, photo: PhotoId, receipt: &Value) -> Result<bool> {
+    if serialized_length(receipt)? > SMALL as usize {
+        return Err(error("receipt operation exceeds bounded identity"));
+    }
+    let local_round_id =
+        receipt["local_round_id"].as_str().filter(|id| valid_transaction(id)).ok_or_else(|| error("invalid stored receipt round"))?;
+    let submission_seq = receipt["submission_seq"].as_u64().ok_or_else(|| error("invalid stored receipt sequence"))?;
+    let connection_generation = receipt["connection_generation"].as_u64().ok_or_else(|| error("invalid stored receipt connection"))?;
+    let library_generation = receipt["runtime_library_generation"].as_u64().ok_or_else(|| error("invalid stored receipt scope"))?;
+    let plan = if receipt["plan"].is_null() { None } else { Some(receipt["plan"].as_str().ok_or_else(|| error("invalid stored receipt plan"))?) };
+    let existing: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    let mut resumed = None;
+    if let Some(pending) = existing {
+        let visible = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
+        recovery::validate(&pending, photo, &visible)?;
+        if pending.revert_override.is_none() {
             return Err(error("uncommitted tail retains its reservation; retry receipt later"));
         }
-        let mut found = None;
-        for ordinal in (h.record_count.saturating_sub(128)..h.record_count).rev() {
-            let entry = entry(store, photo, h.record_root.as_ref(), h.record_count, ordinal)?;
-            if entry.length > 32 * 1024 * 1024 {
-                return Err(error("receipt record requires streaming update"));
+        if pending.head.manifest_digest.is_empty() {
+            if pending.receipt.as_ref() != Some(receipt) {
+                return Err(error("another incomplete receipt retains its reservation"));
             }
-            let bytes = range(store, photo, &entry, 0, entry.length)?;
-            if digest(&bytes) != entry.digest {
-                return Err(error("record digest mismatch"));
-            }
-            let value: Value = serde_json::from_slice(&bytes).map_err(error)?;
-            if value["local_round_id"] == identity.local_round_id.as_str()
-                && value["submission_seq"] == identity.submission_seq
-                && value["connection_generation"] == identity.connection_generation
-                && value["runtime_library_generation"] == identity.scope.library_generation
-            {
-                found = Some((ordinal, value));
-                break;
-            }
-        }
-        let Some((ordinal, mut value)) = found else { return Ok(false) };
-        if let Some(plan) = plan {
-            let Some(stage) = value.get_mut("stages").and_then(Value::as_array_mut).and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan)) else {
-                return Ok(false);
-            };
-            let succeeded = stage["execution_outcome"] == "succeeded";
-            let confirmed = stage["delivery_state"] == "confirmed";
-            if confirmed && (!succeeded || value["backend_confirmed_plan"] == plan) {
-                return Ok(true);
-            }
-            let Some(stage) = value.get_mut("stages").and_then(Value::as_array_mut).and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan)) else {
-                return Ok(false);
-            };
-            stage["delivery_state"] = json!("confirmed");
-            if succeeded {
-                value["backend_confirmed_plan"] = json!(plan);
-            }
+            resumed = Some(pending);
         } else {
-            if value["input_delivery_state"] == "confirmed" {
-                return Ok(true);
+            commit(store, &pending)?;
+            if let Err(e) = finish_pending(store, photo) {
+                log::warn!("archive publication cleanup: {e}");
             }
-            value["input_delivery_state"] = json!("confirmed");
         }
-        let old_head: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
-        let revert: Option<Value> = read(store, &format!("{}/revert.json", base(photo)), SMALL)?;
-        let revert = revert.filter(|r| r["transaction_id"] == h.transaction_id).unwrap_or_else(|| json!({"eligible":false}));
-        let tx = super::super::LocalRoundId::new().map_err(error)?.as_str().to_owned();
-        let pending = PendingCommit {
-            photo,
-            transaction_id: tx.clone(),
-            expected_epoch: h.conversation_epoch,
-            old_head,
-            head: Head { manifest: format!("{}/manifest-{tx}.json", base(photo)), transaction_id: tx, manifest_digest: String::new() },
-            reserved_files: 0,
-            reuse: Some(h.clone()),
-            revert_override: Some(revert),
-        };
-        write(store, &format!("{}/pending.json", base(photo)), &pending)?;
-        let mut writer = Writer { store, pending, sequence: 0 };
-        let root = replace_recent(&mut writer, h.record_root.clone(), h.record_count, ordinal, &value)?;
-        let mut manifest = h;
-        manifest.transaction_id = writer.pending.transaction_id.clone();
-        manifest.record_root = Some(root);
-        manifest.record_patch = Some(ordinal);
-        write(writer.store, &writer.pending.head.manifest, &manifest)?;
-        writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
-        write(writer.store, &format!("{}/pending.json", base(photo)), &writer.pending)?;
-        commit(writer.store, &writer.pending)?;
-        Ok(true)
     }
+    let Some(h) = header(store, photo)? else { return Ok(false) };
+    let mut found = None;
+    for ordinal in (h.record_count.saturating_sub(128)..h.record_count).rev() {
+        let entry = entry(store, photo, h.record_root.as_ref(), h.record_count, ordinal)?;
+        if entry.length > 32 * 1024 * 1024 {
+            return Err(error("receipt record requires streaming update"));
+        }
+        let bytes = range(store, photo, &entry, 0, entry.length)?;
+        if digest(&bytes) != entry.digest {
+            return Err(error("record digest mismatch"));
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(error)?;
+        if value["local_round_id"] == local_round_id
+            && value["submission_seq"] == submission_seq
+            && value["connection_generation"] == connection_generation
+            && value["runtime_library_generation"] == library_generation
+        {
+            found = Some((ordinal, value));
+            break;
+        }
+    }
+    let Some((ordinal, mut value)) = found else { return Ok(false) };
+    if let Some(plan) = plan {
+        let Some(stage) = value.get_mut("stages").and_then(Value::as_array_mut).and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan)) else {
+            return Ok(false);
+        };
+        let succeeded = stage["execution_outcome"] == "succeeded";
+        let confirmed = stage["delivery_state"] == "confirmed";
+        if confirmed && (!succeeded || value["backend_confirmed_plan"] == plan) {
+            return Ok(true);
+        }
+        let Some(stage) = value.get_mut("stages").and_then(Value::as_array_mut).and_then(|s| s.iter_mut().find(|s| s["plan_id"] == plan)) else {
+            return Ok(false);
+        };
+        stage["delivery_state"] = json!("confirmed");
+        if succeeded {
+            value["backend_confirmed_plan"] = json!(plan);
+        }
+    } else {
+        if value["input_delivery_state"] == "confirmed" {
+            return Ok(true);
+        }
+        value["input_delivery_state"] = json!("confirmed");
+    }
+    let old_head: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
+    let revert: Option<Value> = read(store, &format!("{}/revert.json", base(photo)), SMALL)?;
+    let revert = revert.filter(|r| r["transaction_id"] == h.transaction_id).unwrap_or_else(|| json!({"eligible":false}));
+    let tx = super::super::LocalRoundId::new().map_err(error)?.as_str().to_owned();
+    let pending = resumed.unwrap_or(PendingCommit {
+        publication_epoch: None,
+        photo,
+        transaction_id: tx.clone(),
+        expected_epoch: h.conversation_epoch,
+        old_head,
+        head: Head { manifest: format!("{}/manifest-{tx}.json", base(photo)), transaction_id: tx, manifest_digest: String::new() },
+        reserved_files: 0,
+        reuse: Some(h.clone()),
+        revert_override: Some(revert),
+        content_digest: None,
+        receipt: Some(receipt.clone()),
+    });
+    write(store, &format!("{}/pending.json", base(photo)), &pending)?;
+    let mut writer = Writer { store, pending, sequence: 0 };
+    let root = replace_recent(&mut writer, h.record_root.clone(), h.record_count, ordinal, &value)?;
+    let mut manifest = h;
+    manifest.transaction_id = writer.pending.transaction_id.clone();
+    manifest.record_root = Some(root);
+    manifest.record_patch = Some(ordinal);
+    write(writer.store, &writer.pending.head.manifest, &manifest)?;
+    writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
+    write(writer.store, &format!("{}/pending.json", base(photo)), &writer.pending)?;
+    commit(writer.store, &writer.pending)?;
+    if let Err(e) = finish_pending(writer.store, photo) {
+        log::warn!("archive publication cleanup: {e}");
+    }
+    Ok(true)
 }
 
 impl Session {
@@ -813,9 +1094,15 @@ impl Session {
             {
                 return Err(error("runtime prefix retention capacity exceeded"));
             }
+            let replaced = self.companion_archive.prefixes.get(&photo).is_some_and(|old| old != &header);
             self.companion_archive.prefixes.insert(photo, header);
-        } else {
-            self.companion_archive.prefixes.remove(&photo);
+            if replaced {
+                self.companion_archive.readers.release_photo(photo);
+                self.companion_archive.schedule_cleanup(photo);
+            }
+        } else if self.companion_archive.prefixes.remove(&photo).is_some() {
+            self.companion_archive.readers.release_photo(photo);
+            self.companion_archive.schedule_cleanup(photo);
         }
         Ok(())
     }
@@ -840,14 +1127,11 @@ pub(super) fn text_range(value: &Value, images: Option<&Value>) -> Result<Option
         offset = offset.checked_add(serialized_length(key)? as u64).and_then(|v| v.checked_add(1)).ok_or_else(|| error("text span overflow"))?;
         let field = if key == "images" { images.unwrap_or(field) } else { field };
         let length = serialized_length(field)? as u64;
-        if key == "text"
-            && let Some(text) = field.as_str()
-        {
+        if key == "text" && field.is_string() {
             let start = offset.checked_add(1).ok_or_else(|| error("text span overflow"))?;
             // Match the normal message view: execution feedback and appended
             // machine photo-state JSON remain local records, not prose in the panel.
-            let visible =
-                if text.starts_with("Actual execution feedback:") { "" } else { text.split("\nActual photo state:").next().unwrap_or(text) };
+            let visible = if crate::companion::execution_feedback(value) { "" } else { crate::companion::authored_message_text(value) };
             let visible_length = serialized_length(visible)? as u64;
             let end = start.checked_add(visible_length.saturating_sub(2)).ok_or_else(|| error("text span overflow"))?;
             return Ok(Some([start, end]));
@@ -871,4 +1155,152 @@ fn complete_escape_prefix(bytes: &[u8]) -> usize {
         }
     }
     cursor
+}
+
+mod projection;
+mod scan;
+pub use scan::{DisplayRecord, DisplayScan};
+fn display_record(store: &mut dyn Store, photo: PhotoId, entry: &Entry) -> Result<Value> {
+    if entry.length <= 256 * 1024 {
+        let bytes = range(store, photo, entry, 0, entry.length)?;
+        if digest(&bytes) != entry.digest {
+            return Err(error("round digest mismatch"));
+        }
+        return scan::selected(&bytes);
+    }
+    let source = RecordReader { store, photo, entry, offset: 0, hash: lightcraft_preview::Hasher128::new(), cached: Vec::new(), cached_start: 0 };
+    let (record, source) = projection::read(source)?;
+    if source.offset != entry.length as u64 || source.hash.finish().to_string() != entry.digest {
+        return Err(error("round digest mismatch"));
+    }
+    if serialized_length(&record)? > 1024 * 1024 {
+        return Err(error("round display exceeds view budget; local history retained"));
+    }
+    Ok(record)
+}
+fn rounds_display(store: &mut dyn Store, header: &PhotoHeader, cursor: u64, count: usize) -> Result<RecordPage> {
+    if count == 0 || count > 32 {
+        return Err(error("round display page must contain 1..32 records"));
+    }
+    let (root, total) =
+        if header.record_count > 0 { (header.record_root.as_ref(), header.record_count) } else { (header.round_root.as_ref(), header.round_count) };
+    let end = cursor.saturating_add(count as u64).min(total);
+    let mut records = Vec::new();
+    let mut bytes = 0;
+    let mut next = cursor;
+    for index in cursor..end {
+        let e = entry(store, header.photo_id, root, total, index)?;
+        let record = display_record(store, header.photo_id, &e)?;
+        let size = serialized_length(&record)?;
+        if bytes + size > 1024 * 1024 && !records.is_empty() {
+            break;
+        }
+        if size > 1024 * 1024 {
+            return Err(error("round display exceeds view budget; local history retained"));
+        }
+        bytes += size;
+        records.push(record);
+        next = index + 1;
+    }
+    Ok(RecordPage { records, next_cursor: (next < total).then_some(next) })
+}
+impl HistoryReader {
+    /// Captured graph, bounded page. Callers can scan off the frame and cancel between calls.
+    pub fn rounds_display(&mut self, cursor: u64, count: usize) -> Result<RecordPage> {
+        rounds_display(self.store.as_mut(), &self.header, cursor, count)
+    }
+}
+impl Session {
+    pub fn companion_rounds_display_at(&mut self, header: &PhotoHeader, cursor: u64, count: usize) -> Result<RecordPage> {
+        rounds_display(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, cursor, count)
+    }
+}
+fn message_display(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Value> {
+    let entry = entry(store, header.photo_id, header.message_root.as_ref(), header.message_count, index)?;
+    let source = RecordReader {
+        store,
+        photo: header.photo_id,
+        entry: &entry,
+        offset: 0,
+        hash: lightcraft_preview::Hasher128::new(),
+        cached: Vec::new(),
+        cached_start: 0,
+    };
+    let (mut owner, source) = projection::read(source)?;
+    if source.offset != entry.length as u64 || source.hash.finish().to_string() != entry.digest {
+        return Err(error("message owner digest mismatch"));
+    }
+    let id = owner["local_round_id"].as_str();
+    if id.is_some_and(|id| id.is_empty() || id.len() > 128) {
+        return Err(error("invalid local round identity"));
+    }
+    mark_old_hidden_text(&mut owner, &entry);
+    Ok(owner)
+}
+fn message_round_id(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Option<String>> {
+    Ok(message_display(store, header, index)?["local_round_id"].as_str().map(str::to_owned))
+}
+impl HistoryReader {
+    /// Bounded selected presentation fields, verified against the complete captured record digest.
+    pub fn message_display(&mut self, index: u64) -> Result<Value> {
+        message_display(self.store.as_mut(), &self.header, index)
+    }
+    pub fn message_round_id(&mut self, index: u64) -> Result<Option<String>> {
+        message_round_id(self.store.as_mut(), &self.header, index)
+    }
+}
+impl Session {
+    pub fn companion_message_round_id_at(&mut self, header: &PhotoHeader, index: u64) -> Result<Option<String>> {
+        message_round_id(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, index)
+    }
+}
+
+fn legacy_entry(store: &mut dyn Store, header: &PhotoHeader, index: u64) -> Result<Entry> {
+    if header.legacy_round_count > header.round_count || header.legacy_record_count > header.record_count {
+        return Err(error("legacy provenance exceeds graph"));
+    }
+    if index < header.legacy_round_count {
+        entry(store, header.photo_id, header.round_root.as_ref(), header.round_count, index)
+    } else {
+        let index = index.checked_sub(header.legacy_round_count).ok_or_else(|| error("legacy cursor overflow"))?;
+        if index >= header.legacy_record_count {
+            return Err(error("legacy cursor outside original plans"));
+        }
+        entry(store, header.photo_id, header.record_root.as_ref(), header.record_count, index)
+    }
+}
+impl HistoryReader {
+    /// One original unassociated plan from the immutable retained legacy prefix.
+    pub fn legacy_plan(&mut self, index: u64) -> Result<Value> {
+        let entry = legacy_entry(self.store.as_mut(), &self.header, index)?;
+        display_record(self.store.as_mut(), self.header.photo_id, &entry)
+    }
+}
+fn string_end(bytes: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(&byte) = bytes.get(offset) {
+        if byte == b'"' {
+            return Some(offset);
+        }
+        if byte == b'\\' {
+            let length = if *bytes.get(offset + 1)? == b'u' { 6 } else { 2 };
+            if offset + length > bytes.len() {
+                return None;
+            }
+            offset += length;
+        } else {
+            offset += 1;
+        }
+    }
+    None
+}
+fn mark_old_hidden_text(value: &mut Value, entry: &Entry) {
+    if entry.text_range_version != Some(1)
+        && entry.text_range.is_some_and(|[start, end]| start == end)
+        && value["role"] == "user"
+        && value.get("display_kind").is_none()
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("legacy_hidden_text".into(), Value::Bool(true));
+    }
 }

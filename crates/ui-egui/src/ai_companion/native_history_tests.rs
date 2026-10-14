@@ -39,7 +39,7 @@ fn consent(app: LightcraftApp) -> (crate::headless::Headless, mpsc::Receiver<net
     assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     (h, requests, events)
 }
-fn wait_idle(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>) -> Value {
+pub(super) fn wait_idle(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         poll(&mut h.app, &h.view.ctx);
@@ -92,7 +92,7 @@ fn native_current_photo_envelope_overflow_refuses_before_create_without_dropping
     assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.7);
 }
 
-fn outgoing(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>, suffix: &str) -> network::Request {
+pub(super) fn outgoing(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>, suffix: &str) -> network::Request {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         h.step();
@@ -212,6 +212,7 @@ struct ReadGate {
     entered: mpsc::SyncSender<()>,
     release: std::sync::Mutex<mpsc::Receiver<()>>,
     used: AtomicBool,
+    armed: AtomicBool,
     reads: std::sync::Mutex<Vec<(String, usize)>>,
 }
 struct GatedFiles {
@@ -221,7 +222,7 @@ struct GatedFiles {
 }
 impl GatedFiles {
     fn observe(&self, name: &str, length: usize) {
-        if !self.background {
+        if !self.background || !self.gate.armed.load(Ordering::Acquire) || std::thread::current().name() != Some("companion-model-history") {
             return;
         }
         self.gate.reads.lock().unwrap().push((name.into(), length));
@@ -261,6 +262,12 @@ impl Store for GatedFiles {
     fn describe(&self) -> String {
         self.inner.describe()
     }
+    fn retention_namespace(&self) -> Option<String> {
+        self.inner.retention_namespace()
+    }
+    fn conservative_retention(&self) -> bool {
+        self.inner.conservative_retention()
+    }
     fn background_writer(&self) -> Option<Box<dyn Store>> {
         Some(Box::new(Self { inner: FsStore::open(self.inner.dir()).unwrap(), gate: self.gate.clone(), background: true }))
     }
@@ -283,10 +290,23 @@ fn native_stop_during_preview_read_prevents_old_input_after_reconsent_and_allows
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
         used: AtomicBool::new(false),
+        armed: AtomicBool::new(false),
         reads: std::sync::Mutex::new(Vec::new()),
     });
     let (mut h, requests, events) =
         consent(library.open_with(Box::new(GatedFiles { inner: FsStore::open(&library.dir).unwrap(), gate: gate.clone(), background: false })));
+    // Opening the panel now reads the visible original preview too. Finish that
+    // public view load before arming the actual filesystem pause for Start.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        h.step();
+        if h.app.run("ai.status", json!({})).unwrap()["historyLoading"] == false {
+            break;
+        }
+        assert!(Instant::now() < deadline, "visible history did not finish loading");
+        std::thread::yield_now();
+    }
+    gate.armed.store(true, Ordering::Release);
     let old = h.app.run("ai.start", json!({"prompt":"old cancelled submission"})).unwrap()["localRoundId"].clone();
     entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(requests.try_recv().is_err());

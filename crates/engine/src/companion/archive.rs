@@ -21,40 +21,73 @@ pub(crate) struct Archive {
     pub(super) editors: super::editor::Editors,
     pub(super) photos: BTreeMap<PhotoId, Value>,
     pub(super) legacy: bool,
+    pub(super) migration: Option<super::migration::Task>,
     pub(super) v2: bool,
     pub(super) tails: BTreeMap<PhotoId, super::storage::TailUpdate>,
     pub(super) prefixes: BTreeMap<PhotoId, super::storage::PhotoHeader>,
+    pub(super) marker_cleanup: BTreeMap<String, super::storage::reader_pins::MarkerCleanup>,
+    pub(super) cleanup_photos: BTreeSet<PhotoId>,
+    pub(super) cleanup_waiting: BTreeSet<PhotoId>,
+    pub(super) cleanup_errors: BTreeMap<PhotoId, String>,
+    pub(super) cleanup_published: BTreeMap<PhotoId, String>,
+    cleanup_at: Option<web_time::Instant>,
+    cleanup_after: Option<PhotoId>,
+    pub(super) receipts: BTreeMap<PhotoId, Vec<Value>>,
+    pub(super) readers: std::sync::Arc<super::storage::reader_pins::Pins>,
     pub(super) dirty_photos: BTreeSet<PhotoId>,
     pub(super) revert_dirty: BTreeSet<PhotoId>,
+    pub(super) certificate_dirty: BTreeSet<PhotoId>,
+    pub(super) core_save_error: Option<String>,
+    pub(super) clear_errors: BTreeMap<PhotoId, String>,
+    pub(super) ephemeral_epochs: BTreeMap<PhotoId, u64>,
     dirty: bool,
     pub(super) blocked: Option<String>,
     pub(super) error: Option<String>,
     retry_at: Option<web_time::Instant>,
 }
+impl Drop for Archive {
+    fn drop(&mut self) {
+        // Transfer only already-known roots/work in O(1). Never touch Store,
+        // catalog photos or all history; reopening drains one photo per step.
+        self.readers.retire_archive(super::storage::reader_pins::ArchiveDebt {
+            prefixes: std::mem::take(&mut self.prefixes),
+            active: std::mem::take(&mut self.cleanup_photos),
+            waiting: std::mem::take(&mut self.cleanup_waiting),
+            markers: std::mem::take(&mut self.marker_cleanup),
+        });
+    }
+}
 pub(super) fn error(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("AI archive: {e}"))
 }
 impl Archive {
+    pub(crate) fn protect_metadata(&mut self, reason: &str) {
+        self.blocked = Some(match self.blocked.take() {
+            Some(existing) => format!("{existing}; {reason}"),
+            None => reason.to_owned(),
+        });
+    }
     pub(crate) fn load(store: &mut dyn Store, _dir: &Path, _on_disk: bool) -> Self {
-        let mut read = || -> Result<Self> {
-            let Some(bytes) = store.read_limited(STATE_FILE, MAX_ARCHIVE).map_err(error)? else { return Ok(Self::default()) };
-            let root: Value = serde_json::from_slice(&bytes).map_err(error)?;
-            if root["format"] == "lightcraft-companion" && root["version"] == 2 && root["layout"] == "photo-head-v2" {
-                return Ok(Self { v2: true, ..Default::default() });
+        let pins = super::storage::reader_pins::for_store(store);
+        let mut archive = Self::default();
+        let mut read = || -> Result<()> {
+            match super::migration::Task::open(store) {
+                Ok(Some((v2, migration))) => {
+                    archive.v2 = v2;
+                    archive.legacy = migration.is_some();
+                    archive.migration = migration;
+                    Ok(())
+                }
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
             }
-            let saved: Saved = serde_json::from_slice(&bytes).map_err(error)?;
-            if saved.format != "lightcraft-companion" || saved.version != 1 {
-                return Err(error("unsupported format; the file was left unchanged"));
-            }
-            Ok(Self { photos: saved.photos, legacy: true, ..Default::default() })
         };
-        match read() {
-            Ok(a) => a,
-            Err(e) => {
-                log::error!("{e}");
-                Self { blocked: Some(e.to_string()), ..Default::default() }
-            }
+        if let Err(e) = read() {
+            log::error!("{e}");
+            archive.blocked = Some(e.to_string());
         }
+        archive.readers = pins;
+        archive
     }
     pub(crate) fn invalidate(&mut self, ids: &BTreeSet<PhotoId>) {
         for id in ids {
@@ -74,44 +107,187 @@ impl Archive {
             }
         }
     }
-    pub(crate) fn invalidate_storage(&mut self, library: &mut crate::library::Library, ids: &BTreeSet<PhotoId>) {
-        if !self.v2 {
-            return;
-        }
-        self.revert_dirty.extend(ids.iter().copied());
-        match super::storage::invalidate_revert(library.files.as_mut(), &self.revert_dirty) {
-            Ok(()) => {
-                self.revert_dirty.clear();
-            }
-            Err(e) => {
-                self.error = Some(e.to_string());
-            }
-        }
+    pub(super) fn certificate_failed(&mut self, photo: PhotoId, reason: String) {
+        self.certificate_dirty.insert(photo);
+        self.error = Some(reason);
+        self.retry_at = Some(web_time::Instant::now() + std::time::Duration::from_secs(2));
+    }
+    pub(super) fn core_save_failed(&mut self, reason: String) {
+        self.core_save_error = Some(reason);
+        self.retry_at = Some(web_time::Instant::now() + std::time::Duration::from_secs(2));
+    }
+    pub(crate) fn core_save_retry_deferred(&self) -> bool {
+        self.core_save_error.is_some() && self.retry_at.is_some_and(|t| web_time::Instant::now() < t)
     }
     pub(crate) fn needs_retry(&self) -> bool {
-        (self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() || self.editors.dirty())
-            && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t)
+        let data = self.core_save_error.is_some()
+            || self.migration.is_some()
+            || self.dirty
+            || !self.tails.is_empty()
+            || !self.dirty_photos.is_empty()
+            || !self.revert_dirty.is_empty()
+            || !self.certificate_dirty.is_empty()
+            || !self.receipts.is_empty()
+            || self.editors.dirty();
+        (data && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t))
+            || (!data
+                && (!self.marker_cleanup.is_empty() || !self.cleanup_photos.is_empty() || self.readers.has_releases())
+                && self.cleanup_at.is_none_or(|t| web_time::Instant::now() >= t))
+    }
+    pub(super) fn schedule_cleanup(&mut self, photo: PhotoId) {
+        self.cleanup_photos.insert(photo);
+        self.cleanup_waiting.remove(&photo);
+        self.cleanup_at = None;
+    }
+    pub(super) fn marker_cleanup_failed(&mut self, key: String, photo: Option<PhotoId>, bytes: &[u8], error: String) {
+        self.marker_cleanup.insert(
+            key,
+            super::storage::reader_pins::MarkerCleanup { photo, expected_digest: lightcraft_preview::hash_bytes(bytes).to_string(), error },
+        );
+        self.cleanup_at = web_time::Instant::now().checked_add(std::time::Duration::from_millis(250));
+    }
+    fn cleanup_step(&mut self, store: &mut dyn Store) {
+        if let Some((key, marker)) = self.readers.take_marker_cleanup() {
+            self.marker_cleanup.entry(key).or_insert(marker);
+        }
+        if let Some((key, marker)) = self.marker_cleanup.first_key_value().map(|(k, m)| (k.clone(), m.clone())) {
+            let pins = self.readers.clone();
+            let protection = pins.physical_pause();
+            if !protection.as_deref().is_some_and(|count| *count > 0) {
+                let result = (|| -> std::io::Result<()> {
+                    if let Some(bytes) = store.read_limited(&key, 32 * 1024)?
+                        && lightcraft_preview::hash_bytes(&bytes).to_string() != marker.expected_digest
+                    {
+                        // The path now owns a newer critical intent. Old cleanup
+                        // debt must never remove it, even after library reopen.
+                        return Ok(());
+                    }
+                    store.remove(&key)
+                })();
+                match result {
+                    Ok(()) => {
+                        self.marker_cleanup.remove(&key);
+                    }
+                    Err(e) => {
+                        if let Some(marker) = self.marker_cleanup.get_mut(&key) {
+                            marker.error = e.to_string();
+                        }
+                    }
+                }
+            }
+            self.cleanup_at = web_time::Instant::now().checked_add(std::time::Duration::from_millis(250));
+            return;
+        }
+        if let Some(photo) = self.readers.take_release() {
+            self.schedule_cleanup(photo);
+        }
+        use std::ops::Bound::{Excluded, Unbounded};
+        let photo = self
+            .cleanup_after
+            .and_then(|p| self.cleanup_photos.range((Excluded(p), Unbounded)).next().copied())
+            .or_else(|| self.cleanup_photos.first().copied());
+        let Some(photo) = photo else { return };
+        self.cleanup_after = Some(photo);
+        let pins = self.readers.clone();
+        let protection = pins.physical_pause();
+        if protection.as_deref().is_some_and(|count| *count > 0) {
+            // Keep owning-library debt active, without I/O or foreign roots.
+            self.cleanup_at = web_time::Instant::now().checked_add(std::time::Duration::from_millis(250));
+            return;
+        }
+        if !self.tails.contains_key(&photo)
+            && !self.dirty_photos.contains(&photo)
+            && !self.receipts.contains_key(&photo)
+            && let Err(e) = super::storage::reconcile_visible_pending(store, photo, self.cleanup_published.get(&photo).map(String::as_str))
+        {
+            self.cleanup_errors.insert(photo, e.to_string());
+            self.cleanup_at = web_time::Instant::now().checked_add(std::time::Duration::from_millis(250));
+            return;
+        }
+        self.cleanup_published.remove(&photo);
+        let mut retained: Vec<_> =
+            self.prefixes.get(&photo).into_iter().cloned().chain(self.tails.get(&photo).and_then(|t| t.prefix.as_ref()).cloned()).collect();
+        let readers = self.readers.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        retained.extend(readers.headers.values().filter(|h| h.photo_id == photo).cloned());
+        let result = super::storage::collect(store, photo, retained, 2);
+        match result {
+            Ok(report) => {
+                if !report.pending {
+                    self.cleanup_photos.remove(&photo);
+                    if report.protected {
+                        self.cleanup_waiting.insert(photo);
+                    } else {
+                        self.cleanup_waiting.remove(&photo);
+                    }
+                }
+                self.cleanup_errors.remove(&photo);
+            }
+            Err(e) => {
+                self.cleanup_errors.insert(photo, e.to_string());
+            }
+        }
+        self.cleanup_at = web_time::Instant::now().checked_add(std::time::Duration::from_millis(250));
     }
     pub(crate) fn unsaved(&self) -> Option<&str> {
         self.error
             .as_deref()
-            .filter(|_| self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty())
+            .filter(|_| {
+                self.migration.is_some()
+                    || self.dirty
+                    || !self.tails.is_empty()
+                    || !self.dirty_photos.is_empty()
+                    || !self.revert_dirty.is_empty()
+                    || !self.certificate_dirty.is_empty()
+                    || !self.receipts.is_empty()
+            })
+            .or(self.core_save_error.as_deref())
+            .or_else(|| self.clear_errors.values().next().map(String::as_str))
             .or_else(|| self.editors.unsaved())
     }
     fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {
+        if self.migration.is_some() {
+            return Ok(());
+        }
         if let Some(e) = &self.blocked {
-            if self.dirty || !self.tails.is_empty() || !self.dirty_photos.is_empty() || !self.revert_dirty.is_empty() {
+            if self.dirty
+                || !self.tails.is_empty()
+                || !self.dirty_photos.is_empty()
+                || !self.revert_dirty.is_empty()
+                || !self.certificate_dirty.is_empty()
+                || !self.receipts.is_empty()
+            {
                 return Err(error(e));
             }
             return Ok(());
         }
         if self.v2 || !self.tails.is_empty() || !self.dirty_photos.is_empty() {
             let mut tail_failed = None;
+            for photo in self.receipts.keys().copied().collect::<Vec<_>>() {
+                let queued = self.receipts.get(&photo).cloned().unwrap_or_default();
+                let mut left = Vec::new();
+                for receipt in queued {
+                    if let Err(e) = super::storage::retry_receipt(library.files.as_mut(), photo, &receipt) {
+                        tail_failed = Some(e.to_string());
+                        left.push(receipt);
+                    } else {
+                        self.cleanup_photos.insert(photo);
+                        if let Ok(Some(transaction)) = super::storage::published_pending_transaction(library.files.as_mut(), photo) {
+                            self.cleanup_published.insert(photo, transaction);
+                        }
+                    }
+                }
+                if left.is_empty() {
+                    self.receipts.remove(&photo);
+                } else {
+                    self.receipts.insert(photo, left);
+                }
+            }
+            let mut finished = BTreeMap::new();
             for photo in self.tails.keys().copied().collect::<Vec<_>>() {
                 let Some(update) = self.tails.get(&photo) else { continue };
                 match super::storage::persist_tail(library.files.as_mut(), photo, update) {
-                    Ok(()) => {
-                        self.tails.remove(&photo);
+                    Ok(transaction) => {
+                        finished.insert(photo, transaction);
                     }
                     Err(error) => {
                         tail_failed = Some(error.to_string());
@@ -133,10 +309,10 @@ impl Archive {
                 if let Some(value) = self.photos.get(&photo) {
                     match super::storage::stored_epoch(library.files.as_mut(), photo)
                         .and_then(|epoch| super::storage::stage(library.files.as_mut(), photo, epoch, value))
-                        .and_then(|p| super::storage::commit(library.files.as_mut(), &p))
+                        .and_then(|p| super::storage::commit(library.files.as_mut(), &p).map(|()| p.transaction_id))
                     {
-                        Ok(()) => {
-                            self.dirty_photos.remove(&photo);
+                        Ok(transaction) => {
+                            finished.insert(photo, transaction);
                         }
                         Err(e) => {
                             failed = Some(e.to_string());
@@ -155,9 +331,22 @@ impl Archive {
                     }
                 }
             }
+            if self.v2 {
+                for (photo, transaction) in finished {
+                    self.tails.remove(&photo);
+                    self.dirty_photos.remove(&photo);
+                    self.photos.remove(&photo);
+                    self.cleanup_photos.insert(photo);
+                    self.cleanup_published.insert(photo, transaction);
+                    if let Err(e) = super::storage::finish_pending(library.files.as_mut(), photo) {
+                        self.cleanup_errors.insert(photo, e.to_string());
+                    }
+                }
+            }
             self.dirty = !self.tails.is_empty() || !self.dirty_photos.is_empty();
             self.error = failed.clone();
             self.retry_at = failed.as_ref().map(|_| web_time::Instant::now() + std::time::Duration::from_secs(2));
+            self.cleanup_step(library.files.as_mut());
             return failed.map_or(Ok(()), |e| Err(EngineError::NotSaved(e)));
         }
         if !self.dirty {
@@ -172,7 +361,7 @@ impl Archive {
             if bytes.len() as u64 > MAX_ARCHIVE {
                 return Err(error("file exceeds 64 MiB"));
             }
-            library.files.write_atomic(STATE_FILE, &bytes).map_err(error)
+            super::migration::write_legacy(library.files.as_mut(), &bytes)
         })();
         match result {
             Ok(()) => {
@@ -188,6 +377,31 @@ impl Archive {
             }
         }
     }
+    pub(super) fn retry_now(&mut self) {
+        self.retry_at = None;
+    }
+    fn migrate(&mut self, store: &mut dyn Store, lock: Option<std::sync::Arc<lightcraft_catalog::LibraryLock>>, generation: u64) -> Result<()> {
+        let result = self.migration.as_mut().ok_or_else(|| error("migration missing"))?.drive(store, lock, generation);
+        match result {
+            Ok(true) => {
+                self.v2 = true;
+                self.legacy = false;
+                self.migration = None;
+                self.error = None;
+                self.dirty = false;
+                Ok(())
+            }
+            Ok(false) => {
+                self.error = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                self.retry_at = Some(web_time::Instant::now() + std::time::Duration::from_secs(2));
+                Err(crate::EngineError::NotSaved(e.to_string()))
+            }
+        }
+    }
 }
 impl Session {
     pub fn photo_companion(&self, photo: PhotoId) -> Result<Option<&Value>> {
@@ -197,6 +411,9 @@ impl Session {
         Ok(self.companion_archive.photos.get(&photo))
     }
     pub fn set_photo_companion(&mut self, photo: PhotoId, conversation: Option<Value>) -> Result<()> {
+        if self.companion_migration_pending() {
+            return Err(error("legacy migration pauses AI save and conversation deletion"));
+        }
         if self.catalog.photo(photo).is_none() {
             return Err(error("no such photo"));
         }
@@ -219,8 +436,50 @@ impl Session {
         self.flush_companion()
     }
     pub(crate) fn flush_companion(&mut self) -> Result<()> {
+        let locators: Vec<_> = self
+            .mutation_guard
+            .reverts
+            .values()
+            .filter(|p| p.eligible && p.record.is_none())
+            .filter_map(|proof| {
+                let (records, start, epoch) = if let Some(tail) = self.companion_archive.tails.get(&proof.photo) {
+                    (
+                        tail.records.as_slice(),
+                        tail.prefix.as_ref().map(|h| h.record_count).unwrap_or(0),
+                        tail.prefix.as_ref().map(|h| h.conversation_epoch),
+                    )
+                } else {
+                    (self.companion_archive.photos.get(&proof.photo)?.get("round_records")?.as_array()?.as_slice(), 0, None)
+                };
+                let index = records.iter().position(|r| {
+                    r["local_round_id"] == proof.round.as_str()
+                        && r["original"] == json!(proof.original)
+                        && r["recent_complete_result"] == json!(proof.expected)
+                })?;
+                Some((proof.photo, start.checked_add(index as u64)?, epoch))
+            })
+            .collect();
+        for (photo, ordinal, epoch) in locators {
+            let epoch = match (epoch, self.library.as_mut()) {
+                (Some(epoch), _) => Some(epoch),
+                (None, Some(lib)) => super::storage::stored_epoch(lib.files.as_mut(), photo).ok(),
+                _ => None,
+            };
+            if let Some(epoch) = epoch
+                && let Some(proof) = self.mutation_guard.reverts.get_mut(&photo)
+            {
+                // A locator for an existing trusted publication is not authority.
+                // Sealing still requires saved data and validates that exact record.
+                std::sync::Arc::make_mut(proof).record = Some((epoch, ordinal));
+            }
+        }
+        let generation = self.library_generation();
         match self.library.as_mut() {
             Some(lib) => {
+                if self.companion_archive.migration.is_some() {
+                    let lock = lib.retain_read_lock();
+                    self.companion_archive.migrate(lib.files.as_mut(), lock, generation)?;
+                }
                 let editor_dirty = self.companion_archive.editors.dirty();
                 if editor_dirty && !self.companion_archive.legacy && self.companion_archive.blocked.is_none() {
                     self.companion_archive.v2 = true;
@@ -360,3 +619,41 @@ fn remove_legacy(op: &mut Value) -> bool {
 #[cfg(test)]
 #[path = "archive_tests.rs"]
 mod tests;
+
+/// Owned bounded reader for known v1 preview paths. It retains the native library
+/// lock while actual I/O is in flight; callers transfer only the guard to a view.
+pub struct CompanionAttachmentReader {
+    store: Box<dyn Store>,
+    photo: PhotoId,
+    retention: CompanionAttachmentRetention,
+}
+pub struct CompanionAttachmentRetention {
+    _lock: Option<std::sync::Arc<lightcraft_catalog::LibraryLock>>,
+}
+impl CompanionAttachmentReader {
+    pub fn read(&mut self, image: &Value) -> Result<Vec<u8>> {
+        let name = image["attachment"].as_str().ok_or_else(|| error("preview reference missing"))?;
+        validate_attachment(name)?;
+        let prefix = format!("companion/preview-{}-", self.photo.0);
+        let digest = name.strip_prefix(&prefix).and_then(|s| s.strip_suffix(".bin")).ok_or_else(|| error("preview belongs to another photo"))?;
+        let bytes = self.store.read_limited(name, 128 * 1024).map_err(error)?.ok_or_else(|| error("preview missing"))?;
+        if format!("{:032x}", lightcraft_preview::hash_bytes(&bytes).0) != digest {
+            return Err(error("preview digest mismatch"));
+        }
+        super::validate_history_image(image["mime_type"].as_str().unwrap_or_default(), &bytes).map_err(error)?;
+        Ok(bytes)
+    }
+    pub fn into_retention(self) -> CompanionAttachmentRetention {
+        self.retention
+    }
+}
+impl Session {
+    pub fn companion_attachment_reader(&self, photo: PhotoId) -> Result<Option<CompanionAttachmentReader>> {
+        let library = self.library.as_ref().ok_or_else(|| error("library closed"))?;
+        let Some(store) = library.files.background_writer() else { return Ok(None) };
+        if library.files.retention_namespace().is_none() {
+            return Err(error("preview reader requires stable Store namespace"));
+        }
+        Ok(Some(CompanionAttachmentReader { store, photo, retention: CompanionAttachmentRetention { _lock: library.retain_read_lock() } }))
+    }
+}

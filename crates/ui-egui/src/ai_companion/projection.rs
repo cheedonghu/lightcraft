@@ -3,7 +3,7 @@ use super::*;
 const MAX_TEXT: usize = 256 * 1024;
 const MAX_REQUEST: usize = 32 * 1024 * 1024;
 const MAX_IMAGE: usize = 128 * 1024;
-fn invalid() -> String {
+pub(super) fn invalid() -> String {
     tr("The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.").into()
 }
 fn limit() -> String {

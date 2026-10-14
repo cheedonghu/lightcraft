@@ -1998,5 +1998,9 @@
   "Applying the correction…": "Applying the correction…",
   "Stopping generation…": "Stopping generation…",
   "Generation stopped; confirming submission cancellation…": "Generation stopped; confirming submission cancellation…",
-  "Generation stopped; keeping the latest complete result.": "Generation stopped; keeping the latest complete result."
+  "Generation stopped; keeping the latest complete result.": "Generation stopped; keeping the latest complete result.",
+  "Samples": "Amostras",
+  "Combination": "Combinação",
+  "On": "Ativado",
+  "Historical parameter details are unavailable.": "Os detalhes históricos dos parâmetros não estão disponíveis."
 }

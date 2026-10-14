@@ -1998,5 +1998,9 @@
   "Applying the correction…": "Applying the correction…",
   "Stopping generation…": "Stopping generation…",
   "Generation stopped; confirming submission cancellation…": "Generation stopped; confirming submission cancellation…",
-  "Generation stopped; keeping the latest complete result.": "Generation stopped; keeping the latest complete result."
+  "Generation stopped; keeping the latest complete result.": "Generation stopped; keeping the latest complete result.",
+  "Samples": "取樣顏色",
+  "Combination": "組合方式",
+  "On": "開啟",
+  "Historical parameter details are unavailable.": "歷史參數詳情無法使用。"
 }

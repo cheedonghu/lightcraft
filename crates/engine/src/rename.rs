@@ -1035,10 +1035,12 @@ impl Session {
         repairs: &[SidecarMove],
     ) -> Result<()> {
         let mut ops = vec![op.clone()];
-        if let Some(id) = self.companion_task_photo()
-            && let Some(photo) = self.catalog.photo(id)
-            && let Source::File { path } = &photo.source
-        {
+        let mut physical = std::collections::BTreeSet::new();
+        // File ownership belongs to every catalog photo, including cold revert
+        // records never opened in the AI panel and physical aliases absent Op IDs.
+        for photo in self.catalog.photos() {
+            let id = photo.id;
+            let Source::File { path } = &photo.source else { continue };
             let original = Path::new(path);
             let mut owned = vec![original.to_path_buf()];
             owned.extend(sidecars(path).into_iter().map(|(path, _, _)| path));
@@ -1073,10 +1075,14 @@ impl Session {
                 [&folder.from, &folder.to].into_iter().filter(|path| !path.is_empty()).any(|folder| folder_affects_path(Path::new(folder), original))
             });
             if touches_file || touches_folder {
+                physical.insert(id);
                 ops.push(Op::SetFile { id, file_name: photo.file_name.clone(), source: photo.source.clone() });
             }
         }
-        self.authorize_mutation(&Op::Batch { ops })
+        let batch = Op::Batch { ops };
+        self.preflight_mutation(&batch)?;
+        self.invalidate_companion_reverts_before(&physical)?;
+        self.authorize_mutation(&batch)
     }
 
     pub(crate) fn retained_sidecar_repairs(&self) -> Vec<SidecarMove> {

@@ -92,6 +92,9 @@ fn read(store: &mut dyn Store, photo: PhotoId) -> Result<EditorState> {
     })
 }
 impl Editors {
+    pub(crate) fn dirty_for(&self, photo: PhotoId) -> bool {
+        self.dirty.contains(&photo)
+    }
     pub(crate) fn dirty(&self) -> bool {
         !self.dirty.is_empty()
     }
@@ -166,9 +169,8 @@ impl Session {
         if let Some(editor) = self.companion_archive.editors.values.get(&photo) {
             return Ok(editor.clone());
         }
-        if let Some(blocked) = &self.companion_archive.blocked {
-            return Err(error(blocked));
-        }
+        // Editor ownership, version and payload digest are verified separately.
+        // Reading it never hydrates or writes a protected conversation/root.
         let loaded = match self.library.as_mut() {
             Some(library) => read(library.files.as_mut(), photo),
             None => Ok(EditorState::default()),

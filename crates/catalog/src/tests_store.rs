@@ -271,3 +271,47 @@ fn native_case_alias_truncate_reopens_appender_and_checks_parent_sync() {
     assert_eq!(appended.unwrap_err().kind(), io::ErrorKind::PermissionDenied, "truncation through a case alias must close the cached handle");
     assert_eq!(bytes, b"o+new");
 }
+
+#[test]
+fn memory_namespaces_are_shared_by_clones_and_never_reused_after_backing_retirement() {
+    let mut retired = std::collections::BTreeSet::new();
+    for _ in 0..256 {
+        let store = MemStore::new();
+        let namespace = store.retention_namespace().unwrap();
+        let mut clone = store.clone();
+        assert_eq!(clone.retention_namespace().as_ref(), Some(&namespace));
+        clone.write_atomic("shared", b"actual shared backing").unwrap();
+        assert_eq!(store.get("shared").unwrap(), b"actual shared backing");
+        assert!(retired.insert(namespace), "a fresh backing must not inherit a retired process namespace");
+    }
+}
+
+#[test]
+fn memory_snapshot_checks_stay_bounded_and_reject_replacements() {
+    use std::time::{Duration, Instant};
+    let mut store = MemStore::new();
+    store.set("source.json", vec![b'x'; 64 * 1024 * 1024]);
+    let mut source = store.source_snapshot("source.json").unwrap().unwrap();
+    let mut cloned = source.clone_reader().unwrap();
+    let started = Instant::now();
+    for _ in 0..32 {
+        assert!(source.read_range(0, 0).unwrap().is_empty());
+    }
+    let elapsed = started.elapsed();
+    println!("32 empty ranges on 64MiB captured source: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2), "empty range identity checks must not hash the whole source: {elapsed:?}");
+    store.append("unrelated", b"ordinary other file").unwrap();
+    assert_eq!(source.read_range(7, 4).unwrap(), b"xxxx");
+    assert_eq!(cloned.read_range(11, 4).unwrap(), b"xxxx");
+    source.verify_current().unwrap();
+    store.set("source.json", vec![b'y'; 64 * 1024 * 1024]);
+    assert!(source.read_range(0, 0).is_err());
+    assert!(cloned.verify_current().is_err());
+    store.set("source.json", vec![b'x'; 64 * 1024 * 1024]);
+    assert!(source.read_range(0, 0).is_err(), "restored bytes cannot revive a replaced captured source");
+    let mut fresh = store.source_snapshot("source.json").unwrap().unwrap();
+    assert_eq!(fresh.read_range(0, 4).unwrap(), b"xxxx");
+    fresh.verify_current().unwrap();
+    store.remove("source.json").unwrap();
+    assert!(fresh.read_range(0, 0).is_err());
+}

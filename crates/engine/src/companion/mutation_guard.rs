@@ -2,7 +2,9 @@
 //! Mutation preflight is the extension point for the durable invalidation gate.
 use super::LocalRoundId;
 use crate::{EngineError, Result, Session};
-use lightcraft_catalog::{Op, PhotoId};
+use lightcraft_catalog::{Op, PhotoId, Source};
+use lightcraft_develop::DevelopSettings;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
 #[derive(Debug)]
@@ -10,6 +12,9 @@ struct Lease {
     generation: u64,
     photo: PhotoId,
     round: LocalRoundId,
+    original: Arc<DevelopSettings>,
+    source: Source,
+    source_evidence: Option<String>,
 }
 
 /// Holding this non-serializable capability protects the photo. Dropping it releases
@@ -20,6 +25,50 @@ pub struct LeaseToken(Arc<Lease>);
 #[derive(Default)]
 pub(crate) struct MutationGuard {
     active: Weak<Lease>,
+    pub(super) reverts: BTreeMap<PhotoId, Arc<RuntimeRevert>>,
+    pub(super) loaded: BTreeSet<PhotoId>,
+    pub(crate) loaded_seq: u64,
+    pub(crate) clean_load: bool,
+    pub(super) core_proof: Option<super::revert_guard::CoreProof>,
+    pub(crate) load_fenced: bool,
+    pub(crate) protected_load: bool,
+    pub(crate) retire_load: bool,
+    pub(crate) rejected_interaction: bool,
+}
+
+/// A runtime publication proof, never constructed from saved JSON or parameters.
+#[derive(Clone, Debug)]
+pub(super) struct RuntimeRevert {
+    pub(super) generation: u64,
+    pub(super) photo: PhotoId,
+    pub(super) round: LocalRoundId,
+    pub(super) original: Arc<DevelopSettings>,
+    pub(super) expected: Arc<DevelopSettings>,
+    pub(super) source: Source,
+    pub(super) content: String,
+    pub(super) source_evidence: Option<String>,
+    pub(super) certificate: Option<super::revert_guard::Certificate>,
+    pub(super) record: Option<(u64, u64)>,
+    pub(super) eligible: bool,
+    pub(super) reverted: bool,
+    pub(super) later_after_revert: bool,
+    pub(super) later_edits: bool,
+}
+/// Opaque permission bound to this exact runtime proof and photo version.
+/// Callers cannot create or serialize it; commit rechecks it before restoring.
+pub struct VerifiedRevert {
+    proof: Arc<RuntimeRevert>,
+    revision: u64,
+}
+
+/// Historical display state of a round; this is not a permission token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundRevertState {
+    Unverified,
+    Eligible,
+    LaterEdits,
+    Reverted,
+    RevertedWithLaterEdits,
 }
 
 impl Session {
@@ -28,6 +77,17 @@ impl Session {
     }
 
     pub fn acquire_companion_lease(&mut self, photo: PhotoId, round: LocalRoundId) -> Result<LeaseToken> {
+        if self.companion_migration_pending() {
+            return Err(EngineError::Other("AI history migration is in progress. Photo editing and drafts remain available.".into()));
+        }
+        if let Some(blocked) = &self.companion_archive.blocked {
+            return Err(super::archive::error(blocked));
+        }
+        if self.pending_companion_clear_epoch(photo)?.is_some() || self.companion_archive.clear_errors.contains_key(&photo) {
+            return Err(EngineError::Other(
+                "Conversation deletion is waiting for local saving. Retry deletion before starting a new AI task.".into(),
+            ));
+        }
         if self.companion_task_photo().is_some() {
             return Err(EngineError::Other("Another AI task is active; stop it or wait for completion.".into()));
         }
@@ -35,9 +95,17 @@ impl Session {
         if p.deleted {
             return Err(EngineError::Other("This photo is unavailable for AI processing.".into()));
         }
+        if self.library.is_some() && self.companion_photo_header(photo)?.is_some_and(|header| !header.history_complete()) {
+            return Err(EngineError::Other(
+                "The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.".into(),
+            ));
+        }
         // Finish the user's click-time editing transaction before freezing its start.
         self.end_interaction()?;
-        let lease = Arc::new(Lease { generation: self.library_generation(), photo, round });
+        let original = self.develop_of(photo).ok_or(lightcraft_catalog::CatalogError::NoPhoto(photo))?;
+        let source = self.catalog.photo(photo).ok_or(lightcraft_catalog::CatalogError::NoPhoto(photo))?.source.clone();
+        let source_evidence = self.fresh_revert_source(&source).ok();
+        let lease = Arc::new(Lease { generation: self.library_generation(), photo, round, original, source, source_evidence });
         self.mutation_guard.active = Arc::downgrade(&lease);
         Ok(LeaseToken(lease))
     }
@@ -80,9 +148,86 @@ impl Session {
     /// Lease inspection remains pure; adding durable invalidation here never requires
     /// weakening the lease guard or moving an authorization after a side effect.
     pub fn authorize_mutation(&mut self, op: &Op) -> Result<()> {
-        self.preflight_mutation(op)
+        self.preflight_mutation(op)?;
+        let mut pending = vec![op];
+        let mut changed = Vec::new();
+        while let Some(part) = pending.pop() {
+            match part {
+                Op::Batch { ops } => pending.extend(ops),
+                Op::SetDevelop { id, settings, label, .. } => {
+                    if label.starts_with("History:") || self.develop_of(*id).is_none_or(|current| current != *settings) {
+                        changed.push(*id);
+                    }
+                }
+                Op::SetFile { id, source, .. } | Op::Relink { id, source, .. } if self.catalog.photo(*id).is_none_or(|p| p.source != *source) => {
+                    changed.push(*id);
+                }
+                Op::SetDeleted { id, deleted } if self.catalog.photo(*id).is_none_or(|p| p.deleted != *deleted) => {
+                    changed.push(*id);
+                }
+                Op::RemovePhoto { id } => {
+                    changed.push(*id);
+                }
+                Op::AddPhoto { photo } if self.catalog.photo(photo.id).is_some() => {
+                    changed.push(photo.id);
+                }
+                Op::SetContent { id, width, height, file_size, content_hash, preview_only }
+                    if self.catalog.photo(*id).is_none_or(|p| {
+                        p.width != *width
+                            || p.height != *height
+                            || p.file_size != *file_size
+                            || p.content_hash != *content_hash
+                            || p.preview_only != *preview_only
+                    }) =>
+                {
+                    changed.push(*id);
+                }
+                Op::SetEmbeddedLens { id, lens } if self.catalog.photo(*id).is_none_or(|p| p.embedded_lens.as_ref() != lens.as_deref()) => {
+                    changed.push(*id);
+                }
+                _ => {}
+            }
+        }
+        if self.mutation_guard.rejected_interaction && self.interaction.as_ref().is_some_and(|i| changed.contains(&i.photo)) {
+            return Err(EngineError::Other("This gesture was not applied. Release it, then retry the edit explicitly.".into()));
+        }
+        let changed = changed.into_iter().collect();
+        if let Err(e) = self.invalidate_companion_reverts_before(&changed) {
+            if self.interaction.as_ref().is_some_and(|i| changed.contains(&i.photo)) {
+                self.mutation_guard.rejected_interaction = true;
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
+    pub(crate) fn note_companion_actual_edit(&mut self, op: &Op) {
+        let mut pending = vec![op];
+        while let Some(part) = pending.pop() {
+            match part {
+                Op::Batch { ops } => pending.extend(ops),
+                Op::SetDevelop { id, settings, label, .. } => {
+                    if let Some(p) = self.mutation_guard.reverts.get_mut(id)
+                        && (label.starts_with("History:") || *settings != p.expected)
+                    {
+                        let p = Arc::make_mut(p);
+                        p.later_edits = true;
+                        p.later_after_revert |= p.reverted;
+                    }
+                }
+                Op::SetFile { id, source, .. } | Op::Relink { id, source, .. } => {
+                    if let Some(p) = self.mutation_guard.reverts.get_mut(id)
+                        && *source != p.source
+                    {
+                        let p = Arc::make_mut(p);
+                        p.later_edits = true;
+                        p.later_after_revert |= p.reverted;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     /// Only a live round's private capability may publish a single-photo develop result.
     /// Revision and round identity are checked again immediately before publication.
     pub fn commit_companion(&mut self, token: &LeaseToken, round: &LocalRoundId, revision: u64, op: Op) -> Result<()> {
@@ -102,7 +247,137 @@ impl Session {
                 _ => return Err(EngineError::Other("AI publication may only update its task photo.".into())),
             }
         }
-        self.commit_preflighted("AI edit plan", op)
+        if self.catalog.photo(active.photo).is_none_or(|p| p.source != active.source)
+            || active.source_evidence.as_deref().is_some_and(|evidence| self.fresh_revert_source(&active.source).ok().as_deref() != Some(evidence))
+        {
+            return Err(EngineError::Other(
+                "The original source could not be verified or has changed. Use ordinary History; the current photo was kept.".into(),
+            ));
+        }
+        let before = self.develop_of(active.photo).ok_or(lightcraft_catalog::CatalogError::NoPhoto(active.photo))?;
+        let mut proposed = vec![&op];
+        let mut changes = false;
+        while let Some(part) = proposed.pop() {
+            match part {
+                Op::Batch { ops } => proposed.extend(ops),
+                Op::SetDevelop { settings, .. } => changes |= *settings != before,
+                _ => {}
+            }
+        }
+        if changes {
+            self.invalidate_companion_reverts_before(&BTreeSet::from([active.photo]))?;
+        }
+        self.commit_preflighted("AI edit plan", op)?;
+        let p = self.catalog.photo(active.photo).ok_or(lightcraft_catalog::CatalogError::NoPhoto(active.photo))?;
+        if p.develop == before {
+            return Ok(());
+        }
+        self.mutation_guard.reverts.insert(
+            active.photo,
+            Arc::new(RuntimeRevert {
+                generation: active.generation,
+                photo: active.photo,
+                round: active.round.clone(),
+                original: active.original.clone(),
+                expected: p.develop.clone(),
+                source: p.source.clone(),
+                content: crate::media::content_key(p),
+                source_evidence: active.source_evidence.clone(),
+                certificate: None,
+                record: None,
+                eligible: true,
+                reverted: false,
+                later_after_revert: false,
+                later_edits: false,
+            }),
+        );
+        Ok(())
+    }
+    /// Cheap runtime display query, independent of uploaded content and UI caches.
+    pub fn companion_round_revert_state(&self, photo: PhotoId, round: &LocalRoundId) -> RoundRevertState {
+        let Some(proof) = self.mutation_guard.reverts.get(&photo).filter(|p| p.generation == self.library_generation()) else {
+            return RoundRevertState::Unverified;
+        };
+        if &proof.round != round {
+            // A different identity may be a newer no-op or an older result.
+            // This one current proof has no ordering fact about that round.
+            return RoundRevertState::Unverified;
+        }
+        if proof.reverted && proof.later_after_revert {
+            RoundRevertState::RevertedWithLaterEdits
+        } else if proof.reverted {
+            RoundRevertState::Reverted
+        } else if self.runtime_revert_current(proof) {
+            RoundRevertState::Eligible
+        } else if proof.later_edits {
+            RoundRevertState::LaterEdits
+        } else {
+            RoundRevertState::Unverified
+        }
+    }
+    /// Verify an explicit round, including fresh original source evidence.
+    pub fn verify_round_revert(&mut self, photo: PhotoId, round: &LocalRoundId) -> Result<VerifiedRevert> {
+        self.prepare_companion_revert(photo)?;
+        self.preflight_mutation(&Op::SetDevelop {
+            id: photo,
+            settings: Arc::new(DevelopSettings::default()),
+            label: "Undo AI round".into(),
+            edited: None,
+        })?;
+        let proof = self
+            .mutation_guard
+            .reverts
+            .get(&photo)
+            .filter(|p| &p.round == round)
+            .cloned()
+            .ok_or_else(|| EngineError::Other("This round has no verified revert permission; use ordinary History.".into()))?;
+        if !self.runtime_revert_current(&proof) {
+            let message = if proof.later_edits {
+                "The photo has later edits; use ordinary History. The current photo was kept."
+            } else {
+                "This round has no verified revert permission; use ordinary History."
+            };
+            return Err(EngineError::Other(message.into()));
+        }
+        self.verify_revert_source(&proof)?;
+        Ok(VerifiedRevert { proof, revision: self.photo_revision(photo) })
+    }
+    fn verify_revert_source(&mut self, proof: &RuntimeRevert) -> Result<()> {
+        if proof.source_evidence.as_deref().is_none_or(|evidence| self.fresh_revert_source(&proof.source).ok().as_deref() != Some(evidence)) {
+            self.invalidate_companion_reverts_before(&[proof.photo].into_iter().collect())?;
+            return Err(EngineError::Other(
+                "The original source could not be verified or has changed. Use ordinary History; the current photo was kept.".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(super) fn runtime_revert_current(&self, proof: &RuntimeRevert) -> bool {
+        proof.eligible
+            && proof.source_evidence.is_some()
+            && proof.generation == self.library_generation()
+            && self.catalog.photo(proof.photo).is_some_and(|p| {
+                !p.deleted && p.source == proof.source && crate::media::content_key(p) == proof.content && *p.develop == *proof.expected
+            })
+    }
+    /// One undoable single-photo restoration. Auto Sync is never expanded, and
+    /// neither current consent nor a network connection is required.
+    pub fn commit_verified_round_revert(&mut self, verified: VerifiedRevert) -> Result<()> {
+        let p = &verified.proof;
+        if self.photo_revision(p.photo) != verified.revision
+            || !self.mutation_guard.reverts.get(&p.photo).is_some_and(|current| Arc::ptr_eq(current, p))
+            || !self.runtime_revert_current(p)
+        {
+            return Err(EngineError::Other("The round revert permission is stale; the photo was kept.".into()));
+        }
+        self.verify_revert_source(p)?;
+        let op = self.develop_op(p.photo, (*p.original).clone(), "Undo AI round").ok_or(lightcraft_catalog::CatalogError::NoPhoto(p.photo))?;
+        self.commit("Undo AI round", op)?;
+        if let Some(current) = self.mutation_guard.reverts.get_mut(&p.photo) {
+            let current = Arc::make_mut(current);
+            current.eligible = false;
+            current.reverted = true;
+        }
+        Ok(())
     }
 }
 

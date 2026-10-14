@@ -271,7 +271,7 @@ fn old_page_seek_uses_bounded_index_work_and_never_reads_a_whole_storage_file() 
 }
 
 #[test]
-fn large_record_fragment_rejects_real_chunk_corruption_without_materializing_history() {
+fn large_record_fragment_marks_real_chunk_corruption_unavailable_without_materializing_history() {
     let files = MemStore::new();
     let mut session = Session::new();
     session
@@ -285,13 +285,19 @@ fn large_record_fragment_rejects_real_chunk_corruption_without_materializing_his
         .save_companion_tail(photo, None, &[json!({"role":"user","text":"x".repeat(6*1024*1024)})], &[], &[], &json!({"schema_version":2}))
         .unwrap();
     let header = session.companion_photo_header(photo).unwrap().unwrap();
-    let index: serde_json::Value = serde_json::from_slice(&files.get(&header.message_root.unwrap().key).unwrap()).unwrap();
+    let index: serde_json::Value = serde_json::from_slice(&files.get(&header.message_root.as_ref().unwrap().key).unwrap()).unwrap();
     let key = index["entries"][0]["block"].as_str().unwrap();
     let mut bytes = files.get(key).unwrap();
     bytes[100] ^= 1;
-    files.set(key, bytes);
-    let failure = session.companion_history_slice(photo, HistoryCursor::default(), 32 * 1024).unwrap_err();
+    files.set(key, bytes.clone());
+    let page = session.companion_history_slice(photo, HistoryCursor::default(), 32 * 1024).unwrap();
+    assert!(matches!(page.items.as_slice(), [super::storage::HistoryItem::Unavailable { record: 0 }]));
+    assert!(page.records.is_empty() && page.fragments.is_empty(), "unverified content is never exposed");
+    assert!(page.errors[0].contains("chunk digest mismatch"));
+    assert!(page.bytes <= 32 * 1024);
+    let failure = session.companion_protocol_messages_bounded(&header, 0, 1, 32 * 1024 * 1024).unwrap_err();
     assert!(failure.to_string().contains("chunk digest mismatch"));
+    assert_eq!(files.get(key).unwrap(), bytes);
     assert_eq!(session.companion_photo_header(photo).unwrap().unwrap().message_count, 1);
 }
 
@@ -371,9 +377,14 @@ fn retrying_a_staged_late_receipt_cannot_restore_eligibility_after_a_manual_edit
     assert!(session.confirm_companion_execution(&identity, "plan").is_err());
     let pending = session.companion_pending(photo).unwrap().unwrap();
     assert_ne!(session.companion_round(photo, identity.local_round_id.as_str()).unwrap().unwrap()["backend_confirmed_plan"], "plan");
-    session.execute("develop.set", &json!({"ids":[photo.0],"values":{"light.exposure":0.5}})).unwrap();
+    assert!(
+        matches!(session.execute("develop.set", &json!({"ids":[photo.0],"values":{"light.exposure":0.5}})), Err(crate::EngineError::NotSaved(_))),
+        "receipt storage debt must remain visible after the ordinary edit"
+    );
+    assert_eq!(session.develop_of(photo).unwrap().light.exposure, 0.5);
     fail.store(false, Ordering::Relaxed);
-    session.companion_commit(&pending).unwrap();
+    assert!(session.confirm_companion_execution(&identity, "plan").unwrap());
+    assert_eq!(session.companion_photo_header(photo).unwrap().unwrap().transaction_id, pending.transaction_id);
     assert_eq!(session.companion_round(photo, identity.local_round_id.as_str()).unwrap().unwrap()["backend_confirmed_plan"], "plan");
     assert_eq!(session.companion_metadata(photo).unwrap().unwrap()["checkpoint"]["eligible"], false);
     assert_eq!(session.develop_of(photo).unwrap().light.exposure, 0.5);

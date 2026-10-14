@@ -168,6 +168,9 @@ pub type SystemThemeFn = Box<dyn Fn(&egui::Context) -> Option<egui::Theme>>;
 /// Platform services injected by the host app (desktop or web).
 #[derive(Default)]
 pub struct Services {
+    /// Host-selected loopback endpoint for both companion health and round transport.
+    /// None preserves PHOTO_COMPANION_ADDR and the native development default.
+    pub companion_address: Option<String>,
     /// Native file dialogs for commands, shown off the UI thread and answered later
     /// (`pick`; #191). With it, the synchronous pickers below serve only the buttons inside
     /// dialogs; without it (the web, tests) they answer the commands too.
@@ -515,6 +518,9 @@ impl LightcraftApp {
             params
         };
         let r = self.session.execute(id, &params).map_err(|e| crate::i18n::tr(&e.to_string()).to_owned());
+        if r.is_ok() && matches!(id, "library.select" | "library.selectAll") {
+            ai_companion::selection_intent(self);
+        }
         if r.is_ok() && matches!(id, "crop.aspect" | "crop.rotateAspect") {
             self.ui.crop_default_aspect = if id == "crop.aspect" && params.get("aspect").and_then(Value::as_str) == Some("original") {
                 Some(serde_json::json!("original"))
@@ -676,12 +682,16 @@ impl LightcraftApp {
                 self.ui.unsaved_seen = true;
                 let t = ctx.input(|i| i.time);
                 self.ui.toast = Some((
-                    crate::i18n::tr_format!(
-                        "{n} change{} saved in memory but not written to disk: {e} — LightCraft will retry",
-                        if n == 1 { "" } else { "s" },
-                        n = n,
-                        e = e
-                    ),
+                    if self.session.companion_save_requires_explicit_retry() {
+                        crate::i18n::tr("Conversation deletion requires an explicit save retry in that photo's AI conversation.").to_owned()
+                    } else {
+                        crate::i18n::tr_format!(
+                            "{n} change{} saved in memory but not written to disk: {e} — LightCraft will retry",
+                            if n == 1 { "" } else { "s" },
+                            n = n,
+                            e = e
+                        )
+                    },
                     t + 6.0,
                     None,
                 ));
@@ -1317,6 +1327,7 @@ impl LightcraftApp {
         // Order matters: earlier panels take the full edge (top bar spans the window; the tool strip,
         // right panels and left panel run to the bottom; the bottom bar sits between them).
         panels::topbar::show(self, ui);
+        ai_companion::show_task_entry(self, ui);
         panels::library_problem::banner(self, ui);
         panels::strip::show(self, ui);
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| docking::show(self, ui));
