@@ -325,6 +325,11 @@ fn shared_tools_mixed_continuation_renders_old_fragment_before_newer_record_and_
             }
             let text = h.app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().to_owned();
             assert!(text.find("OLD_MESSAGE_END").unwrap() < text.find("NEWER_MESSAGE").unwrap(), "{current_tail}: {text}");
+            h.request("ui.hoverWidget", json!({"id":"ai:messages"}), timeout);
+            h.request("ui.scroll", json!({"dy":-100000.0}), timeout);
+            for _ in 0..12 {
+                h.step();
+            }
             let painted = h.painted_text().join("\n");
             assert!(painted.find("OLD_MESSAGE_END").unwrap() < painted.find("NEWER_MESSAGE").unwrap());
             assert!(h.app.ai.conversations[&photo].view.as_ref().unwrap().bytes <= 256 * 1024);

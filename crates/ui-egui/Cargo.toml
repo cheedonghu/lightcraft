@@ -13,6 +13,7 @@ workspace = true
 craft-ui = { workspace = true }
 lightcraft-geom = { workspace = true }
 lightcraft-meta = { workspace = true }
+lightcraft-codecs = { workspace = true }
 lightcraft-color = { workspace = true }
 lightcraft-raster = { workspace = true }
 lightcraft-develop = { workspace = true }
@@ -21,7 +22,6 @@ lightcraft-catalog = { workspace = true }
 web-time = { workspace = true }
 lightcraft-engine = { workspace = true }
 lightcraft-preview = { workspace = true }
-lightcraft-codecs = { workspace = true }
 egui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

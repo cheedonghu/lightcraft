@@ -202,12 +202,30 @@ impl State {
         // owner/round scans and inactive pauses until the actual view drops.
         let retention = app.session.retain_companion_history(&prefix).map_err(|e| e.to_string())?;
         let page = app.session.companion_history_slice_at(&prefix, cursor, 256 * 1024).map_err(|e| e.to_string())?;
-        let wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
+        let cached = self
+            .conversations
+            .get(&photo)
+            .and_then(|c| c.view.as_ref())
+            .filter(|v| v.captured_header == prefix)
+            .map(|v| v.fragment_messages.clone())
+            .unwrap_or_default();
+        let mut wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
+        let mut presentation = BTreeMap::new();
         let owners: VecDeque<_> = page
             .items
             .iter()
             .filter_map(|item| match item {
-                lightcraft_engine::companion::storage::HistoryItem::Fragment { record, .. } => Some(*record),
+                lightcraft_engine::companion::storage::HistoryItem::Fragment { record, .. } => {
+                    if let Some(message) = cached.get(record) {
+                        if let Some(id) = message["local_round_id"].as_str() {
+                            wanted.insert(id.to_owned());
+                        }
+                        presentation.insert(*record, message.clone());
+                        None
+                    } else {
+                        Some(*record)
+                    }
+                }
                 _ => None,
             })
             .collect();
@@ -218,12 +236,14 @@ impl State {
         let preview_bytes = preview.as_ref().map_or(0, historical::Preview::bytes);
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
         conversation.view = Some(HistoryView {
+            captured_header: prefix.clone(),
             _retention: retention,
             items: page.items,
             cursor,
             next: page.next,
             messages: page.records,
             fragments: page.fragments,
+            fragment_messages: presentation.clone(),
             bytes: page.bytes,
             cards: Vec::new(),
             diagnostic: None,
@@ -235,8 +255,13 @@ impl State {
                 )
             }),
             preview,
-            cards_bytes: preview_bytes,
-            card_cursor: (total > 0 && (!wanted.is_empty() || !owners.is_empty())).then_some(0),
+            cards_bytes: preview_bytes.saturating_add(
+                presentation
+                    .values()
+                    .map(|v| lightcraft_engine::companion::storage::record_size(v).unwrap_or(usize::MAX))
+                    .fold(0usize, usize::saturating_add),
+            ),
+            card_cursor: (!owners.is_empty() || (total > 0 && !wanted.is_empty())).then_some(0),
             card_pending: wanted,
             card_owners: owners,
             card_scan: None,

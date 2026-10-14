@@ -1516,10 +1516,102 @@ fn small_legacy_png_with_deep_additive_image_metadata_keeps_visible_text_and_ima
         assert_eq!(status["historicalPreview"]["available"], true, "{native}: {status}");
         h.step();
         h.step();
+        assert_eq!(h.request("ui.hoverWidget", json!({"id":"ai:messages"}), Duration::from_secs(5))["ok"], true);
+        assert_eq!(h.request("ui.scroll", json!({"dy":-300}), Duration::from_secs(5))["ok"], true);
+        assert!(h.step_until(Duration::from_secs(5), |h| h.app.widgets.iter().any(|(id, _)| id == "image:aiHistoricalPreview")));
         let rect = h.app.widgets.iter().find(|(id, _)| id == "image:aiHistoricalPreview").unwrap().1;
         let image = h.paint();
         let center = rect.center();
         assert_eq!(image.pixels[center.y as usize * image.size[0] + center.x as usize], egui::Color32::from_rgb(24, 196, 212));
+        assert!(h.settle(Duration::from_secs(10)));
+        h.app.session.close_library().unwrap();
+        drop(h);
+        if native {
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+}
+
+#[test]
+fn legacy_image_navigation_resets_for_different_page_counts_and_keeps_missing_refs_recoverable() {
+    for native in [true, false] {
+        let directory = std::env::temp_dir().join(format!("lc-ux10-page-images-{}", LocalRoundId::new().unwrap().as_str()));
+        let catalog = MemStore::new();
+        let memory = MemStore::new();
+        let files = || -> Box<dyn Store> { if native { Box::new(FsStore::open(&directory).unwrap()) } else { Box::new(memory.clone()) } };
+        let mut initial = lightcraft_engine::Session::new();
+        initial
+            .open_library_in(LibraryStores { catalog: Box::new(catalog.clone()), files: files(), dir: directory.clone(), on_disk: false }, true)
+            .unwrap();
+        let photo = initial.active().unwrap();
+        let png = lightcraft_engine::export::encode_image(
+            &lightcraft_raster::Rgba8::from_fn(32, 32, |_, _| [24, 196, 212, 255]),
+            &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+        )
+        .unwrap();
+        let name = initial.library.as_mut().unwrap().companion_attachment(photo, &png).unwrap();
+        initial.close_library().unwrap();
+        drop(initial);
+        let missing = format!("companion/preview-{}-00000000000000000000000000000000.bin", photo.0);
+        let messages: Vec<_> = (0..33)
+            .map(|record| {
+                let mut images = vec![json!({"mime_type":"image/png","attachment":name})];
+                if record < 32 {
+                    images.push(json!({"mime_type":"image/png","attachment":if record==0 {&missing}else{&name}}));
+                }
+                json!({"role":"user","text":format!("Original page message {record}"),"images":images})
+            })
+            .collect();
+        let source = serde_json::to_vec(
+            &json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():{"schema_version":1,"messages":messages,"rounds":[]}}}),
+        )
+        .unwrap();
+        files().write_atomic("companion/state.json", &source).unwrap();
+        let mut session = lightcraft_engine::Session::new();
+        session.open_library_in(LibraryStores { catalog: Box::new(catalog), files: files(), dir: directory.clone(), on_disk: false }, true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.companion_migration_pending() && Instant::now() < deadline {
+            let _ = session.persist();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!session.companion_migration_pending());
+        let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1100., 750.], 1.);
+        h.app.ui.settings.gpu = false;
+        h.app.run("ai.open", json!({})).unwrap();
+        let ready = |h: &mut Headless| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                h.step();
+                let status = h.app.run("ai.status", json!({})).unwrap();
+                if status["historyLoading"] == false {
+                    return status;
+                }
+                assert!(Instant::now() < deadline, "{status}");
+                std::thread::yield_now();
+            }
+        };
+        h.app.run("ai.history", json!({"record":0,"offset":0})).unwrap();
+        assert_eq!(ready(&mut h)["historicalPreview"]["total"], 64);
+        h.app.run("ai.historicalImage", json!({"index":5})).unwrap();
+        assert_eq!(ready(&mut h)["historicalPreview"]["position"], 5);
+        h.app.run("ai.history", json!({"record":32,"offset":0})).unwrap();
+        let status = ready(&mut h);
+        assert_eq!(status["historicalPreview"]["position"], 0, "page-local selection must reset: {native}: {status}");
+        assert_eq!(status["historicalPreview"]["total"], 1);
+        assert_eq!(status["historicalPreview"]["available"], true);
+        h.app.run("ai.historicalImage", json!({"index":0})).unwrap();
+        assert_eq!(ready(&mut h)["historicalPreview"]["record"], 32);
+        h.app.run("ai.history", json!({"record":0,"offset":0})).unwrap();
+        let status = ready(&mut h);
+        assert_eq!(status["historicalPreview"]["position"], 0);
+        assert_eq!(status["historicalPreview"]["total"], 64);
+        h.app.run("ai.historicalImage", json!({"index":1})).unwrap();
+        let status = ready(&mut h);
+        assert_eq!(status["historicalPreview"]["available"], false);
+        assert_eq!(status["historicalPreview"]["total"], 64);
+        h.app.run("ai.historicalImage", json!({"index":0})).unwrap();
+        assert_eq!(ready(&mut h)["historicalPreview"]["available"], true);
+        assert_eq!(files().read("companion/state.v1.backup.json").unwrap().unwrap(), source);
         assert!(h.settle(Duration::from_secs(10)));
         h.app.session.close_library().unwrap();
         drop(h);

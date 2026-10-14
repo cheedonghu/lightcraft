@@ -73,7 +73,11 @@ impl Session {
         if e.length <= 256 * 1024 {
             return selected(&scan.small).map(Some);
         }
-        scan.fields.finish().map(Some)
+        let mut value = scan.fields.finish()?;
+        if matches!(scan.target, DisplayRecord::Message(_)) {
+            super::mark_old_hidden_text(&mut value, e);
+        }
+        Ok(Some(value))
     }
 }
 
@@ -295,6 +299,10 @@ impl Fields {
                                     || matches!(
                                         self.name.as_str(),
                                         "local_round_id"
+                                            | "role"
+                                            | "display_kind"
+                                            | "authored_text_bytes"
+                                            | "local_message_id"
                                             | "photo_id"
                                             | "local_terminal"
                                             | "trace_id"
@@ -307,6 +315,7 @@ impl Fields {
                                             | "reason"
                                             | "operations"
                                     )
+                                    || (!self.display && self.name == "images")
                             };
                         }
                         self.legacy = matches!(self.name.as_str(), "before_state" | "proposed_state" | "applied_state" | "recent_complete_result");

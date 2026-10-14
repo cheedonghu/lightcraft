@@ -2203,5 +2203,19 @@
   "Previous historical image": "上一张历史图片",
   "Next historical image": "下一张历史图片",
   "Historical preview unavailable. Original reference is retained.": "历史预览不可用，原始引用已保留。",
-  "Historical preview is unavailable.": "历史预览不可用。"
+  "Historical preview is unavailable.": "历史预览不可用。",
+  "You": "你",
+  "Assistant": "助手",
+  "Execution feedback": "执行反馈",
+  "Tool process": "工具过程",
+  "Tool": "工具",
+  "Edits applied.": "修改已应用。",
+  "Edits were not executed: cancelled.": "修改未执行：已取消。",
+  "The edit failed. The last complete result was kept.": "修改失败，已保留最近一次完整结果。",
+  "Recorded execution feedback is available in this round's result.": "本轮结果中保留了执行反馈。",
+  "Back to bottom": "回到底部",
+  "Historical preview unavailable": "历史预览不可用",
+  "Loading historical preview…": "正在加载历史预览…",
+  "Message details unavailable": "消息详情暂不可用",
+  "Read AI history": "回看 AI 历史"
 }

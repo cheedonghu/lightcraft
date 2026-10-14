@@ -523,3 +523,41 @@ fn remove_legacy(op: &mut Value) -> bool {
 #[cfg(test)]
 #[path = "archive_tests.rs"]
 mod tests;
+
+/// Owned bounded reader for known v1 preview paths. It retains the native library
+/// lock while actual I/O is in flight; callers transfer only the guard to a view.
+pub struct CompanionAttachmentReader {
+    store: Box<dyn Store>,
+    photo: PhotoId,
+    retention: CompanionAttachmentRetention,
+}
+pub struct CompanionAttachmentRetention {
+    _lock: Option<std::sync::Arc<lightcraft_catalog::LibraryLock>>,
+}
+impl CompanionAttachmentReader {
+    pub fn read(&mut self, image: &Value) -> Result<Vec<u8>> {
+        let name = image["attachment"].as_str().ok_or_else(|| error("preview reference missing"))?;
+        validate_attachment(name)?;
+        let prefix = format!("companion/preview-{}-", self.photo.0);
+        let digest = name.strip_prefix(&prefix).and_then(|s| s.strip_suffix(".bin")).ok_or_else(|| error("preview belongs to another photo"))?;
+        let bytes = self.store.read_limited(name, 128 * 1024).map_err(error)?.ok_or_else(|| error("preview missing"))?;
+        if format!("{:032x}", lightcraft_preview::hash_bytes(&bytes).0) != digest {
+            return Err(error("preview digest mismatch"));
+        }
+        super::validate_history_image(image["mime_type"].as_str().unwrap_or_default(), &bytes).map_err(error)?;
+        Ok(bytes)
+    }
+    pub fn into_retention(self) -> CompanionAttachmentRetention {
+        self.retention
+    }
+}
+impl Session {
+    pub fn companion_attachment_reader(&self, photo: PhotoId) -> Result<Option<CompanionAttachmentReader>> {
+        let library = self.library.as_ref().ok_or_else(|| error("library closed"))?;
+        let Some(store) = library.files.background_writer() else { return Ok(None) };
+        if library.files.retention_namespace().is_none() {
+            return Err(error("preview reader requires stable Store namespace"));
+        }
+        Ok(Some(CompanionAttachmentReader { store, photo, retention: CompanionAttachmentRetention { _lock: library.retain_read_lock() } }))
+    }
+}

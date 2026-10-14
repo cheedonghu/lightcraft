@@ -93,6 +93,8 @@ struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text_range: Option<[u64; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_range_version: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     preview_refs: Option<Vec<String>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -328,6 +330,7 @@ impl Writer<'_> {
                 self.block(&mut bytes, &mut offsets, &mut entries)?;
                 let mut entry = pagination::stream_record(self, record, length)?;
                 entry.text_range = pagination::text_range(record, None)?;
+                entry.text_range_version = Some(1);
                 entry.preview_refs = preview_inventory(record);
                 entries.push(entry);
             } else {
@@ -381,7 +384,16 @@ impl Writer<'_> {
         }
         let key = self.file("blocks/", "bin", bytes)?;
         for (offset, length, digest, text_range, preview_refs) in offsets.drain(..) {
-            entries.push(Entry { block: key.clone(), offset, length, digest, chunk_payload: None, text_range, preview_refs });
+            entries.push(Entry {
+                block: key.clone(),
+                offset,
+                length,
+                digest,
+                chunk_payload: None,
+                text_range,
+                text_range_version: Some(1),
+                preview_refs,
+            });
         }
         bytes.clear();
         Ok(())

@@ -55,6 +55,7 @@ impl Sink<'_, '_> {
             digest: self.hash.finish().to_string(),
             chunk_payload: self.chunked.then_some(BLOCK - 32),
             text_range: None,
+            text_range_version: None,
             preview_refs: None,
         })
     }
