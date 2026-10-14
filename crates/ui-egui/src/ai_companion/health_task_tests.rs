@@ -914,7 +914,7 @@ fn cold_verified_history_keeps_trace_and_consent_controls_scoped_while_loading()
         assert_eq!(h.view.clipboard, "abcdef012345-cold");
         if let Some((requests, _events)) = owned.as_ref() {
             assert_eq!(h.app.run("ai.start", json!({"prompt":"new explicit request"})).unwrap()["started"], true);
-            assert_eq!(requests.recv_timeout(Duration::from_secs(1)).unwrap().path, "/v1/rounds");
+            assert_eq!(native_history_tests::outgoing(&mut h, requests, "/v1/rounds").path, "/v1/rounds");
         }
         h.app.run("library.select", json!({"ids":[other.0]})).unwrap();
         frames(&mut h);

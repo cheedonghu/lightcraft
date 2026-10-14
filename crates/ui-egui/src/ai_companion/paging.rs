@@ -7,14 +7,27 @@ struct PageRequest {
     scope: PhotoScope,
     header: lightcraft_engine::companion::storage::PhotoHeader,
     cursor: HistoryCursor,
+    legacy_cursor: u64,
+    preview_cursor: u64,
+    presentation: BTreeMap<u64, Value>,
 }
 struct ReadMessage {
     retention: lightcraft_engine::companion::storage::HistoryRetention,
     request: u64,
     scope: PhotoScope,
+    header: lightcraft_engine::companion::storage::PhotoHeader,
     transaction: String,
     cursor: HistoryCursor,
-    result: Result<(HistorySlice, Vec<card::Card>, Option<String>, Option<String>), String>,
+    result: ReadContent,
+}
+enum ReadContent {
+    Page(
+        Result<
+            (Box<HistorySlice>, Vec<card::Card>, Option<String>, Option<String>, Option<Value>, Option<historical::Preview>, BTreeMap<u64, Value>),
+            String,
+        >,
+    ),
+    Preview(Option<historical::Preview>),
 }
 pub(super) struct Paging {
     tx: mpsc::SyncSender<ReadMessage>,
@@ -76,11 +89,12 @@ impl State {
             }
             self.paging.completed = message.request;
             match message.result {
-                Ok((page, cards, notice, diagnostic)) => {
+                ReadContent::Page(Ok((page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages))) => {
                     if let Some(notice) = notice {
                         conversation.notice = notice;
                     }
                     conversation.view = Some(HistoryView {
+                        captured_header: message.header,
                         _retention: message.retention,
                         items: page.items,
                         cursor: message.cursor,
@@ -88,12 +102,21 @@ impl State {
                         messages: page.records,
                         fragments: page.fragments,
                         bytes: page.bytes,
-                        cards_bytes: cards
-                            .iter()
-                            .map(|c| serde_json::to_vec(c).map_or(usize::MAX, |bytes| bytes.len()))
-                            .fold(0, usize::saturating_add),
+                        cards_bytes: fragment_messages
+                            .values()
+                            .map(|v| lightcraft_engine::companion::storage::record_size(v).unwrap_or(usize::MAX))
+                            .fold(0usize, usize::saturating_add)
+                            .saturating_add(
+                                cards.iter().map(|c| serde_json::to_vec(c).map_or(usize::MAX, |bytes| bytes.len())).fold(0, usize::saturating_add),
+                            )
+                            .saturating_add(legacy_plan.as_ref().and_then(|p| serde_json::to_vec(p).ok()).map_or(0, |p| p.len()))
+                            .saturating_add(preview.as_ref().map_or(0, historical::Preview::bytes)),
                         cards,
+                        fragment_messages,
                         diagnostic,
+                        legacy_plan,
+                        legacy_scan: None,
+                        preview,
                         card_cursor: None,
                         card_pending: BTreeSet::new(),
                         card_owners: VecDeque::new(),
@@ -101,24 +124,57 @@ impl State {
                     });
                     self.accept_page(app, message.scope.photo, message.cursor);
                 }
-                Err(error) => {
+                ReadContent::Preview(preview) => {
+                    if let Some(view) = conversation.view.as_mut()
+                        && view.captured_header == message.header
+                        && view.cursor == message.cursor
+                    {
+                        view.cards_bytes = view.cards_bytes.saturating_sub(view.preview.as_ref().map_or(0, historical::Preview::bytes));
+                        view.cards_bytes = view.cards_bytes.saturating_add(preview.as_ref().map_or(0, historical::Preview::bytes));
+                        view.preview = preview;
+                    }
+                }
+                ReadContent::Page(Err(error)) => {
                     conversation.notice = error;
                     conversation.view = Some(HistoryView {
+                        captured_header: message.header,
                         _retention: message.retention,
                         items: Vec::new(),
                         cursor: message.cursor,
                         next: None,
                         messages: Vec::new(),
                         fragments: Vec::new(),
+                        fragment_messages: BTreeMap::new(),
                         bytes: 0,
                         cards: Vec::new(),
                         diagnostic: None,
+                        legacy_plan: None,
+                        legacy_scan: None,
+                        preview: None,
                         cards_bytes: 0,
                         card_cursor: None,
                         card_pending: BTreeSet::new(),
                         card_owners: VecDeque::new(),
                         card_scan: None,
                     });
+                }
+            }
+        }
+        if let Some(photo) = self.displayed_photo(app)
+            && let Some(conversation) = self.conversations.get_mut(&photo)
+            && let Some(view) = conversation.view.as_mut()
+            && let Some(scan) = view.legacy_scan.as_mut()
+        {
+            match app.session.companion_display_step(scan) {
+                Ok(Some(plan)) => {
+                    view.cards_bytes = view.cards_bytes.saturating_add(serde_json::to_vec(&plan).map_or(usize::MAX, |b| b.len()));
+                    view.legacy_plan = Some(plan);
+                    view.legacy_scan = None;
+                }
+                Ok(None) => return,
+                Err(e) => {
+                    conversation.notice = e.to_string();
+                    view.legacy_scan = None;
                 }
             }
         }
@@ -138,7 +194,27 @@ impl State {
                     Ok(Some(record)) => {
                         match scan.target() {
                             DisplayRecord::Message(_) => {
-                                view.card_owners.pop_front();
+                                if let Some(owner) = view.card_owners.pop_front() {
+                                    let mut presentation = record.clone();
+                                    if let Some(object) = presentation.as_object_mut() {
+                                        object.retain(|key, _| {
+                                            matches!(
+                                                key.as_str(),
+                                                "role"
+                                                    | "display_kind"
+                                                    | "authored_text_bytes"
+                                                    | "legacy_hidden_text"
+                                                    | "local_message_id"
+                                                    | "local_round_id"
+                                                    | "images"
+                                            )
+                                        });
+                                    }
+                                    view.cards_bytes = view
+                                        .cards_bytes
+                                        .saturating_add(lightcraft_engine::companion::storage::record_size(&presentation).unwrap_or(usize::MAX));
+                                    view.fragment_messages.insert(owner, presentation);
+                                }
                                 if let Some(id) = record["local_round_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 128) {
                                     view.card_pending.insert(id.to_owned());
                                 }
@@ -159,6 +235,9 @@ impl State {
                                     }
                                 }
                             }
+                            DisplayRecord::LegacyPlan(_) => {
+                                view.legacy_plan = Some(record);
+                            }
                         }
                         view.card_scan = None;
                         if view.card_owners.is_empty() && view.card_pending.is_empty() {
@@ -172,6 +251,22 @@ impl State {
                         view.card_scan = None;
                     }
                 }
+            }
+        }
+        if let Some(photo) = self.displayed_photo(app)
+            && self.bottom_reading.contains(&photo)
+            && !self.paging.busy()
+            && !self.paging.awaiting_page(photo)
+            && let Some(view) = self.conversations.get(&photo).and_then(|c| c.view.as_ref())
+            && view.card_cursor.is_none()
+        {
+            if let Some(next) = view.next {
+                if let Err(error) = self.request_page(app, photo, next) {
+                    self.text = error;
+                    self.bottom_reading.remove(&photo);
+                }
+            } else {
+                self.bottom_reading.remove(&photo);
             }
         }
         if !self.paging.busy()
@@ -190,15 +285,32 @@ impl State {
     }
     pub(super) fn request_page(&mut self, app: &mut LightcraftApp, photo: PhotoId, cursor: HistoryCursor) -> Result<(), String> {
         let Some(header) = self.conversations.get(&photo).and_then(|c| c.prefix.clone()) else { return Ok(()) };
-        if self.paging.busy() && self.paging.desired.as_ref().is_some_and(|r| r.scope.photo == photo && r.header == header && r.cursor == cursor) {
+        if self.paging.busy()
+            && self.paging.desired.as_ref().is_some_and(|r| {
+                r.scope.photo == photo
+                    && r.header == header
+                    && r.cursor == cursor
+                    && r.legacy_cursor == self.conversations.get(&photo).map(|c| c.legacy_cursor).unwrap_or(0)
+                    && r.preview_cursor == self.conversations.get(&photo).map(|c| c.preview_cursor).unwrap_or(0)
+            })
+        {
             return Ok(());
         }
         self.paging.sequence = self.paging.sequence.checked_add(1).ok_or_else(|| tr("AI history preparation failed. Try again.").to_owned())?;
         let request = PageRequest {
             id: self.paging.sequence,
             scope: PhotoScope { library_generation: app.session.library_generation(), photo },
-            header,
+            header: header.clone(),
             cursor,
+            legacy_cursor: self.conversations.get(&photo).map(|c| c.legacy_cursor).unwrap_or(0),
+            preview_cursor: self.conversations.get(&photo).map(|c| c.preview_cursor).unwrap_or(0),
+            presentation: self
+                .conversations
+                .get(&photo)
+                .and_then(|c| c.view.as_ref())
+                .filter(|v| v.captured_header == header)
+                .map(|v| v.fragment_messages.clone())
+                .unwrap_or_default(),
         };
         self.paging.desired = Some(request.clone());
         if self.paging.busy() {
@@ -239,6 +351,7 @@ impl State {
                         let mut cards = Vec::new();
                         let mut notice = None;
                         let mut diagnostic = None;
+                        let mut fragment_messages = BTreeMap::new();
                         // Exact recorded ids, never inferred from neighbouring rounds.
                         let mut wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
                         for item in &page.items {
@@ -246,16 +359,23 @@ impl State {
                                 break;
                             }
                             if let lightcraft_engine::companion::storage::HistoryItem::Fragment { record, .. } = item {
-                                match reader.message_round_id(*record) {
-                                    Ok(Some(id)) => {
-                                        wanted.insert(id);
+                                let selected = if let Some(message) = request.presentation.get(record) {
+                                    Ok(message.clone())
+                                } else {
+                                    reader.message_display(*record)
+                                };
+                                match selected {
+                                    Ok(message) => {
+                                        if let Some(id) = message["local_round_id"].as_str() {
+                                            wanted.insert(id.to_owned());
+                                        }
+                                        fragment_messages.insert(*record, message);
                                     }
-                                    Ok(None) => {}
                                     Err(error) => notice = Some(error.to_string()),
                                 }
                             }
                         }
-                        while !wanted.is_empty() && !cancel.load(Ordering::Relaxed) {
+                        while !request.header.legacy_migrated && !wanted.is_empty() && !cancel.load(Ordering::Relaxed) {
                             let rounds = match reader.rounds_display(cursor, 32) {
                                 Ok(rounds) => rounds,
                                 Err(error) => {
@@ -279,24 +399,81 @@ impl State {
                             let Some(next) = rounds.next_cursor else { break };
                             cursor = next;
                         }
-                        (page, cards, notice, diagnostic)
+                        let legacy_plan = if request.header.legacy_plan_count() > 0 {
+                            match reader.legacy_plan(request.legacy_cursor) {
+                                Ok(plan) => Some(plan),
+                                Err(e) => {
+                                    notice = Some(e.to_string());
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let preview = if request.header.original_message_count() > 0 {
+                            historical::read_native(&mut reader, &page, request.preview_cursor)
+                        } else {
+                            None
+                        };
+                        (page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages)
                     });
                     if !cancel.load(Ordering::Relaxed) {
                         let _ = tx.try_send(ReadMessage {
                             retention: reader.into_retention(),
                             request: request.id,
                             scope: request.scope,
+                            header: request.header.clone(),
                             transaction: request.header.transaction_id,
                             cursor: request.cursor,
-                            result,
+                            result: ReadContent::Page(result.map(|(page, cards, notice, diagnostic, legacy_plan, preview, presentation)| {
+                                (Box::new(page), cards, notice, diagnostic, legacy_plan, preview, presentation)
+                            })),
                         });
                     }
                 })
                 .map_err(|e| e.to_string())?;
         } else {
-            let result = self.read_page(app, request.scope.photo, request.cursor);
-            self.paging.completed = request.id;
-            result?;
+            self.read_page(app, request.scope.photo, request.cursor)?;
+            let page = self.conversations.get(&request.scope.photo).and_then(|c| c.view.as_ref()).map(|view| HistorySlice {
+                items: view.items.clone(),
+                records: view.messages.clone(),
+                fragments: view.fragments.clone(),
+                next: view.next,
+                bytes: view.bytes,
+            });
+            if let Some(page) =
+                page.filter(|page| request.header.original_message_count() > 0 && (!page.records.is_empty() || !page.fragments.is_empty()))
+                && let Some(mut reader) = app.session.companion_owned_history_reader(&request.header).map_err(|e| e.to_string())?
+            {
+                let tx = self.paging.tx.clone();
+                self.paging.cancel = Arc::new(AtomicBool::new(false));
+                let cancel = self.paging.cancel.clone();
+                self.paging.alive.store(true, Ordering::Relaxed);
+                let guard = WorkerAlive(self.paging.alive.clone());
+                std::thread::Builder::new()
+                    .name("companion-history-preview".into())
+                    .spawn(move || {
+                        let _guard = guard;
+                        if cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let preview = historical::read_native(&mut reader, &page, request.preview_cursor);
+                        if !cancel.load(Ordering::Relaxed) {
+                            let _ = tx.try_send(ReadMessage {
+                                retention: reader.into_retention(),
+                                request: request.id,
+                                scope: request.scope,
+                                header: request.header.clone(),
+                                transaction: request.header.transaction_id,
+                                cursor: request.cursor,
+                                result: ReadContent::Preview(preview),
+                            });
+                        }
+                    })
+                    .map_err(|e| e.to_string())?;
+            } else {
+                self.paging.completed = request.id;
+            }
         }
         Ok(())
     }
@@ -335,13 +512,16 @@ fn assemble(
     prompt: &str,
     settings: &DevelopSettings,
 ) -> Result<Vec<Value>, String> {
+    if !reader.header().history_complete() {
+        return Err(projection::invalid());
+    }
     let mut projection = projection::HistoryProjection::new(reader.header().photo_id);
     let mut cursor = 0;
     while cursor < reader.header().message_count {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        let page = reader.messages(cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
+        let page = reader.protocol_messages(cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
         for message in &page.records {
             projection.push_cancellable(message, |picture| reader.preview(picture).map_err(|e| e.to_string()), || cancel.load(Ordering::Relaxed))?;
         }

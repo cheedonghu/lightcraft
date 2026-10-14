@@ -162,6 +162,18 @@ pub fn write_atomic_with(path: &Path, fill: &mut dyn FnMut(&mut dyn Write) -> io
     replace_with(path, true, fill)
 }
 
+/// Durable replacement with a source-identity check after the new temp file is
+/// fully synced and immediately before publication. The owning library lock and
+/// writer coordination remain the caller's responsibility.
+pub(crate) fn write_atomic_checked(path: &Path, data: &[u8], check: &mut dyn FnMut() -> io::Result<()>) -> io::Result<()> {
+    let (tmp, _) = write_temp(path, true, &mut |writer| writer.write_all(data))?;
+    let result = check().and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Replace (or create) `path` with `data` atomically but **without syncing** it to disk — only for
 /// outputs that can always be recreated (exports, renders, screenshots); see the module docs.
 /// Anything that can't be made again goes through [`write_atomic`].

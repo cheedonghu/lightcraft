@@ -21,6 +21,7 @@ pub(crate) struct Archive {
     pub(super) editors: super::editor::Editors,
     pub(super) photos: BTreeMap<PhotoId, Value>,
     pub(super) legacy: bool,
+    pub(super) migration: Option<super::migration::Task>,
     pub(super) v2: bool,
     pub(super) tails: BTreeMap<PhotoId, super::storage::TailUpdate>,
     pub(super) prefixes: BTreeMap<PhotoId, super::storage::PhotoHeader>,
@@ -59,19 +60,16 @@ impl Archive {
         let pins = super::storage::reader_pins::for_store(store);
         let mut archive = Self::default();
         let mut read = || -> Result<()> {
-            let Some(bytes) = store.read_limited(STATE_FILE, MAX_ARCHIVE).map_err(error)? else { return Ok(()) };
-            let root: Value = serde_json::from_slice(&bytes).map_err(error)?;
-            if root["format"] == "lightcraft-companion" && root["version"] == 2 && root["layout"] == "photo-head-v2" {
-                archive.v2 = true;
-                return Ok(());
+            match super::migration::Task::open(store) {
+                Ok(Some((v2, migration))) => {
+                    archive.v2 = v2;
+                    archive.legacy = migration.is_some();
+                    archive.migration = migration;
+                    Ok(())
+                }
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
             }
-            let saved: Saved = serde_json::from_slice(&bytes).map_err(error)?;
-            if saved.format != "lightcraft-companion" || saved.version != 1 {
-                return Err(error("unsupported format; the file was left unchanged"));
-            }
-            archive.photos = saved.photos;
-            archive.legacy = true;
-            Ok(())
         };
         if let Err(e) = read() {
             log::error!("{e}");
@@ -104,7 +102,8 @@ impl Archive {
         self.retry_at = Some(web_time::Instant::now() + std::time::Duration::from_secs(2));
     }
     pub(crate) fn needs_retry(&self) -> bool {
-        let data = self.dirty
+        let data = self.migration.is_some()
+            || self.dirty
             || !self.tails.is_empty()
             || !self.dirty_photos.is_empty()
             || !self.revert_dirty.is_empty()
@@ -176,7 +175,8 @@ impl Archive {
         self.error
             .as_deref()
             .filter(|_| {
-                self.dirty
+                self.migration.is_some()
+                    || self.dirty
                     || !self.tails.is_empty()
                     || !self.dirty_photos.is_empty()
                     || !self.revert_dirty.is_empty()
@@ -186,6 +186,9 @@ impl Archive {
             .or_else(|| self.editors.unsaved())
     }
     fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {
+        if self.migration.is_some() {
+            return Ok(());
+        }
         if let Some(e) = &self.blocked {
             if self.dirty
                 || !self.tails.is_empty()
@@ -299,7 +302,7 @@ impl Archive {
             if bytes.len() as u64 > MAX_ARCHIVE {
                 return Err(error("file exceeds 64 MiB"));
             }
-            library.files.write_atomic(STATE_FILE, &bytes).map_err(error)
+            super::migration::write_legacy(library.files.as_mut(), &bytes)
         })();
         match result {
             Ok(()) => {
@@ -315,6 +318,31 @@ impl Archive {
             }
         }
     }
+    pub(super) fn retry_now(&mut self) {
+        self.retry_at = None;
+    }
+    fn migrate(&mut self, store: &mut dyn Store, lock: Option<std::sync::Arc<lightcraft_catalog::LibraryLock>>, generation: u64) -> Result<()> {
+        let result = self.migration.as_mut().ok_or_else(|| error("migration missing"))?.drive(store, lock, generation);
+        match result {
+            Ok(true) => {
+                self.v2 = true;
+                self.legacy = false;
+                self.migration = None;
+                self.error = None;
+                self.dirty = false;
+                Ok(())
+            }
+            Ok(false) => {
+                self.error = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                self.retry_at = Some(web_time::Instant::now() + std::time::Duration::from_secs(2));
+                Err(crate::EngineError::NotSaved(e.to_string()))
+            }
+        }
+    }
 }
 impl Session {
     pub fn photo_companion(&self, photo: PhotoId) -> Result<Option<&Value>> {
@@ -324,6 +352,9 @@ impl Session {
         Ok(self.companion_archive.photos.get(&photo))
     }
     pub fn set_photo_companion(&mut self, photo: PhotoId, conversation: Option<Value>) -> Result<()> {
+        if self.companion_migration_pending() {
+            return Err(error("legacy migration pauses AI save and conversation deletion"));
+        }
         if self.catalog.photo(photo).is_none() {
             return Err(error("no such photo"));
         }
@@ -383,8 +414,13 @@ impl Session {
                 std::sync::Arc::make_mut(proof).record = Some((epoch, ordinal));
             }
         }
+        let generation = self.library_generation();
         match self.library.as_mut() {
             Some(lib) => {
+                if self.companion_archive.migration.is_some() {
+                    let lock = lib.retain_read_lock();
+                    self.companion_archive.migrate(lib.files.as_mut(), lock, generation)?;
+                }
                 let editor_dirty = self.companion_archive.editors.dirty();
                 if editor_dirty && !self.companion_archive.legacy && self.companion_archive.blocked.is_none() {
                     self.companion_archive.v2 = true;
@@ -524,3 +560,41 @@ fn remove_legacy(op: &mut Value) -> bool {
 #[cfg(test)]
 #[path = "archive_tests.rs"]
 mod tests;
+
+/// Owned bounded reader for known v1 preview paths. It retains the native library
+/// lock while actual I/O is in flight; callers transfer only the guard to a view.
+pub struct CompanionAttachmentReader {
+    store: Box<dyn Store>,
+    photo: PhotoId,
+    retention: CompanionAttachmentRetention,
+}
+pub struct CompanionAttachmentRetention {
+    _lock: Option<std::sync::Arc<lightcraft_catalog::LibraryLock>>,
+}
+impl CompanionAttachmentReader {
+    pub fn read(&mut self, image: &Value) -> Result<Vec<u8>> {
+        let name = image["attachment"].as_str().ok_or_else(|| error("preview reference missing"))?;
+        validate_attachment(name)?;
+        let prefix = format!("companion/preview-{}-", self.photo.0);
+        let digest = name.strip_prefix(&prefix).and_then(|s| s.strip_suffix(".bin")).ok_or_else(|| error("preview belongs to another photo"))?;
+        let bytes = self.store.read_limited(name, 128 * 1024).map_err(error)?.ok_or_else(|| error("preview missing"))?;
+        if format!("{:032x}", lightcraft_preview::hash_bytes(&bytes).0) != digest {
+            return Err(error("preview digest mismatch"));
+        }
+        super::validate_history_image(image["mime_type"].as_str().unwrap_or_default(), &bytes).map_err(error)?;
+        Ok(bytes)
+    }
+    pub fn into_retention(self) -> CompanionAttachmentRetention {
+        self.retention
+    }
+}
+impl Session {
+    pub fn companion_attachment_reader(&self, photo: PhotoId) -> Result<Option<CompanionAttachmentReader>> {
+        let library = self.library.as_ref().ok_or_else(|| error("library closed"))?;
+        let Some(store) = library.files.background_writer() else { return Ok(None) };
+        if library.files.retention_namespace().is_none() {
+            return Err(error("preview reader requires stable Store namespace"));
+        }
+        Ok(Some(CompanionAttachmentReader { store, photo, retention: CompanionAttachmentRetention { _lock: library.retain_read_lock() } }))
+    }
+}

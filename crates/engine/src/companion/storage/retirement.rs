@@ -428,6 +428,9 @@ impl Session {
     /// Reclamation never changes photo parameters or committed dialogue. Errors
     /// represent cleanup debt and can be retried independently of archive saving.
     pub fn collect_companion(&mut self, photo: PhotoId, budget: usize) -> Result<CleanupReport> {
+        if self.companion_migration_pending() || self.companion_archive.legacy || self.companion_archive.blocked.is_some() {
+            return Err(error("legacy, unsupported or unconfirmed archive; files protected"));
+        }
         let mut retained = self.companion_retained_headers(photo);
         let pins = self.companion_archive.readers.clone();
         let protection = pins.physical_pause();

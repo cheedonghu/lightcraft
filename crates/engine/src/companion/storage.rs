@@ -11,6 +11,7 @@ const SMALL: u64 = 32 * 1024;
 const BLOCK: u64 = 4 * 1024 * 1024;
 const PAGE_ITEMS: usize = 128;
 const PACK_ITEMS: usize = 32;
+pub(super) mod migration;
 mod pagination;
 pub(super) mod reader_pins;
 mod recovery;
@@ -42,6 +43,27 @@ pub struct PhotoHeader {
     pub metadata_chunk_payload: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_patch: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_migrated: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_history_incomplete: bool,
+    #[serde(default)]
+    pub legacy_round_count: u64,
+    #[serde(default)]
+    pub legacy_record_count: u64,
+    #[serde(default)]
+    pub legacy_message_count: u64,
+}
+impl PhotoHeader {
+    pub fn history_complete(&self) -> bool {
+        !self.legacy_history_incomplete
+    }
+    pub fn legacy_plan_count(&self) -> u64 {
+        self.legacy_round_count.saturating_add(self.legacy_record_count)
+    }
+    pub fn original_message_count(&self) -> u64 {
+        if self.legacy_message_count == 0 && self.legacy_migrated { self.message_count } else { self.legacy_message_count.min(self.message_count) }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRoot {
@@ -75,6 +97,8 @@ struct Entry {
     chunk_payload: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text_range: Option<[u64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_range_version: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     preview_refs: Option<Vec<String>>,
 }
@@ -311,6 +335,7 @@ impl Writer<'_> {
                 self.block(&mut bytes, &mut offsets, &mut entries)?;
                 let mut entry = pagination::stream_record(self, record, length)?;
                 entry.text_range = pagination::text_range(record, None)?;
+                entry.text_range_version = Some(1);
                 entry.preview_refs = preview_inventory(record);
                 entries.push(entry);
             } else {
@@ -364,7 +389,16 @@ impl Writer<'_> {
         }
         let key = self.file("blocks/", "bin", bytes)?;
         for (offset, length, digest, text_range, preview_refs) in offsets.drain(..) {
-            entries.push(Entry { block: key.clone(), offset, length, digest, chunk_payload: None, text_range, preview_refs });
+            entries.push(Entry {
+                block: key.clone(),
+                offset,
+                length,
+                digest,
+                chunk_payload: None,
+                text_range,
+                text_range_version: Some(1),
+                preview_refs,
+            });
         }
         bytes.clear();
         Ok(())
@@ -445,6 +479,11 @@ pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, expected_epoch: u64, 
         metadata_length,
         metadata_chunk_payload: None,
         record_patch: None,
+        legacy_migrated: false,
+        legacy_history_incomplete: false,
+        legacy_round_count: 0,
+        legacy_record_count: 0,
+        legacy_message_count: 0,
     };
     write(writer.store, &writer.pending.head.manifest, &manifest)?;
     writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
@@ -461,7 +500,11 @@ fn verify_suffix(store: &mut dyn Store, manifest: &PhotoHeader, reuse: Option<&P
 fn verify_suffix_from(store: &mut dyn Store, manifest: &PhotoHeader, reuse: Option<&PhotoHeader>, from: Option<[u64; 3]>) -> Result<()> {
     validate_key(manifest.photo_id, &manifest.metadata, "blocks/")?;
     let entry = pagination::metadata_entry(manifest)?;
-    pagination::verify_record(store, manifest.photo_id, &entry)?;
+    if manifest.legacy_migrated {
+        migration::verify_record(store, manifest.photo_id, &entry)?;
+    } else {
+        pagination::verify_record(store, manifest.photo_id, &entry)?;
+    }
     for (ordinal, (root, count, messages, start)) in [
         (manifest.message_root.as_ref(), manifest.message_count, true, reuse.map(|h| h.message_count).unwrap_or(0)),
         (manifest.round_root.as_ref(), manifest.round_count, false, reuse.map(|h| h.round_count).unwrap_or(0)),
@@ -476,8 +519,15 @@ fn verify_suffix_from(store: &mut dyn Store, manifest: &PhotoHeader, reuse: Opti
         }
         while cursor < count {
             let entry = pagination::entry(store, manifest.photo_id, root, count, cursor)?;
-            pagination::verify_record(store, manifest.photo_id, &entry)?;
-            if messages && entry.length as u64 <= BLOCK {
+            if manifest.legacy_migrated {
+                migration::verify_record(store, manifest.photo_id, &entry)?;
+            } else {
+                pagination::verify_record(store, manifest.photo_id, &entry)?;
+            }
+            if messages && manifest.legacy_migrated {
+                migration::prove_references(store, manifest.photo_id, &entry)?;
+            }
+            if messages && !manifest.legacy_migrated && entry.length as u64 <= BLOCK {
                 let bytes = pagination::range(store, manifest.photo_id, &entry, 0, entry.length)?;
                 let message: Value = serde_json::from_slice(&bytes).map_err(error)?;
                 if let Some(images) = message.get("images").and_then(Value::as_array) {
@@ -558,7 +608,7 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
     // durability confirmation after a possible rename/directory-sync error.
     write(store, &head_key, &pending.head)?;
     let manifest = header(store, pending.photo)?.ok_or_else(|| error("committed manifest missing"))?;
-    let metadata = pagination::metadata_raw(store, &manifest)?;
+    let metadata = if manifest.legacy_migrated { json!({"checkpoint":null}) } else { pagination::metadata_raw(store, &manifest)? };
     let live_revert = super::revert_guard::read_guard(store, pending.photo)?;
     let revert = pending.revert_override.as_ref();
     let override_eligible = revert.map(|r| {
@@ -575,8 +625,9 @@ pub(crate) fn commit(store: &mut dyn Store, pending: &PendingCommit) -> Result<(
             && r.get("local_round_id") == local_round_id
             && (r["transaction_id"] == pending.transaction_id || pending.old_head.as_ref().is_some_and(|h| r["transaction_id"] == h.transaction_id))
     });
-    let eligible =
-        !invalidated && override_eligible.unwrap_or_else(|| metadata.pointer("/checkpoint/eligible").and_then(Value::as_bool).unwrap_or(false));
+    let eligible = !staged.legacy_migrated
+        && !invalidated
+        && override_eligible.unwrap_or_else(|| metadata.pointer("/checkpoint/eligible").and_then(Value::as_bool).unwrap_or(false));
     let mut guard = live_revert.unwrap_or_else(|| json!({}));
     guard["transaction_id"] = json!(pending.transaction_id);
     guard["local_round_id"] = json!(local_round_id);
@@ -616,13 +667,17 @@ pub(crate) fn published_pending_transaction(store: &mut dyn Store, photo: PhotoI
     Ok(p.filter(|p| !p.head.manifest_digest.is_empty()).map(|p| p.transaction_id))
 }
 pub(crate) fn activate(store: &mut dyn Store) -> Result<()> {
-    if let Some(root) = read::<Value>(store, STATE_FILE, SMALL)?
-        && (root["format"] != FORMAT || root["version"] != 2 || root["layout"] != "photo-head-v2")
-    {
-        return Err(error("activation refuses an existing legacy or unknown root"));
+    if let Some(bytes) = store.read_limited(STATE_FILE, SMALL).map_err(error)? {
+        if !super::migration::known_v2_root(&bytes)? {
+            return Err(error("activation refuses an existing legacy or unknown root"));
+        }
+        // Confirmation preserves all owned recoverability metadata, including
+        // the exact v1 backup proof. Repeating these same bytes proves durability.
+        return store.write_atomic(STATE_FILE, &bytes).map_err(error);
     }
     write(store, STATE_FILE, &json!({"format":FORMAT,"version":2,"layout":"photo-head-v2"}))
 }
+
 impl Session {
     /// Retain a main-frame/resumable reader from capture until actual retirement.
     pub fn retain_companion_history(&mut self, header: &PhotoHeader) -> Result<HistoryRetention> {
@@ -656,6 +711,9 @@ impl Session {
             || self.companion_archive.receipts.contains_key(&photo)
     }
     pub fn companion_photo_header(&mut self, photo: PhotoId) -> Result<Option<PhotoHeader>> {
+        if self.companion_archive.legacy || self.companion_archive.blocked.is_some() {
+            return Ok(None);
+        }
         let lib = self.library.as_mut().ok_or_else(|| error("library closed"))?;
         let h = header(lib.files.as_mut(), photo)?;
         if h.is_some() && self.companion_archive.v2 {
@@ -715,6 +773,9 @@ impl Session {
         stage(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), photo, expected_epoch, conversation)
     }
     pub fn companion_commit(&mut self, pending: &PendingCommit) -> Result<CommitReceipt> {
+        if self.companion_migration_pending() {
+            return Err(error("legacy migration pauses AI save and conversation deletion"));
+        }
         let store = self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut();
         commit(store, pending)?;
         if !self.companion_archive.v2 {
@@ -781,6 +842,9 @@ impl Session {
             return Ok(self.companion_archive.photos.get(&photo).cloned());
         }
         if !self.companion_archive.v2 {
+            if let Some(migration) = self.companion_archive.migration.as_mut() {
+                return migration.conversation(photo);
+            }
             return Ok(self.photo_companion(photo)?.cloned());
         }
         let Some(h) = self.companion_photo_header(photo)? else { return Ok(None) };

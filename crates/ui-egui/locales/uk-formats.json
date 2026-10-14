@@ -258,5 +258,7 @@
   "{faces} faces learned.": "{faces} faces learned.",
   "{before} → {after}": "{before} → {after}",
   "Point Color {n}": "Point Color {n}",
-  "View AI task for {photo}": "View AI task for {photo}"
+  "View AI task for {photo}": "View AI task for {photo}",
+  "Legacy plan {n} of {total}": "Legacy plan {n} of {total}",
+  "{parameter}: {value}": "{parameter}: {value}"
 }

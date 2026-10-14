@@ -87,11 +87,19 @@ fn stopped_multi_tool_batch_reopens_and_next_real_input_has_all_true_results() {
     app.session.close_library().unwrap();
     drop(state);
     let mut app = make_app();
-    let (connection, requests, _) = network::test_connection();
-    let mut state = State { consent: true, connection: Some(connection), ..Default::default() };
-    state.start(&mut app).unwrap();
-    requests.try_recv().unwrap();
-    let history = &state.jobs[&photo].history;
+    let (connection, requests, events) = network::test_connection();
+    app.ai.next_connection = Some(connection);
+    let mut h = crate::headless::Headless::new(app, [1100., 750.], 1.);
+    h.app.run("ai.open", json!({})).unwrap();
+    h.step();
+    h.step();
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(5))["ok"], true);
+    h.app.run("ai.start", json!({"prompt":"next explicit request"})).unwrap();
+    let creation = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
+    let identity = creation.identity;
+    events.send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"next","payload":{"submission_seq":identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":identity.scope.library_generation},"state":"awaiting_input"}}) }).unwrap();
+    let request = native_history_tests::outgoing(&mut h, &requests, "/input");
+    let history = request.body["history"].as_array().unwrap();
     let tools: Vec<_> = history.iter().filter(|m| m["role"] == "tool").collect();
     assert_eq!(tools.len(), 3);
     assert_eq!(tools[0]["tool_call_id"], "z-done");
@@ -103,12 +111,6 @@ fn stopped_multi_tool_batch_reopens_and_next_real_input_has_all_true_results() {
         assert_eq!(result["executed"], false);
     }
     assert!(!history.iter().any(|m| m["text"].as_str().unwrap_or("").contains("MUST NOT PROJECT")));
-    let identity = state.jobs[&photo].identity.clone();
-    state.server(&mut app,&egui::Context::default(),"round.state",&json!({"round_id":"next","payload":{"submission_seq":identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":identity.scope.library_generation},"state":"awaiting_input"}})).unwrap();
-    let render = state.rx.recv_timeout(Duration::from_secs(30)).unwrap();
-    state.prepared(&mut app, &egui::Context::default(), render).unwrap();
-    let request = requests.try_recv().unwrap();
-    assert!(request.path.ends_with("/input"));
     if let Ok(path) = std::env::var("UX11_HISTORY_FIXTURE") {
         std::fs::write(path, serde_json::to_vec_pretty(&request.body).unwrap()).unwrap();
     }
@@ -312,7 +314,11 @@ fn start_command_refuses_ambiguous_legacy_image_and_allows_next_ordinary_edit() 
     h.step();
     h.step();
     assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
-    let error = h.app.run("ai.start", json!({"prompt":"current request"})).unwrap_err();
+    let started = h.app.run("ai.start", json!({"prompt":"current request"}));
+    let error = match started {
+        Err(error) => error,
+        Ok(_) => native_history_tests::wait_idle(&mut h, &requests)["text"].as_str().unwrap().to_owned(),
+    };
     assert!(error.contains("history is incomplete or invalid"), "{error}");
     assert!(requests.try_recv().is_err(), "no creation request should reach the transport adapter");
     h.app.run("develop.set", json!({"control":"light.exposure","value":0.7})).unwrap();
@@ -347,6 +353,12 @@ fn start_refuses_truncated_historical_jpeg_and_keeps_valid_jpeg_usable() {
         );
         let mut session = lightcraft_engine::Session::new();
         session.open_library_in(stores(), false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.companion_migration_pending() && Instant::now() < deadline {
+            let _ = session.persist();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!session.companion_migration_pending(), "migration must finish before testing image-specific admission");
         let mut app = LightcraftApp::new(session, crate::Services::default());
         let (connection, requests, _events) = network::test_connection();
         app.ai.generation = app.session.library_generation();
@@ -358,15 +370,27 @@ fn start_refuses_truncated_historical_jpeg_and_keeps_valid_jpeg_usable() {
         assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
         let result = h.app.run("ai.start", json!({"prompt":"current request"}));
         if refused {
-            let error = result.unwrap_err();
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => native_history_tests::wait_idle(&mut h, &requests)["text"].as_str().unwrap().to_owned(),
+            };
             assert!(error.contains("history is incomplete or invalid"), "{error}");
             assert!(requests.try_recv().is_err(), "corrupt JPEG must not create/upload a round");
-            assert_eq!(h.app.session.load_companion_conversation(photo).unwrap().unwrap(), saved, "complete local history is still readable");
+            assert_eq!(
+                h.app.session.companion_messages_page(photo, 0, 1).unwrap().records,
+                saved["messages"].as_array().unwrap().clone(),
+                "complete original messages remain readable"
+            );
+            assert_eq!(
+                files.get("companion/state.v1.backup.json"),
+                Some(serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():saved}})).unwrap()),
+                "the exact original archive remains recoverable"
+            );
             h.app.run("develop.set", json!({"control":"light.exposure","value":0.7})).unwrap();
             assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.7);
         } else {
             assert_eq!(result.unwrap()["started"], true);
-            assert_eq!(requests.try_recv().unwrap().path, "/v1/rounds");
+            assert_eq!(native_history_tests::outgoing(&mut h, &requests, "/v1/rounds").path, "/v1/rounds");
         }
     }
 }
@@ -401,6 +425,12 @@ fn start_refuses_service_unsupported_lossless_jpeg_and_keeps_normal_jpeg_usable(
         );
         let mut session = lightcraft_engine::Session::new();
         session.open_library_in(stores(), false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.companion_migration_pending() && Instant::now() < deadline {
+            let _ = session.persist();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!session.companion_migration_pending(), "migration must finish before testing image-specific admission");
         let mut app = LightcraftApp::new(session, crate::Services::default());
         let (connection, requests, _events) = network::test_connection();
         app.ai.generation = app.session.library_generation();
@@ -412,15 +442,27 @@ fn start_refuses_service_unsupported_lossless_jpeg_and_keeps_normal_jpeg_usable(
         assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
         let result = h.app.run("ai.start", json!({"prompt":"current request"}));
         if refused {
-            let error = result.unwrap_err();
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => native_history_tests::wait_idle(&mut h, &requests)["text"].as_str().unwrap().to_owned(),
+            };
             assert!(error.contains("history is incomplete or invalid"), "{error}");
             assert!(requests.try_recv().is_err(), "corrupt JPEG must not create/upload a round");
-            assert_eq!(h.app.session.load_companion_conversation(photo).unwrap().unwrap(), saved, "complete local history is still readable");
+            assert_eq!(
+                h.app.session.companion_messages_page(photo, 0, 1).unwrap().records,
+                saved["messages"].as_array().unwrap().clone(),
+                "complete original messages remain readable"
+            );
+            assert_eq!(
+                files.get("companion/state.v1.backup.json"),
+                Some(serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():saved}})).unwrap()),
+                "the exact original archive remains recoverable"
+            );
             h.app.run("develop.set", json!({"control":"light.exposure","value":0.7})).unwrap();
             assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.7);
         } else {
             assert_eq!(result.unwrap()["started"], true);
-            assert_eq!(requests.try_recv().unwrap().path, "/v1/rounds");
+            assert_eq!(native_history_tests::outgoing(&mut h, &requests, "/v1/rounds").path, "/v1/rounds");
         }
     }
 }

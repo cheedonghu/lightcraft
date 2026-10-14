@@ -75,12 +75,23 @@ impl Session {
     }
 
     pub fn acquire_companion_lease(&mut self, photo: PhotoId, round: LocalRoundId) -> Result<LeaseToken> {
+        if self.companion_migration_pending() {
+            return Err(EngineError::Other("AI history migration is in progress. Photo editing and drafts remain available.".into()));
+        }
+        if let Some(blocked) = &self.companion_archive.blocked {
+            return Err(super::archive::error(blocked));
+        }
         if self.companion_task_photo().is_some() {
             return Err(EngineError::Other("Another AI task is active; stop it or wait for completion.".into()));
         }
         let p = self.catalog.photo(photo).ok_or(lightcraft_catalog::CatalogError::NoPhoto(photo))?;
         if p.deleted {
             return Err(EngineError::Other("This photo is unavailable for AI processing.".into()));
+        }
+        if self.library.is_some() && self.companion_photo_header(photo)?.is_some_and(|header| !header.history_complete()) {
+            return Err(EngineError::Other(
+                "The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.".into(),
+            ));
         }
         // Finish the user's click-time editing transaction before freezing its start.
         self.end_interaction()?;

@@ -524,9 +524,18 @@ impl Session {
     }
     /// Write pending ops to the log (fsynced), compact when due, and save changed presets.
     /// Called after every top-level command; cheap when nothing changed. Fails (with
-    /// [`EngineError::NotSaved`]) only when the queued ops couldn't be written; they stay queued.
+    /// [`EngineError::NotSaved`]) when queued data could not be written or a local
+    /// conversation migration has not retired and published its owning receipt.
+    /// Automatic frame persistence drives that migration without claiming Save readiness.
     pub fn persist(&mut self) -> Result<()> {
-        self.persist_inner(false, true)
+        self.persist_inner(false, true)?;
+        self.ensure_companion_migration_saved()
+    }
+    fn ensure_companion_migration_saved(&self) -> Result<()> {
+        if self.companion_migration_pending() {
+            return Err(EngineError::NotSaved("legacy conversation upgrade is still pending; retry after its producer retires".into()));
+        }
+        Ok(())
     }
     pub(crate) fn persist_automatic(&mut self) -> Result<()> {
         self.persist_inner(self.companion_retry_deferred, true)
@@ -647,6 +656,9 @@ impl Session {
         self.flush_companion()?;
         self.seal_companion_reverts()?;
         self.flush_companion()?;
+        // A live/queued producer is not a durable completion receipt. Keep this
+        // Session and its latest independent editor overlay for the next retry.
+        self.ensure_companion_migration_saved()?;
         self.finish_companion_close()?;
         self.library_identity = std::sync::Arc::new(());
         Ok(())

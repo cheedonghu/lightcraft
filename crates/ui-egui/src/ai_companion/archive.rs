@@ -2,6 +2,15 @@
 use super::*;
 impl State {
     pub(super) fn load(&mut self, app: &mut LightcraftApp, photo: PhotoId) -> Result<(), String> {
+        let pending = app.session.companion_migration_pending();
+        if self.conversations.get(&photo).is_some_and(|c| c.legacy_readonly && c.prefix.is_none()) {
+            // A pre-stage source view is only a bounded compatibility cache; once
+            // a graph/activation is ready, reload it rather than freezing an empty view.
+            self.conversations.remove(&photo);
+        }
+        if !pending && let Some(conversation) = self.conversations.get_mut(&photo) {
+            conversation.legacy_readonly = false;
+        }
         if let Some(conversation) = self.conversations.get(&photo) {
             let prefix = conversation.prefix.clone();
             let loaded = conversation.view.as_ref().map(|view| view.cursor);
@@ -14,14 +23,31 @@ impl State {
             return Ok(());
         }
         let _ = app.session.prepare_companion_revert(photo);
-        let mut conversation =
-            Conversation { scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }), ..Default::default() };
-        let header = if app.session.library.is_some() { app.session.companion_photo_header(photo).map_err(|e| e.to_string())? } else { None };
-        let archive = if let Some(header) = header {
-            conversation.prefix = Some(header);
-            app.session.companion_metadata(photo).map_err(|e| e.to_string())?
+        let mut conversation = Conversation {
+            scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }),
+            legacy_readonly: pending,
+            ..Default::default()
+        };
+        let header = if app.session.library.is_some() {
+            match app.session.companion_photo_header(photo).map_err(|e| e.to_string())? {
+                Some(header) => Some(header),
+                None if pending => app.session.companion_legacy_photo_header(photo).map_err(|e| e.to_string())?,
+                None => None,
+            }
         } else {
-            app.session.photo_companion(photo).map_err(|e| e.to_string())?.cloned()
+            None
+        };
+        let archive = if let Some(header) = header {
+            let metadata = app.session.companion_metadata_at(&header).map_err(|e| e.to_string())?;
+            conversation.prefix = Some(header);
+            Some(metadata)
+        } else if pending {
+            // The owning migration producer will publish a bounded completed
+            // header. Until then retain the independent editor and wait; never
+            // scan/materialize the original v1 conversation on a frame.
+            None
+        } else {
+            app.session.load_companion_conversation(photo).map_err(|e| e.to_string())?
         };
         if let Some(archive) = archive {
             if !matches!(archive.get("schema_version").and_then(Value::as_u64), Some(1 | 2)) {
@@ -138,11 +164,14 @@ impl State {
         let conversation = self.conversations.get(&photo).ok_or("AI 会话不存在。")?;
         let tail = conversation.messages.clone();
         let prefix = conversation.prefix.clone();
+        if prefix.as_ref().is_some_and(|h| !h.history_complete()) {
+            return Err(projection::invalid());
+        }
         let mut projection = projection::HistoryProjection::new(photo);
         if let Some(prefix) = prefix {
             let mut cursor = 0;
             while cursor < prefix.message_count {
-                let page = app.session.companion_messages_bounded(&prefix, cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
+                let page = app.session.companion_protocol_messages_bounded(&prefix, cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
                 for message in &page.records {
                     projection.push(message, |picture| {
                         let name = picture.get("attachment").and_then(Value::as_str).ok_or("AI 预览附件无效。")?;
@@ -179,29 +208,60 @@ impl State {
         // owner/round scans and inactive pauses until the actual view drops.
         let retention = app.session.retain_companion_history(&prefix).map_err(|e| e.to_string())?;
         let page = app.session.companion_history_slice_at(&prefix, cursor, 256 * 1024).map_err(|e| e.to_string())?;
-        let wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
+        let cached = self
+            .conversations
+            .get(&photo)
+            .and_then(|c| c.view.as_ref())
+            .filter(|v| v.captured_header == prefix)
+            .map(|v| v.fragment_messages.clone())
+            .unwrap_or_default();
+        let mut wanted: BTreeSet<_> = page.records.iter().filter_map(|m| m["local_round_id"].as_str()).map(str::to_owned).collect();
+        let mut presentation = BTreeMap::new();
         let owners: VecDeque<_> = page
             .items
             .iter()
             .filter_map(|item| match item {
-                lightcraft_engine::companion::storage::HistoryItem::Fragment { record, .. } => Some(*record),
+                lightcraft_engine::companion::storage::HistoryItem::Fragment { record, .. } => {
+                    if let Some(message) = cached.get(record) {
+                        if let Some(id) = message["local_round_id"].as_str() {
+                            wanted.insert(id.to_owned());
+                        }
+                        presentation.insert(*record, message.clone());
+                        None
+                    } else {
+                        Some(*record)
+                    }
+                }
                 _ => None,
             })
             .collect();
         let total = if prefix.record_count > 0 { prefix.record_count } else { prefix.round_count };
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
         conversation.view = Some(HistoryView {
+            captured_header: prefix.clone(),
             _retention: retention,
             items: page.items,
             cursor,
             next: page.next,
             messages: page.records,
             fragments: page.fragments,
+            fragment_messages: presentation.clone(),
             bytes: page.bytes,
             cards: Vec::new(),
             diagnostic: None,
-            cards_bytes: 0,
-            card_cursor: (total > 0 && (!wanted.is_empty() || !owners.is_empty())).then_some(0),
+            legacy_plan: None,
+            legacy_scan: (prefix.legacy_plan_count() > 0).then(|| {
+                lightcraft_engine::companion::storage::DisplayScan::new(
+                    prefix.clone(),
+                    lightcraft_engine::companion::storage::DisplayRecord::LegacyPlan(conversation.legacy_cursor),
+                )
+            }),
+            preview: None,
+            cards_bytes: presentation
+                .values()
+                .map(|v| lightcraft_engine::companion::storage::record_size(v).unwrap_or(usize::MAX))
+                .fold(0usize, usize::saturating_add),
+            card_cursor: (!owners.is_empty() || (total > 0 && !wanted.is_empty())).then_some(0),
             card_pending: wanted,
             card_owners: owners,
             card_scan: None,
