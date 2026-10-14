@@ -1587,7 +1587,7 @@ fn small_legacy_png_with_deep_additive_image_metadata_keeps_visible_text_and_ima
                 assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(5))["ok"], true);
                 let submitted = h.app.run("ai.start", json!({"prompt":"Continue from the complete original history"}));
                 assert!(submitted.is_ok(), "complete retained history must remain submit-capable: {submitted:?}");
-                requests.recv_timeout(Duration::from_secs(5)).unwrap();
+                native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
                 h.app.run("ai.stop", json!({})).unwrap();
             }
             assert!(h.settle(Duration::from_secs(10)));
@@ -1749,5 +1749,186 @@ fn fragmented_legacy_png_remains_viewable_on_the_real_memory_fallback() {
     assert_eq!(h.app.session.companion_messages_page(photo, 0, 1).unwrap().records, vec![message]);
     assert_eq!(files.get("companion/state.v1.backup.json"), Some(source));
     assert!(h.settle(Duration::from_secs(10)));
+    h.app.session.close_library().unwrap();
+}
+
+#[derive(Default)]
+struct ContextGate {
+    transaction: String,
+    owning_thread: Option<std::thread::ThreadId>,
+    main_reads: usize,
+    entered: bool,
+    released: bool,
+}
+#[derive(Clone)]
+struct GatedMemoryContext {
+    memory: MemStore,
+    gate: Arc<(Mutex<ContextGate>, Condvar)>,
+}
+impl GatedMemoryContext {
+    fn observe(&self, name: &str) {
+        let mut gate = self.gate.0.lock().unwrap();
+        if gate.transaction.is_empty() || !name.contains("/blocks/") || !name.contains(&gate.transaction) {
+            return;
+        }
+        if gate.owning_thread == Some(std::thread::current().id()) {
+            gate.main_reads += 1;
+        } else {
+            gate.entered = true;
+            self.gate.1.notify_all();
+            while !gate.released {
+                gate = self.gate.1.wait(gate).unwrap();
+            }
+        }
+    }
+}
+impl Store for GatedMemoryContext {
+    fn read(&mut self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+        self.observe(name);
+        self.memory.read(name)
+    }
+    fn read_limited(&mut self, name: &str, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+        self.observe(name);
+        self.memory.read_limited(name, limit)
+    }
+    fn read_range(&mut self, name: &str, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        self.observe(name);
+        self.memory.read_range(name, offset, length)
+    }
+    fn write_atomic(&mut self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.memory.write_atomic(name, bytes)
+    }
+    fn append(&mut self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.memory.append(name, bytes)
+    }
+    fn remove(&mut self, name: &str) -> std::io::Result<()> {
+        self.memory.remove(name)
+    }
+    fn truncate(&mut self, name: &str, length: u64) -> std::io::Result<()> {
+        self.memory.truncate(name, length)
+    }
+    fn describe(&self) -> String {
+        self.memory.describe()
+    }
+    fn retention_namespace(&self) -> Option<String> {
+        self.memory.retention_namespace()
+    }
+    fn source_snapshot(&mut self, name: &str) -> std::io::Result<Option<Box<dyn SourceSnapshot>>> {
+        self.memory.source_snapshot(name)
+    }
+    fn copy_source_atomic(&mut self, name: &str, source: &mut dyn SourceSnapshot) -> std::io::Result<()> {
+        self.memory.copy_source_atomic(name, source)
+    }
+    fn replace_source_atomic(&mut self, name: &str, expected: &SourceIdentity, bytes: &[u8]) -> std::io::Result<()> {
+        self.memory.replace_source_atomic(name, expected, bytes)
+    }
+    fn replace_source_atomic_authorized(
+        &mut self,
+        name: &str,
+        expected: &SourceIdentity,
+        bytes: &[u8],
+        authorized: &dyn Fn() -> bool,
+    ) -> std::io::Result<()> {
+        self.memory.replace_source_atomic_authorized(name, expected, bytes, authorized)
+    }
+    fn migration_writer(&self) -> Option<Box<dyn Store>> {
+        Some(Box::new(self.clone()))
+    }
+}
+
+#[test]
+fn memory_history_submission_paints_and_stops_before_captured_record_reader_retires() {
+    let catalog = MemStore::new();
+    let memory = MemStore::new();
+    let mut initial = lightcraft_engine::Session::new();
+    initial
+        .open_library_in(
+            LibraryStores { catalog: Box::new(catalog.clone()), files: Box::new(memory.clone()), dir: "memory-preflight".into(), on_disk: false },
+            true,
+        )
+        .unwrap();
+    let photo = initial.active().unwrap();
+    let png = lightcraft_engine::export::encode_image(
+        &lightcraft_raster::Rgba8::from_fn(32, 32, |_, _| [24, 196, 212, 255]),
+        &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+    )
+    .unwrap();
+    let attachment = initial.library.as_mut().unwrap().companion_attachment(photo, &png).unwrap();
+    initial.close_library().unwrap();
+    let source=serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():{"schema_version":1,"messages":[{"role":"user","text":"Complete original context", "images":[{"mime_type":"image/png","attachment":attachment}],"opaque":"x".repeat(1024*1024)}],"rounds":[]}}})).unwrap();
+    memory.set("companion/state.json", source.clone());
+    let gate = Arc::new((Mutex::new(ContextGate::default()), Condvar::new()));
+    let mut session = lightcraft_engine::Session::new();
+    session
+        .open_library_in(
+            LibraryStores {
+                catalog: Box::new(catalog),
+                files: Box::new(GatedMemoryContext { memory: memory.clone(), gate: gate.clone() }),
+                dir: "memory-preflight".into(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session.companion_migration_pending() {
+        assert!(Instant::now() < deadline);
+        let _ = session.persist();
+        std::thread::yield_now();
+    }
+    let header = session.companion_photo_header(photo).unwrap().unwrap();
+    assert!(header.history_complete());
+    assert!(session.companion_reader(&header).unwrap().is_none(), "this must exercise the actual no-background-page Mem adapter");
+    let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1100., 750.], 1.);
+    h.app.ui.settings.gpu = false;
+    h.app.run("ai.open", json!({})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        h.step();
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["historyLoading"] == false {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{status}");
+        std::thread::yield_now();
+    }
+    assert!(h.settle(Duration::from_secs(15)));
+    let (connection, requests, _) = network::test_connection();
+    h.app.ai.next_connection = Some(connection);
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(5))["ok"], true);
+    {
+        let mut state = gate.0.lock().unwrap();
+        state.transaction = header.transaction_id.clone();
+        state.owning_thread = Some(std::thread::current().id());
+    }
+    let submitted = h.app.run("ai.start", json!({"prompt":"Keep the complete original context"}));
+    let owning_reads = gate.0.lock().unwrap().main_reads;
+    // Always release a genuinely paused filesystem adapter before reporting a
+    // failure, so the test cannot strand an owned producer.
+    if owning_reads != 0 || submitted.is_err() {
+        gate.0.lock().unwrap().released = true;
+        gate.1.notify_all();
+        assert!(submitted.is_ok(), "{submitted:?}");
+        assert_eq!(owning_reads, 0, "submission must not read captured history blocks on the owning thread");
+    }
+    let state = gate.0.lock().unwrap();
+    let (state, _) = gate.1.wait_timeout_while(state, Duration::from_secs(5), |state| !state.entered).unwrap();
+    let entered = state.entered;
+    drop(state);
+    h.step();
+    let painted = h.painted_text().join("\n");
+    let create_before_ready = requests.try_recv().ok();
+    let stopped = h.app.run("ai.stop", json!({}));
+    gate.0.lock().unwrap().released = true;
+    gate.1.notify_all();
+    assert!(entered, "real captured context worker must be paused at its record read");
+    assert!(painted.contains("Submitting") || painted.contains("Preparing"), "{painted}");
+    assert!(create_before_ready.is_none(), "complete context must verify before backend creation");
+    assert!(stopped.is_ok(), "Stop must respond while context I/O is paused: {stopped:?}");
+    assert!(h.settle(Duration::from_secs(15)));
+    assert!(requests.try_recv().is_err(), "cancelled history cannot create a late request");
+    assert!(h.app.session.companion_task_photo().is_none());
+    assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.);
+    assert_eq!(memory.get("companion/state.v1.backup.json"), Some(source));
     h.app.session.close_library().unwrap();
 }

@@ -39,7 +39,7 @@ fn consent(app: LightcraftApp) -> (crate::headless::Headless, mpsc::Receiver<net
     assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     (h, requests, events)
 }
-fn wait_idle(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>) -> Value {
+pub(super) fn wait_idle(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         poll(&mut h.app, &h.view.ctx);
@@ -92,7 +92,7 @@ fn native_current_photo_envelope_overflow_refuses_before_create_without_dropping
     assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.7);
 }
 
-fn outgoing(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>, suffix: &str) -> network::Request {
+pub(super) fn outgoing(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>, suffix: &str) -> network::Request {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         h.step();

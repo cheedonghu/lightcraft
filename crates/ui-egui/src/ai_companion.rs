@@ -431,10 +431,13 @@ impl State {
             .conversations
             .get(&photo)
             .and_then(|c| c.prefix.as_ref())
-            .map(|h| app.session.companion_reader(h))
+            .map(|h| app.session.companion_owned_history_reader(h))
             .transpose()
             .map_err(|e| e.to_string())?
             .flatten();
+        if reader.is_none() && self.conversations.get(&photo).is_some_and(|c| c.prefix.is_some()) {
+            return Err(tr("AI history preparation failed. Try again.").into());
+        }
         let history = if reader.is_some() { Vec::new() } else { self.history(app, photo)? };
         if reader.is_none() {
             projection::reserve_input(&history, &prompt, &original)?;

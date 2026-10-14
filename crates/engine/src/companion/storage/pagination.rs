@@ -668,9 +668,10 @@ impl Session {
         let pin = reader_pins::capture(&self.companion_archive.readers, store.as_mut(), header, library.retain_read_lock())?;
         Ok(Some(HistoryReader { store, header: header.clone(), _pin: pin }))
     }
-    /// Read-only captured attachment selector on actual owned Fs/Mem handles.
-    /// This does not enable background main-history reads or grant publication.
-    pub fn companion_attachment_history_reader(&self, header: &PhotoHeader) -> Result<Option<HistoryReader>> {
+    /// Read-only captured selector on actual owned Fs/Mem handles, including
+    /// protocol preparation and attachments. Main page reading retains its
+    /// separate adapter policy; this never grants publication authority.
+    pub fn companion_owned_history_reader(&self, header: &PhotoHeader) -> Result<Option<HistoryReader>> {
         let library = self.library.as_ref().ok_or_else(|| error("library closed"))?;
         let Some(mut store) = library.files.migration_writer() else { return Ok(None) };
         if library.files.retention_namespace().is_none() {

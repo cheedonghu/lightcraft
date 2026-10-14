@@ -185,7 +185,7 @@ impl Attachments {
         let source = if request.image["data"].is_string() {
             Some(Source::Inline)
         } else if let Some(header) = request.scope.header.as_ref() {
-            app.session.companion_attachment_history_reader(header).ok().flatten().map(|reader| Source::History(Box::new(reader)))
+            app.session.companion_owned_history_reader(header).ok().flatten().map(|reader| Source::History(Box::new(reader)))
         } else {
             app.session.companion_attachment_reader(request.scope.photo).ok().flatten().map(Source::Legacy)
         };

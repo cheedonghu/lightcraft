@@ -484,7 +484,7 @@ fn real_reading_offset_is_photo_scoped_and_user_scroll_stops_tail_following() {
     h.app.ai.next_connection = Some(connection);
     h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
     h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout);
-    let creation = requests.try_recv().unwrap();
+    let creation = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
     events.try_send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"reading-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":a.0,"library_generation":creation.identity.scope.library_generation},"state":"queued"}}) }).unwrap();
     frames(&mut h);
     let messages = rect(&h, "ai:messages");

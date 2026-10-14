@@ -72,7 +72,7 @@ fn upward_reading_survives_stream_completion_until_explicit_back_to_bottom() {
     h.app.ai.generation = h.app.session.library_generation();
     assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     h.app.run("ai.start", json!({"prompt":"Read this photo"})).unwrap();
-    let creation = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+    let creation = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
     events.send(network::Event::Server{kind:"round.state".into(),data:json!({"round_id":"reading-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":creation.identity.scope.library_generation},"state":"queued"}})}).unwrap();
     h.step();
     let rect = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").unwrap().1;

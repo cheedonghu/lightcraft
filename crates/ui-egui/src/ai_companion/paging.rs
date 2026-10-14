@@ -443,7 +443,7 @@ impl State {
             });
             if let Some(page) =
                 page.filter(|page| request.header.original_message_count() > 0 && (!page.records.is_empty() || !page.fragments.is_empty()))
-                && let Some(mut reader) = app.session.companion_attachment_history_reader(&request.header).map_err(|e| e.to_string())?
+                && let Some(mut reader) = app.session.companion_owned_history_reader(&request.header).map_err(|e| e.to_string())?
             {
                 let tx = self.paging.tx.clone();
                 self.paging.cancel = Arc::new(AtomicBool::new(false));
