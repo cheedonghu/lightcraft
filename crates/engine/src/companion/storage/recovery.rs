@@ -29,7 +29,30 @@ pub(super) fn validate(p: &PendingCommit, photo: PhotoId, visible: &Option<Head>
     Ok(())
 }
 pub(super) fn prepare(store: &mut dyn Store, photo: PhotoId, epoch: u64, fingerprint: &str) -> Result<(PendingCommit, bool)> {
+    prepare_with_epoch(store, photo, epoch, None, fingerprint)
+}
+pub(super) fn prepare_clear(
+    store: &mut dyn Store,
+    photo: PhotoId,
+    epoch: u64,
+    publication_epoch: u64,
+    fingerprint: &str,
+) -> Result<(PendingCommit, bool)> {
+    prepare_with_epoch(store, photo, epoch, Some(publication_epoch), fingerprint)
+}
+fn prepare_with_epoch(
+    store: &mut dyn Store,
+    photo: PhotoId,
+    epoch: u64,
+    publication_epoch: Option<u64>,
+    fingerprint: &str,
+) -> Result<(PendingCommit, bool)> {
     let unresolved: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    if unresolved.as_ref().is_some_and(|p| p.publication_epoch.is_some() && p.publication_epoch != publication_epoch) {
+        // An old producer cannot alter or acknowledge a new-context intent,
+        // even while its failed HEAD still leaves the old prefix visible.
+        return Err(error("confirmed conversation replacement is still pending"));
+    }
     if unresolved.as_ref().is_some_and(|p| p.receipt.is_some()) {
         pagination::recover_receipt(store, photo)?;
     }
@@ -72,6 +95,7 @@ pub(super) fn prepare(store: &mut dyn Store, photo: PhotoId, epoch: u64, fingerp
             photo,
             transaction_id: tx.clone(),
             expected_epoch: epoch,
+            publication_epoch: None,
             old_head,
             head: Head { manifest: format!("{}/manifest-{tx}.json", base(photo)), transaction_id: tx, manifest_digest: String::new() },
             reserved_files: 0,

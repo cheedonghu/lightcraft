@@ -1005,6 +1005,7 @@ fn confirm_receipt(store: &mut dyn Store, photo: PhotoId, receipt: &Value) -> Re
     let revert = revert.filter(|r| r["transaction_id"] == h.transaction_id).unwrap_or_else(|| json!({"eligible":false}));
     let tx = super::super::LocalRoundId::new().map_err(error)?.as_str().to_owned();
     let pending = resumed.unwrap_or(PendingCommit {
+        publication_epoch: None,
         photo,
         transaction_id: tx.clone(),
         expected_epoch: h.conversation_epoch,

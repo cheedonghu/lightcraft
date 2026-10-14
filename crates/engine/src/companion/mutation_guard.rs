@@ -82,6 +82,11 @@ impl Session {
         if let Some(blocked) = &self.companion_archive.blocked {
             return Err(super::archive::error(blocked));
         }
+        if self.pending_companion_clear_epoch(photo)?.is_some() || self.companion_archive.clear_errors.contains_key(&photo) {
+            return Err(EngineError::Other(
+                "Conversation deletion is waiting for local saving. Retry deletion before starting a new AI task.".into(),
+            ));
+        }
         if self.companion_task_photo().is_some() {
             return Err(EngineError::Other("Another AI task is active; stop it or wait for completion.".into()));
         }

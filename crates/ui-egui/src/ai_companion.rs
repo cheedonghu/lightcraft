@@ -12,6 +12,8 @@ mod card;
 #[path = "ai_companion/card_tests.rs"]
 mod card_tests;
 #[cfg(test)]
+mod clear_tests;
+#[cfg(test)]
 #[path = "ai_companion/disconnect_tests.rs"]
 mod disconnect_tests;
 mod drafts;
@@ -1930,7 +1932,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                     .ok_or_else(|| "请先选择照片。".to_owned())?;
                 undo(&mut state, app, target, round)
             }),
-        "ai.clear" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| clear(&mut state, app, p)),
+        "ai.clear" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| clear(&mut state, app, p, params)),
         _ => {
             app.ai = state;
             return None;
@@ -1979,9 +1981,22 @@ fn undo(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, round: &str)
     state.save(app, photo)?;
     Ok(json!({"undone":true}))
 }
-fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId) -> Result<Value, String> {
+fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, params: &Value) -> Result<Value, String> {
+    if params.get("confirm").and_then(Value::as_bool) == Some(true)
+        && params.get("library_generation").and_then(Value::as_u64) != Some(app.session.library_generation())
+    {
+        return Err(tr("This delete request belongs to another or closed library.").into());
+    }
     if state.jobs.contains_key(&photo) || state.worker_busy(photo) {
         return Err("处理期间不能删除对话，请先停止并等待结束。".into());
+    }
+    if params.get("confirm").and_then(Value::as_bool) != Some(true) {
+        let epoch = if app.session.library.is_some() {
+            app.session.companion_photo_header(photo).map_err(|e| e.to_string())?.map(|h| h.conversation_epoch).unwrap_or(0)
+        } else {
+            0
+        };
+        return Ok(json!({"confirmationRequired":true,"photo":photo.0,"libraryGeneration":app.session.library_generation(),"expectedEpoch":epoch}));
     }
     state.load(app, photo)?;
     let names: BTreeSet<_> = state

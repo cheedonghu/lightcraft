@@ -2227,5 +2227,6 @@
   "Historical preview unavailable": "历史预览不可用",
   "Loading historical preview…": "正在加载历史预览…",
   "Message details unavailable": "消息详情暂不可用",
-  "Read AI history": "回看 AI 历史"
+  "Read AI history": "回看 AI 历史",
+  "This delete request belongs to another or closed library.": "此删除请求属于另一图库或已关闭的图库。"
 }

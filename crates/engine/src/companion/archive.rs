@@ -38,6 +38,7 @@ pub(crate) struct Archive {
     pub(super) revert_dirty: BTreeSet<PhotoId>,
     pub(super) certificate_dirty: BTreeSet<PhotoId>,
     pub(super) core_save_error: Option<String>,
+    pub(super) clear_errors: BTreeMap<PhotoId, String>,
     dirty: bool,
     pub(super) blocked: Option<String>,
     pub(super) error: Option<String>,
@@ -233,6 +234,7 @@ impl Archive {
                     || !self.receipts.is_empty()
             })
             .or(self.core_save_error.as_deref())
+            .or_else(|| self.clear_errors.values().next().map(String::as_str))
             .or_else(|| self.editors.unsaved())
     }
     fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {
