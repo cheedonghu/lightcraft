@@ -13,6 +13,59 @@ const LIMIT: u64 = 32 * 1024;
 const IDENTITY: &str = "companion/v2/store-identity.json";
 const CLOSE: &str = "companion/v2/close-proof.json";
 const LOAD: &str = "companion/v2/load-proof.json";
+const CORE: &str = "companion/v2/core-proof.json";
+const CORE_PENDING: &str = "companion/v2/core-proof-pending.json";
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct CoreProof {
+    version: u32,
+    storage_identity: String,
+    chain: LocalRoundId,
+    first_seq: u64,
+    core_seq: u64,
+}
+#[derive(Serialize, Deserialize)]
+struct Association {
+    version: u32,
+    photo: PhotoId,
+    storage_identity: String,
+    chain: LocalRoundId,
+    core_seq: u64,
+    certificate_digest: String,
+}
+fn association_key(id: &LocalRoundId) -> Result<String> {
+    if !id.as_str().strip_prefix("local-").is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(error("invalid revert association"));
+    }
+    Ok(format!("companion/v2/revert-associations/{}.json", id.as_str()))
+}
+fn certificate_digest(cert: &Certificate) -> Result<String> {
+    Ok(lightcraft_preview::hash_bytes(&serde_json::to_vec(cert).map_err(error)?).to_string())
+}
+fn core_proof(store: &mut dyn Store) -> Result<Option<CoreProof>> {
+    let Some(bytes) = store.read_limited(CORE, LIMIT).map_err(error)? else { return Ok(None) };
+    let proof: CoreProof = serde_json::from_slice(&bytes).map_err(error)?;
+    if proof.version != 1 || proof.first_seq > proof.core_seq {
+        return Err(error("unknown core continuity proof"));
+    }
+    Ok(Some(proof))
+}
+fn intent_bytes() -> Result<Vec<u8>> {
+    // Cleanup debt survives archive drops in this process. Each newer critical
+    // intent must differ even when its journal sequence/settings are unchanged.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempt = NEXT
+        .try_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| error("companion intent counter exhausted"))?;
+    serde_json::to_vec(&json!({"version":1,"pending":true,"attempt":attempt})).map_err(error)
+}
+fn core_pending(store: &mut dyn Store) -> Result<bool> {
+    let Some(bytes) = store.read_limited(CORE_PENDING, LIMIT).map_err(error)? else { return Ok(false) };
+    let value: Value = serde_json::from_slice(&bytes).map_err(error)?;
+    if value["version"] != 1 || value["pending"] != true {
+        return Err(error("unknown core continuity intent"));
+    }
+    Ok(true)
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Certificate {
     version: u32,
@@ -22,6 +75,8 @@ pub(super) struct Certificate {
     mutation_epoch: u64,
     conversation_epoch: u64,
     core_seq: u64,
+    #[serde(default)]
+    association: Option<LocalRoundId>,
     record: u64,
     original_digest: String,
     result_digest: String,
@@ -104,7 +159,7 @@ fn load_pending(store: &mut dyn Store) -> Result<bool> {
 /// Fence before core replay can repair or replace files and erase its warning.
 pub(crate) fn begin_load(store: &mut dyn Store) -> Result<(bool, bool)> {
     let pending = load_pending(store)?;
-    let failed_close = close_pending(store)? == Some(true);
+    let failed_close = close_pending(store)? == Some(true) || core_pending(store)?;
     if pending || identity(store, false)?.is_some() {
         store.write_atomic(LOAD, br#"{"version":1,"pending":true}"#).map_err(error)?;
         return Ok((true, pending || failed_close));
@@ -112,6 +167,105 @@ pub(crate) fn begin_load(store: &mut dyn Store) -> Result<(bool, bool)> {
     Ok((false, false))
 }
 impl Session {
+    /// Validate the previous acknowledged core anchor before any new save. A
+    /// mismatch retires the old lineage, never rebinds it to loaded equality.
+    pub(crate) fn load_companion_core_proof(&mut self) {
+        let Some(lib) = self.library.as_mut() else { return };
+        let stored = core_proof(lib.files.as_mut());
+        match stored {
+            Ok(Some(proof))
+                if self.mutation_guard.clean_load
+                    && proof.core_seq == self.mutation_guard.loaded_seq
+                    && identity(lib.files.as_mut(), false).ok().flatten().as_deref() == Some(proof.storage_identity.as_str()) =>
+            {
+                self.mutation_guard.core_proof = Some(proof);
+            }
+            Ok(None) if !self.mutation_guard.load_fenced => {}
+            _ => {
+                self.mutation_guard.clean_load = false;
+                self.mutation_guard.retire_load = self.mutation_guard.load_fenced;
+            }
+        }
+    }
+    pub(crate) fn begin_companion_core_save(&mut self) -> Result<()> {
+        if self.mutation_guard.core_proof.is_some() {
+            let Some(lib) = self.library.as_mut() else { return Ok(()) };
+            if let Err(e) = lib.files.write_atomic(CORE_PENDING, &intent_bytes()?) {
+                self.companion_archive.core_save_failed(e.to_string());
+                return Err(error(e));
+            }
+        }
+        Ok(())
+    }
+    /// Constant owning metadata work. Only this session's validated chain can
+    /// advance after acknowledged core and companion saves; cold certificates
+    /// remain immutable and are checked by their exact association on action.
+    pub(crate) fn advance_companion_core_proof(&mut self) -> Result<()> {
+        let Some(mut proof) = self.mutation_guard.core_proof.clone() else { return Ok(()) };
+        let Some(lib) = self.library.as_mut() else { return Ok(()) };
+        let seq = lib.journal().seq();
+        if proof.core_seq != seq {
+            proof.core_seq = seq;
+            if let Err(e) = lib.files.write_atomic(CORE, &serde_json::to_vec(&proof).map_err(error)?) {
+                self.companion_archive.core_save_failed(e.to_string());
+                return Err(error(e));
+            }
+            self.mutation_guard.core_proof = Some(proof);
+        }
+        let intent = (|| -> Result<Option<Vec<u8>>> {
+            if !core_pending(lib.files.as_mut())? {
+                return Ok(None);
+            }
+            lib.files.read_limited(CORE_PENDING, LIMIT).map_err(error)?.ok_or_else(|| error("core intent missing")).map(Some)
+        })();
+        let bytes = match intent {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.companion_archive.core_save_failed(e.to_string());
+                return Err(e);
+            }
+        };
+        if let Some(bytes) = bytes {
+            if let Err(e) = lib.files.remove(CORE_PENDING) {
+                // Core and its continuity anchor are acknowledged. An uncertain
+                // deletion is cleanup debt; a still-present intent stays conservative.
+                self.companion_archive.marker_cleanup_failed(CORE_PENDING.into(), None, &bytes, e.to_string());
+            }
+        }
+        // The core log may already be acknowledged while this independent
+        // continuity write is not. Clear its recovery state only after retry
+        // acknowledges the owning metadata; marker deletion remains cleanup.
+        self.companion_archive.core_save_error = None;
+        Ok(())
+    }
+    fn core_proof_for_certificate(&mut self, seq: u64) -> Result<CoreProof> {
+        if let Some(proof) = &self.mutation_guard.core_proof {
+            return Ok(proof.clone());
+        }
+        let lib = self.library.as_mut().ok_or_else(|| error("library closed"))?;
+        let storage_identity = identity(lib.files.as_mut(), true)?.ok_or_else(|| error("storage identity missing"))?;
+        let proof = CoreProof { version: 1, storage_identity, chain: LocalRoundId::new().map_err(error)?, first_seq: seq, core_seq: seq };
+        lib.files.write_atomic(CORE, &serde_json::to_vec(&proof).map_err(error)?).map_err(error)?;
+        self.mutation_guard.core_proof = Some(proof.clone());
+        Ok(proof)
+    }
+    fn valid_companion_association(&mut self, cert: &Certificate) -> Result<bool> {
+        let Some(proof) = self.mutation_guard.core_proof.as_ref() else { return Ok(false) };
+        let Some(id) = cert.association.as_ref() else { return Ok(false) };
+        let Some(lib) = self.library.as_mut() else { return Ok(false) };
+        let Some(bytes) = lib.files.read_limited(&association_key(id)?, LIMIT).map_err(error)? else { return Ok(false) };
+        let a: Association = serde_json::from_slice(&bytes).map_err(error)?;
+        Ok(a.version == 1
+            && a.photo == cert.photo
+            && a.storage_identity == cert.storage_identity
+            && a.storage_identity == proof.storage_identity
+            && a.chain == proof.chain
+            && a.core_seq == cert.core_seq
+            && a.core_seq >= proof.first_seq
+            && a.core_seq <= proof.core_seq
+            && a.certificate_digest == certificate_digest(cert)?)
+    }
+
     /// Retire a photo's round authority before its conversation is cleared or
     /// repaired. The caller must first retire its task/lease and must not clear
     /// saved context if this returns an error. Photo edits/history stay intact.
@@ -146,6 +300,11 @@ impl Session {
             lib.files.write_atomic(IDENTITY, &serde_json::to_vec(&json!({"version":1,"identity":id})).map_err(error)?).map_err(error)?;
             self.mutation_guard.retire_load = false;
         }
+        // An uncertain continuity transition has retired the old storage identity;
+        // cleanup cannot reconnect its old associations to a new core sequence.
+        if self.mutation_guard.core_proof.is_none() && core_pending(lib.files.as_mut())? {
+            lib.files.remove(CORE_PENDING).map_err(error)?;
+        }
         lib.files.remove(LOAD).map_err(error)?;
         self.mutation_guard.load_fenced = false;
         Ok(())
@@ -157,14 +316,19 @@ impl Session {
             // A durable fence rejects certificates until the final snapshot and
             // companion flush both finish. It also protects already sealed proofs.
             let _ = close_pending(lib.files.as_mut())?;
-            lib.files.write_atomic(CLOSE, br#"{"version":1,"pending":true}"#).map_err(error)?;
+            lib.files.write_atomic(CLOSE, &intent_bytes()?).map_err(error)?;
         }
         Ok(())
     }
     pub(crate) fn finish_companion_close(&mut self) -> Result<()> {
         let Some(lib) = self.library.as_mut() else { return Ok(()) };
         if close_pending(lib.files.as_mut())?.is_some() {
-            lib.files.remove(CLOSE).map_err(error)?;
+            let bytes = lib.files.read_limited(CLOSE, LIMIT).map_err(error)?.ok_or_else(|| error("close intent missing"))?;
+            if let Err(e) = lib.files.remove(CLOSE) {
+                // This runs only after final snapshot, data, certificate and
+                // continuity acknowledgments. Report saved plus cleanup debt.
+                self.companion_archive.marker_cleanup_failed(CLOSE.into(), None, &bytes, e.to_string());
+            }
         }
         Ok(())
     }
@@ -299,12 +463,14 @@ impl Session {
             || !cert.eligible
             || guard["mutation_epoch"].as_u64() != Some(cert.mutation_epoch)
             || !self.mutation_guard.clean_load
-            || self.mutation_guard.loaded_seq != cert.core_seq
             || seal_pending(lib.files.as_mut(), photo)?
             || close_pending(lib.files.as_mut())? == Some(true)
             || load_pending(lib.files.as_mut())?
             || identity(lib.files.as_mut(), false)?.as_deref() != Some(cert.storage_identity.as_str())
         {
+            return Ok(());
+        }
+        if !self.valid_companion_association(&cert)? {
             return Ok(());
         }
         let Some(h) = self.companion_photo_header(photo)? else { return Ok(()) };
@@ -403,6 +569,7 @@ impl Session {
             self.invalidate_companion_reverts_before(&[proof.photo].into_iter().collect())?;
             return Ok(None);
         }
+        let core = self.core_proof_for_certificate(seq)?;
         let lib = self.library.as_mut().ok_or_else(|| error("library closed"))?;
         let mut guard = read_guard(lib.files.as_mut(), proof.photo)?.unwrap_or_else(|| json!({}));
         let epoch = guard["mutation_epoch"].as_u64().unwrap_or(0);
@@ -418,6 +585,7 @@ impl Session {
             mutation_epoch: epoch,
             conversation_epoch: h.conversation_epoch,
             core_seq: seq,
+            association: Some(LocalRoundId::new().map_err(error)?),
             record: ordinal,
             original_digest: digest(&proof.original)?,
             result_digest: digest(&proof.expected)?,
@@ -428,15 +596,29 @@ impl Session {
         if proof.certificate.as_ref().is_some_and(|c| c.core_seq == seq && c.conversation_epoch == h.conversation_epoch) {
             return Ok(None);
         }
+        let association = Association {
+            version: 1,
+            photo: proof.photo,
+            storage_identity: cert.storage_identity.clone(),
+            chain: core.chain,
+            core_seq: seq,
+            certificate_digest: certificate_digest(&cert)?,
+        };
+        let id = cert.association.as_ref().ok_or_else(|| error("association missing"))?;
+        lib.files.write_atomic(&association_key(id)?, &serde_json::to_vec(&association).map_err(error)?).map_err(error)?;
         guard["mutation_epoch"] = json!(epoch);
         guard["certificate"] = json!(cert);
         let _ = seal_pending(lib.files.as_mut(), proof.photo)?;
         let stamp = json!({"version":1,"photo":proof.photo.0,"certificate_digest":lightcraft_preview::hash_bytes(&serde_json::to_vec(&cert).map_err(error)?).to_string()});
-        lib.files.write_atomic(&seal_key(proof.photo), &serde_json::to_vec(&stamp).map_err(error)?).map_err(error)?;
+        let stamp_bytes = serde_json::to_vec(&stamp).map_err(error)?;
+        lib.files.write_atomic(&seal_key(proof.photo), &stamp_bytes).map_err(error)?;
         write_guard(lib.files.as_mut(), proof.photo, &guard)?;
-        // Only removal after a successful guard write can retire the intent.
-        // A guard-write error after visible rename leaves cold authority blocked.
-        lib.files.remove(&seal_key(proof.photo)).map_err(error)?;
+        // Association, complete certificate and both saves are acknowledged.
+        // Marker retirement is now independent cleanup, not a failed certificate.
+        // A guard-write error above still leaves cold authority fenced.
+        if let Err(e) = lib.files.remove(&seal_key(proof.photo)) {
+            self.companion_archive.marker_cleanup_failed(seal_key(proof.photo), Some(proof.photo), &stamp_bytes, e.to_string());
+        }
         Ok(Some(cert))
     }
 }

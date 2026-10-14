@@ -12,20 +12,30 @@ pub(crate) struct State {
     released: BTreeSet<PhotoId>,
     retired: VecDeque<ArchiveDebt>,
 }
+#[derive(Clone)]
+pub(crate) struct MarkerCleanup {
+    pub photo: Option<PhotoId>,
+    pub expected_digest: String,
+    pub error: String,
+}
 pub(crate) struct ArchiveDebt {
     pub prefixes: BTreeMap<PhotoId, PhotoHeader>,
     pub active: BTreeSet<PhotoId>,
     pub waiting: BTreeSet<PhotoId>,
+    pub markers: BTreeMap<String, MarkerCleanup>,
 }
 impl ArchiveDebt {
     fn empty(&self) -> bool {
-        self.prefixes.is_empty() && self.active.is_empty() && self.waiting.is_empty()
+        self.prefixes.is_empty() && self.active.is_empty() && self.waiting.is_empty() && self.markers.is_empty()
     }
     fn take(&mut self) -> Option<PhotoId> {
         self.active.pop_first().or_else(|| self.waiting.pop_first()).or_else(|| self.prefixes.pop_first().map(|(photo, _)| photo))
     }
     fn contains(&self, photo: PhotoId) -> bool {
-        self.active.contains(&photo) || self.waiting.contains(&photo) || self.prefixes.contains_key(&photo)
+        self.active.contains(&photo)
+            || self.waiting.contains(&photo)
+            || self.prefixes.contains_key(&photo)
+            || self.markers.values().any(|m| m.photo.is_none_or(|p| p == photo))
     }
 }
 #[derive(Default)]
@@ -54,6 +64,15 @@ impl Pins {
     pub(crate) fn photo_released(&self, photo: PhotoId) -> bool {
         let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.released.contains(&photo) || state.retired.iter().any(|debt| debt.contains(photo))
+    }
+    pub(crate) fn take_marker_cleanup(&self) -> Option<(String, MarkerCleanup)> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let debt = state.retired.front_mut()?;
+        let marker = debt.markers.pop_first();
+        if debt.empty() {
+            state.retired.pop_front();
+        }
+        marker
     }
     pub(crate) fn take_release(&self) -> Option<PhotoId> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

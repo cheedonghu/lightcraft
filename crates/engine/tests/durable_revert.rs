@@ -1202,3 +1202,412 @@ fn final_snapshot_rescues_failed_append_and_failed_log_reset_never_duplicates_pe
         }
     }
 }
+
+#[test]
+fn unopened_cold_round_survives_another_photos_normal_save_and_close() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut s = open(&catalog, &files);
+    let a = s.active().unwrap();
+    let b = s.catalog.photos().find(|p| p.id != a).unwrap().id;
+    let start = s.develop_of(a).unwrap();
+    let round = publish(&mut s, a);
+    s.close_library().unwrap();
+    drop(s);
+    let mut control = open(&catalog, &files);
+    assert!(control.verify_round_revert(a, &round).is_ok());
+    drop(control);
+    let mut s = open(&catalog, &files);
+    let result = s.develop_of(a).unwrap();
+    let source = s.catalog.photo(a).unwrap().source.clone();
+    // Never load A's AI history or prepare its revert in this session.
+    s.execute("photo.rate", &json!({"ids":[b.0],"rating":3})).unwrap();
+    s.compact_library().unwrap();
+    s.close_library().unwrap();
+    assert_eq!(s.develop_of(a).unwrap(), result);
+    assert_eq!(s.catalog.photo(a).unwrap().source, source);
+    drop(s);
+    let mut s = open(&catalog, &files);
+    let permit = s.verify_round_revert(a, &round).unwrap();
+    s.commit_verified_round_revert(permit).unwrap();
+    assert_eq!(s.develop_of(a).unwrap(), start);
+    assert_eq!(s.catalog.photo(b).unwrap().rating, 3);
+    assert!(s.companion_round(a, round.as_str()).unwrap().is_some());
+}
+
+struct ReadTrace {
+    memory: MemStore,
+    reads: Arc<std::sync::Mutex<Vec<String>>>,
+}
+impl Store for ReadTrace {
+    fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        self.reads.lock().unwrap().push(name.into());
+        self.memory.read(name)
+    }
+    fn read_limited(&mut self, name: &str, limit: u64) -> io::Result<Option<Vec<u8>>> {
+        self.reads.lock().unwrap().push(name.into());
+        self.memory.read_limited(name, limit)
+    }
+    fn read_range(&mut self, name: &str, offset: u64, limit: usize) -> io::Result<Vec<u8>> {
+        self.reads.lock().unwrap().push(name.into());
+        self.memory.read_range(name, offset, limit)
+    }
+    fn write_atomic(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        self.memory.write_atomic(name, bytes)
+    }
+    fn append(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        self.memory.append(name, bytes)
+    }
+    fn truncate(&mut self, name: &str, len: u64) -> io::Result<()> {
+        self.memory.truncate(name, len)
+    }
+    fn remove(&mut self, name: &str) -> io::Result<()> {
+        self.memory.remove(name)
+    }
+    fn describe(&self) -> String {
+        self.memory.describe()
+    }
+    fn retention_namespace(&self) -> Option<String> {
+        self.memory.retention_namespace()
+    }
+}
+#[test]
+fn unrelated_save_does_not_read_cold_authority_or_its_native_original() {
+    let root = std::env::temp_dir().join(format!("lc-ux18-cold-source-{}", LocalRoundId::new().unwrap().as_str()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("original.png");
+    let held = root.join("held.png");
+    let image = lightcraft_raster::Rgba8::from_fn(8, 8, |x, y| [(x * 20) as u8, (y * 20) as u8, 60, 255]);
+    let bytes = lightcraft_engine::export::encode_image(
+        &image,
+        &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+    )
+    .unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut s = open(&catalog, &files).with_fs();
+    let a = s.active().unwrap();
+    let b = s.catalog.photos().find(|p| p.id != a).unwrap().id;
+    s.commit(
+        "Native source",
+        lightcraft_catalog::Op::SetFile {
+            id: a,
+            file_name: "original.png".into(),
+            source: lightcraft_catalog::Source::File { path: path.to_string_lossy().into() },
+        },
+    )
+    .unwrap();
+    let start = s.develop_of(a).unwrap();
+    let round = publish(&mut s, a);
+    s.close_library().unwrap();
+    drop(s);
+    let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = Session::new().with_fs();
+    s.open_library_in(
+        LibraryStores {
+            catalog: Box::new(catalog.clone()),
+            files: Box::new(ReadTrace { memory: files.clone(), reads: reads.clone() }),
+            dir: "trace".into(),
+            on_disk: false,
+        },
+        false,
+    )
+    .unwrap();
+    reads.lock().unwrap().clear();
+    std::fs::rename(&path, &held).unwrap();
+    s.execute("photo.rate", &json!({"ids":[b.0],"rating":3})).unwrap();
+    s.close_library().unwrap();
+    assert!(
+        reads.lock().unwrap().iter().all(|name| !name.ends_with("/revert.json") && !name.contains("/revert-associations/")),
+        "B saves must not scan or hydrate cold candidates"
+    );
+    drop(s);
+    std::fs::rename(&held, &path).unwrap();
+    let mut s = open(&catalog, &files).with_fs();
+    let permit = s.verify_round_revert(a, &round).unwrap();
+    s.commit_verified_round_revert(permit).unwrap();
+    assert_eq!(s.develop_of(a).unwrap(), start);
+    assert_eq!(s.catalog.photo(b).unwrap().rating, 3);
+    drop(s);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+struct RemoveFault<S: Store> {
+    memory: S,
+    fail: Arc<AtomicBool>,
+    tripped: Arc<AtomicBool>,
+    suffix: &'static str,
+}
+impl<S: Store> Store for RemoveFault<S> {
+    fn read(&mut self, n: &str) -> io::Result<Option<Vec<u8>>> {
+        self.memory.read(n)
+    }
+    fn read_limited(&mut self, n: &str, l: u64) -> io::Result<Option<Vec<u8>>> {
+        self.memory.read_limited(n, l)
+    }
+    fn read_range(&mut self, n: &str, o: u64, l: usize) -> io::Result<Vec<u8>> {
+        self.memory.read_range(n, o, l)
+    }
+    fn write_atomic(&mut self, n: &str, b: &[u8]) -> io::Result<()> {
+        self.memory.write_atomic(n, b)
+    }
+    fn append(&mut self, n: &str, b: &[u8]) -> io::Result<()> {
+        self.memory.append(n, b)
+    }
+    fn truncate(&mut self, n: &str, l: u64) -> io::Result<()> {
+        self.memory.truncate(n, l)
+    }
+    fn remove(&mut self, n: &str) -> io::Result<()> {
+        self.memory.remove(n)?;
+        if n.ends_with(self.suffix) && self.fail.load(Ordering::Relaxed) {
+            self.tripped.store(true, Ordering::Relaxed);
+            return Err(io::Error::other("directory sync failed after visible marker removal"));
+        }
+        Ok(())
+    }
+    fn describe(&self) -> String {
+        self.memory.describe()
+    }
+    fn retention_namespace(&self) -> Option<String> {
+        self.memory.retention_namespace()
+    }
+}
+#[test]
+fn acknowledged_certificate_survives_visible_seal_cleanup_failure_as_saved_with_cleanup_debt() {
+    let root = std::env::temp_dir().join(format!("lc-ux18-remove-seal-{}", LocalRoundId::new().unwrap().as_str()));
+    let fail = Arc::new(AtomicBool::new(false));
+    let tripped = Arc::new(AtomicBool::new(false));
+    let mut s = Session::new().with_fs();
+    s.open_library_in(
+        LibraryStores {
+            catalog: Box::new(lightcraft_catalog::FsStore::open(&root).unwrap()),
+            files: Box::new(RemoveFault {
+                memory: lightcraft_catalog::FsStore::open(&root).unwrap(),
+                fail: fail.clone(),
+                tripped: tripped.clone(),
+                suffix: "/seal-pending.json",
+            }),
+            dir: root.clone(),
+            on_disk: true,
+        },
+        true,
+    )
+    .unwrap();
+    let a = s.active().unwrap();
+    let round = publish(&mut s, a);
+    let before = serde_json::to_value(&s.catalog).unwrap();
+    let labels = s.undo.iter().map(|e| e.label.clone()).collect::<Vec<_>>();
+    fail.store(true, Ordering::Relaxed);
+    let saved = s.persist();
+    assert!(tripped.load(Ordering::Relaxed), "exercise the actual native post-removal error");
+    assert!(saved.is_ok(), "substantive certificate commit is acknowledged; only cleanup failed: {saved:?}");
+    assert!(s.unsaved().is_none());
+    assert!(!s.companion_photo_unsaved(a));
+    assert!(s.companion_photo_cleanup_pending(a));
+    assert!(s.companion_cleanup_error(a).is_some());
+    assert_eq!(serde_json::to_value(&s.catalog).unwrap(), before);
+    assert_eq!(s.undo.iter().map(|e| e.label.clone()).collect::<Vec<_>>(), labels);
+    let mut cold = Session::new().with_fs();
+    cold.open_library(&root, false).unwrap();
+    assert!(cold.verify_round_revert(a, &round).is_ok());
+    assert!(cold.companion_round(a, round.as_str()).unwrap().is_some());
+    drop(cold);
+    fail.store(false, Ordering::Relaxed);
+    s.persist().unwrap();
+    assert!(s.companion_cleanup_error(a).is_none());
+    assert_eq!(serde_json::to_value(&s.catalog).unwrap(), before);
+    drop(s);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn acknowledged_final_close_survives_visible_fence_cleanup_failure_as_saved_with_cleanup_debt() {
+    let root = std::env::temp_dir().join(format!("lc-ux18-remove-close-{}", LocalRoundId::new().unwrap().as_str()));
+    let fail = Arc::new(AtomicBool::new(false));
+    let tripped = Arc::new(AtomicBool::new(false));
+    let mut s = Session::new().with_fs();
+    s.open_library_in(
+        LibraryStores {
+            catalog: Box::new(lightcraft_catalog::FsStore::open(&root).unwrap()),
+            files: Box::new(RemoveFault {
+                memory: lightcraft_catalog::FsStore::open(&root).unwrap(),
+                fail: fail.clone(),
+                tripped: tripped.clone(),
+                suffix: "companion/v2/close-proof.json",
+            }),
+            dir: root.clone(),
+            on_disk: true,
+        },
+        true,
+    )
+    .unwrap();
+    let a = s.active().unwrap();
+    let round = publish(&mut s, a);
+    s.persist().unwrap();
+    let before = serde_json::to_value(&s.catalog).unwrap();
+    let labels = s.undo.iter().map(|e| e.label.clone()).collect::<Vec<_>>();
+    fail.store(true, Ordering::Relaxed);
+    let closed = s.close_library();
+    assert!(tripped.load(Ordering::Relaxed), "exercise native returned failure after visible fence removal");
+    assert!(closed.is_ok(), "final snapshot/data/certificate commits succeeded; only cleanup failed: {closed:?}");
+    assert!(s.unsaved().is_none());
+    assert!(!s.companion_photo_unsaved(a));
+    assert!(s.companion_photo_cleanup_pending(a));
+    assert!(s.companion_cleanup_error(a).is_some());
+    assert_eq!(serde_json::to_value(&s.catalog).unwrap(), before);
+    assert_eq!(s.undo.iter().map(|e| e.label.clone()).collect::<Vec<_>>(), labels);
+    drop(s);
+    let mut cold = Session::new().with_fs();
+    cold.open_library(&root, false).unwrap();
+    assert!(cold.verify_round_revert(a, &round).is_ok());
+    assert!(cold.companion_round(a, round.as_str()).unwrap().is_some());
+    assert!(cold.companion_cleanup_pending(), "owning namespace retains cleanup across archive drop");
+    cold.persist().unwrap();
+    assert!(cold.companion_cleanup_error(a).is_none());
+    assert_eq!(serde_json::to_value(&cold.catalog).unwrap(), before);
+    drop(cold);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+struct CoreProofFault {
+    memory: MemStore,
+    fail: Arc<AtomicBool>,
+    fail_read: Arc<AtomicBool>,
+    tripped: Arc<AtomicBool>,
+}
+impl Store for CoreProofFault {
+    fn read(&mut self, n: &str) -> io::Result<Option<Vec<u8>>> {
+        self.memory.read(n)
+    }
+    fn read_limited(&mut self, n: &str, l: u64) -> io::Result<Option<Vec<u8>>> {
+        if n == "companion/v2/core-proof-pending.json" && self.fail_read.load(Ordering::Relaxed) {
+            self.tripped.store(true, Ordering::Relaxed);
+            return Err(io::Error::other("continuity intent read failed"));
+        }
+        self.memory.read_limited(n, l)
+    }
+    fn read_range(&mut self, n: &str, o: u64, l: usize) -> io::Result<Vec<u8>> {
+        self.memory.read_range(n, o, l)
+    }
+    fn write_atomic(&mut self, n: &str, b: &[u8]) -> io::Result<()> {
+        self.memory.write_atomic(n, b)?;
+        if n == "companion/v2/core-proof.json" && self.fail.load(Ordering::Relaxed) {
+            self.tripped.store(true, Ordering::Relaxed);
+            return Err(io::Error::other("visible continuity write sync failure"));
+        }
+        Ok(())
+    }
+    fn append(&mut self, n: &str, b: &[u8]) -> io::Result<()> {
+        self.memory.append(n, b)
+    }
+    fn truncate(&mut self, n: &str, l: u64) -> io::Result<()> {
+        self.memory.truncate(n, l)
+    }
+    fn remove(&mut self, n: &str) -> io::Result<()> {
+        self.memory.remove(n)
+    }
+    fn describe(&self) -> String {
+        self.memory.describe()
+    }
+    fn retention_namespace(&self) -> Option<String> {
+        self.memory.retention_namespace()
+    }
+}
+#[test]
+fn failed_continuity_commit_reports_pending_and_storage_retry_preserves_the_exact_cold_candidate() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut s = open(&catalog, &files);
+    let a = s.active().unwrap();
+    let b = s.catalog.photos().find(|p| p.id != a).unwrap().id;
+    let start = s.develop_of(a).unwrap();
+    let round = publish(&mut s, a);
+    s.close_library().unwrap();
+    drop(s);
+    let fail = Arc::new(AtomicBool::new(false));
+    let tripped = Arc::new(AtomicBool::new(false));
+    let mut s = Session::new();
+    s.open_library_in(
+        LibraryStores {
+            catalog: Box::new(catalog.clone()),
+            files: Box::new(CoreProofFault {
+                memory: files.clone(),
+                fail: fail.clone(),
+                fail_read: Arc::new(AtomicBool::new(false)),
+                tripped: tripped.clone(),
+            }),
+            dir: "proof-fault".into(),
+            on_disk: false,
+        },
+        false,
+    )
+    .unwrap();
+    fail.store(true, Ordering::Relaxed);
+    let _ = s.execute("photo.rate", &json!({"ids":[b.0],"rating":3}));
+    assert!(tripped.load(Ordering::Relaxed));
+    assert!(s.unsaved().is_some(), "an unacknowledged continuity write needs the existing local recovery outlet");
+    assert!(s.companion_photo_unsaved(b));
+    let before = serde_json::to_value(&s.catalog).unwrap();
+    let labels = s.undo.iter().map(|e| e.label.clone()).collect::<Vec<_>>();
+    fail.store(false, Ordering::Relaxed);
+    s.persist().unwrap();
+    assert!(s.unsaved().is_none());
+    assert!(!s.companion_photo_unsaved(b));
+    assert_eq!(serde_json::to_value(&s.catalog).unwrap(), before);
+    assert_eq!(s.undo.iter().map(|e| e.label.clone()).collect::<Vec<_>>(), labels);
+    s.close_library().unwrap();
+    drop(s);
+    let mut cold = open(&catalog, &files);
+    let permit = cold.verify_round_revert(a, &round).unwrap();
+    cold.commit_verified_round_revert(permit).unwrap();
+    assert_eq!(cold.develop_of(a).unwrap(), start);
+    assert_eq!(cold.catalog.photo(b).unwrap().rating, 3);
+}
+
+#[test]
+fn continuity_intent_read_failure_reports_pending_until_storage_only_retry() {
+    let (catalog, files) = (MemStore::new(), MemStore::new());
+    let mut s = open(&catalog, &files);
+    let a = s.active().unwrap();
+    let b = s.catalog.photos().find(|p| p.id != a).unwrap().id;
+    let start = s.develop_of(a).unwrap();
+    let round = publish(&mut s, a);
+    s.close_library().unwrap();
+    drop(s);
+    let fail_read = Arc::new(AtomicBool::new(false));
+    let tripped = Arc::new(AtomicBool::new(false));
+    let mut s = Session::new();
+    s.open_library_in(
+        LibraryStores {
+            catalog: Box::new(catalog.clone()),
+            files: Box::new(CoreProofFault {
+                memory: files.clone(),
+                fail: Arc::new(AtomicBool::new(false)),
+                fail_read: fail_read.clone(),
+                tripped: tripped.clone(),
+            }),
+            dir: "continuity-read-fault".into(),
+            on_disk: false,
+        },
+        false,
+    )
+    .unwrap();
+    fail_read.store(true, Ordering::Relaxed);
+    let _ = s.execute("photo.rate", &json!({"ids":[b.0],"rating":4}));
+    assert!(tripped.load(Ordering::Relaxed));
+    assert!(s.unsaved().is_some(), "an unreadable owning continuity intent must not report Saved");
+    assert!(s.companion_photo_unsaved(b));
+    let before = serde_json::to_value(&s.catalog).unwrap();
+    let labels = s.undo.iter().map(|e| e.label.clone()).collect::<Vec<_>>();
+    fail_read.store(false, Ordering::Relaxed);
+    s.persist().unwrap();
+    assert!(s.unsaved().is_none());
+    assert!(!s.companion_photo_unsaved(b));
+    assert_eq!(serde_json::to_value(&s.catalog).unwrap(), before);
+    assert_eq!(s.undo.iter().map(|e| e.label.clone()).collect::<Vec<_>>(), labels);
+    s.close_library().unwrap();
+    drop(s);
+    let mut cold = open(&catalog, &files);
+    let permit = cold.verify_round_revert(a, &round).unwrap();
+    cold.commit_verified_round_revert(permit).unwrap();
+    assert_eq!(cold.develop_of(a).unwrap(), start);
+    assert_eq!(cold.catalog.photo(b).unwrap().rating, 4);
+}

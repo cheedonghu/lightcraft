@@ -29,6 +29,7 @@ pub(crate) struct MutationGuard {
     pub(super) loaded: BTreeSet<PhotoId>,
     pub(crate) loaded_seq: u64,
     pub(crate) clean_load: bool,
+    pub(super) core_proof: Option<super::revert_guard::CoreProof>,
     pub(crate) load_fenced: bool,
     pub(crate) retire_load: bool,
     pub(crate) rejected_interaction: bool,

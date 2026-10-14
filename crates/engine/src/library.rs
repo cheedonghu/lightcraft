@@ -494,6 +494,7 @@ impl Session {
             });
         self.mutation_guard.load_fenced = load_fenced;
         self.mutation_guard.retire_load = load_fenced && !self.mutation_guard.clean_load;
+        self.load_companion_core_proof();
         self.finish_companion_load()?;
         // forget untouched Local records of folders not browsed for a while (journaled at once)
         if self.forget_local_days > 0 {
@@ -541,6 +542,9 @@ impl Session {
         self.persist_inner(self.companion_retry_deferred, true)
     }
     fn persist_inner(&mut self, defer_companion: bool, seal_reverts: bool) -> Result<()> {
+        if !self.pending_log.is_empty() {
+            self.begin_companion_core_save()?;
+        }
         let Some(lib) = self.library.as_mut() else { return Ok(()) };
         if !self.pending_log.is_empty() {
             if let Err(e) = lib.journal.append(&self.pending_log) {
@@ -585,6 +589,7 @@ impl Session {
         } else {
             self.finish_companion_load()?;
             self.flush_companion()?;
+            self.advance_companion_core_proof()?;
             if seal_reverts { self.seal_companion_reverts() } else { Ok(()) }
         }
     }
@@ -592,7 +597,8 @@ impl Session {
     /// Persist if commands left ops pending (cheap; frontends call it once per frame for state
     /// changed outside [`Session::execute`]).
     pub fn persist_if_dirty(&mut self) {
-        let backing_off = self.library.as_ref().and_then(|l| l.retry_at).is_some_and(|t| web_time::Instant::now() < t);
+        let backing_off = self.library.as_ref().and_then(|l| l.retry_at).is_some_and(|t| web_time::Instant::now() < t)
+            || self.companion_archive.core_save_retry_deferred();
         if self.library.is_some()
             && (!self.pending_log.is_empty() || self.companion_archive.needs_retry() || self.mutation_guard.load_fenced)
             && !backing_off
@@ -654,11 +660,12 @@ impl Session {
         }
         self.finish_companion_load()?;
         self.flush_companion()?;
-        self.seal_companion_reverts()?;
-        self.flush_companion()?;
         // A live/queued producer is not a durable completion receipt. Keep this
         // Session and its latest independent editor overlay for the next retry.
         self.ensure_companion_migration_saved()?;
+        self.advance_companion_core_proof()?;
+        self.seal_companion_reverts()?;
+        self.flush_companion()?;
         self.finish_companion_close()?;
         self.library_identity = std::sync::Arc::new(());
         Ok(())

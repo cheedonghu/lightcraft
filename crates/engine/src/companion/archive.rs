@@ -25,6 +25,7 @@ pub(crate) struct Archive {
     pub(super) v2: bool,
     pub(super) tails: BTreeMap<PhotoId, super::storage::TailUpdate>,
     pub(super) prefixes: BTreeMap<PhotoId, super::storage::PhotoHeader>,
+    pub(super) marker_cleanup: BTreeMap<String, super::storage::reader_pins::MarkerCleanup>,
     pub(super) cleanup_photos: BTreeSet<PhotoId>,
     pub(super) cleanup_waiting: BTreeSet<PhotoId>,
     pub(super) cleanup_errors: BTreeMap<PhotoId, String>,
@@ -36,6 +37,7 @@ pub(crate) struct Archive {
     pub(super) dirty_photos: BTreeSet<PhotoId>,
     pub(super) revert_dirty: BTreeSet<PhotoId>,
     pub(super) certificate_dirty: BTreeSet<PhotoId>,
+    pub(super) core_save_error: Option<String>,
     dirty: bool,
     pub(super) blocked: Option<String>,
     pub(super) error: Option<String>,
@@ -49,6 +51,7 @@ impl Drop for Archive {
             prefixes: std::mem::take(&mut self.prefixes),
             active: std::mem::take(&mut self.cleanup_photos),
             waiting: std::mem::take(&mut self.cleanup_waiting),
+            markers: std::mem::take(&mut self.marker_cleanup),
         });
     }
 }
@@ -101,8 +104,16 @@ impl Archive {
         self.error = Some(reason);
         self.retry_at = Some(web_time::Instant::now() + std::time::Duration::from_secs(2));
     }
+    pub(super) fn core_save_failed(&mut self, reason: String) {
+        self.core_save_error = Some(reason);
+        self.retry_at = Some(web_time::Instant::now() + std::time::Duration::from_secs(2));
+    }
+    pub(crate) fn core_save_retry_deferred(&self) -> bool {
+        self.core_save_error.is_some() && self.retry_at.is_some_and(|t| web_time::Instant::now() < t)
+    }
     pub(crate) fn needs_retry(&self) -> bool {
-        let data = self.migration.is_some()
+        let data = self.core_save_error.is_some()
+            || self.migration.is_some()
             || self.dirty
             || !self.tails.is_empty()
             || !self.dirty_photos.is_empty()
@@ -112,7 +123,7 @@ impl Archive {
             || self.editors.dirty();
         (data && self.retry_at.is_none_or(|t| web_time::Instant::now() >= t))
             || (!data
-                && (!self.cleanup_photos.is_empty() || self.readers.has_releases())
+                && (!self.marker_cleanup.is_empty() || !self.cleanup_photos.is_empty() || self.readers.has_releases())
                 && self.cleanup_at.is_none_or(|t| web_time::Instant::now() >= t))
     }
     pub(super) fn schedule_cleanup(&mut self, photo: PhotoId) {
@@ -120,7 +131,45 @@ impl Archive {
         self.cleanup_waiting.remove(&photo);
         self.cleanup_at = None;
     }
+    pub(super) fn marker_cleanup_failed(&mut self, key: String, photo: Option<PhotoId>, bytes: &[u8], error: String) {
+        self.marker_cleanup.insert(
+            key,
+            super::storage::reader_pins::MarkerCleanup { photo, expected_digest: lightcraft_preview::hash_bytes(bytes).to_string(), error },
+        );
+        self.cleanup_at = web_time::Instant::now().checked_add(std::time::Duration::from_millis(250));
+    }
     fn cleanup_step(&mut self, store: &mut dyn Store) {
+        if let Some((key, marker)) = self.readers.take_marker_cleanup() {
+            self.marker_cleanup.entry(key).or_insert(marker);
+        }
+        if let Some((key, marker)) = self.marker_cleanup.first_key_value().map(|(k, m)| (k.clone(), m.clone())) {
+            let pins = self.readers.clone();
+            let protection = pins.physical_pause();
+            if !protection.as_deref().is_some_and(|count| *count > 0) {
+                let result = (|| -> std::io::Result<()> {
+                    if let Some(bytes) = store.read_limited(&key, 32 * 1024)?
+                        && lightcraft_preview::hash_bytes(&bytes).to_string() != marker.expected_digest
+                    {
+                        // The path now owns a newer critical intent. Old cleanup
+                        // debt must never remove it, even after library reopen.
+                        return Ok(());
+                    }
+                    store.remove(&key)
+                })();
+                match result {
+                    Ok(()) => {
+                        self.marker_cleanup.remove(&key);
+                    }
+                    Err(e) => {
+                        if let Some(marker) = self.marker_cleanup.get_mut(&key) {
+                            marker.error = e.to_string();
+                        }
+                    }
+                }
+            }
+            self.cleanup_at = web_time::Instant::now().checked_add(std::time::Duration::from_millis(250));
+            return;
+        }
         if let Some(photo) = self.readers.take_release() {
             self.schedule_cleanup(photo);
         }
@@ -183,6 +232,7 @@ impl Archive {
                     || !self.certificate_dirty.is_empty()
                     || !self.receipts.is_empty()
             })
+            .or(self.core_save_error.as_deref())
             .or_else(|| self.editors.unsaved())
     }
     fn persist(&mut self, library: &mut crate::library::Library) -> Result<()> {

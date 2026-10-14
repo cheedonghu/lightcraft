@@ -687,20 +687,27 @@ impl Session {
     }
     /// A bounded cleanup timer needs future frames even after the last AI job ends.
     pub fn companion_cleanup_pending(&self) -> bool {
-        !self.companion_archive.cleanup_photos.is_empty()
+        !self.companion_archive.marker_cleanup.is_empty()
+            || !self.companion_archive.cleanup_photos.is_empty()
             || !self.companion_archive.cleanup_waiting.is_empty()
             || self.companion_archive.readers.has_releases()
     }
     pub fn companion_photo_cleanup_pending(&self, photo: PhotoId) -> bool {
-        self.companion_archive.cleanup_photos.contains(&photo)
+        self.companion_archive.marker_cleanup.values().any(|m| m.photo.is_none_or(|p| p == photo))
+            || self.companion_archive.cleanup_photos.contains(&photo)
             || self.companion_archive.cleanup_waiting.contains(&photo)
             || self.companion_archive.readers.photo_released(photo)
     }
     pub fn companion_cleanup_error(&self, photo: PhotoId) -> Option<&str> {
-        self.companion_archive.cleanup_errors.get(&photo).map(String::as_str)
+        self.companion_archive
+            .cleanup_errors
+            .get(&photo)
+            .map(String::as_str)
+            .or_else(|| self.companion_archive.marker_cleanup.values().find(|m| m.photo.is_none_or(|p| p == photo)).map(|m| m.error.as_str()))
     }
     pub fn companion_photo_unsaved(&self, photo: PhotoId) -> bool {
-        self.companion_archive.editors.dirty_for(photo)
+        self.companion_archive.core_save_error.is_some()
+            || self.companion_archive.editors.dirty_for(photo)
             || self.companion_history_unsaved(photo)
             || self.companion_archive.certificate_dirty.contains(&photo)
     }
