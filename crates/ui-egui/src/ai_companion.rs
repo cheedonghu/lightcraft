@@ -2260,10 +2260,19 @@ fn readonly_task_body(app: &mut LightcraftApp, ui: &mut egui::Ui, scope: PhotoSc
 }
 fn save_recovery(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
     let sizing = ui.is_sizing_pass();
-    if app.session.companion_cleanup_error(photo).is_some()
-        && !app.ai.feedback_needs_paint(ui.ctx())
-        && !ui.input(|input| input.pointer.any_down() || input.pointer.any_released())
-    {
+    let cleanup_id = egui::Id::new(("ai-cleanup-shown", app.session.library_generation(), photo.0));
+    let hold_geometry = app.ai.feedback_needs_paint(ui.ctx()) || ui.input(|input| input.pointer.any_down() || input.pointer.any_released());
+    let cleanup_shown = if hold_geometry {
+        // A pressed control must remain at its painted position through release.
+        // Defer new notices, but retain an existing row even if cleanup finishes.
+        ui.ctx().data(|data| data.get_temp::<bool>(cleanup_id).unwrap_or(false))
+    } else {
+        app.session.companion_cleanup_error(photo).is_some()
+    };
+    if !sizing {
+        ui.ctx().data_mut(|data| data.insert_temp(cleanup_id, cleanup_shown));
+    }
+    if cleanup_shown {
         let notice = ui.label(tr("File cleanup is still pending. Current conversation data is kept."));
         composer_widget(ui, "indicator:aiCleanupPending", notice.rect);
     }
