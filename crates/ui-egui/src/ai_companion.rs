@@ -13,6 +13,9 @@ mod card;
 mod card_tests;
 #[cfg(test)]
 mod clear_tests;
+mod comparison;
+#[cfg(test)]
+mod comparison_tests;
 #[cfg(test)]
 mod damaged_tests;
 #[cfg(test)]
@@ -95,6 +98,7 @@ pub struct State {
     connection: Option<network::Connection>,
     retiring_connection: Option<Arc<AtomicBool>>,
     retiring_migrations: BTreeMap<u64, lightcraft_engine::companion::MigrationRetirement>,
+    comparison: Option<comparison::Comparison>,
     #[cfg(test)]
     next_connection: Option<network::Connection>,
     pending_confirmations: Vec<(RoundIdentity, Option<String>)>,
@@ -137,6 +141,7 @@ impl Default for State {
             connection: None,
             retiring_connection: None,
             retiring_migrations: BTreeMap::new(),
+            comparison: None,
             #[cfg(test)]
             next_connection: None,
             pending_confirmations: Vec::new(),
@@ -389,7 +394,7 @@ impl State {
         if self.exiting || app.quit_confirmed {
             return Err(tr("The app is closing. AI tasks cannot start.").into());
         }
-        if self.readonly_task.is_some() {
+        if self.readonly_task.is_some() || self.comparison.is_some() {
             return Err(tr("Return to the selected photo before starting a new AI task.").into());
         }
         if app.session.companion_migration_pending() {
@@ -1294,6 +1299,7 @@ impl State {
         self.retiring_migrations.retain(|_, receipt| !receipt.retired());
         self.poll_pages(app);
         self.poll_interruption(app, ctx);
+        comparison::poll(self, app, ctx);
         for (photo, c) in &mut self.conversations {
             if c.storage_notice && !app.session.companion_history_unsaved(*photo) && !self.pending_local_saves.contains(photo) {
                 c.notice = tr("AI history saved. Photo changes are kept.").into();
@@ -1720,6 +1726,9 @@ pub(crate) fn selection_intent(app: &mut LightcraftApp) {
 pub fn show_task_entry(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     task_entry::show(app, ui);
 }
+pub fn show_comparison(app: &mut LightcraftApp, ui: &mut egui::Ui) -> bool {
+    comparison::show(app, ui)
+}
 
 pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
     let mut state = std::mem::take(&mut app.ai);
@@ -1745,6 +1754,7 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
 /// after a failed save or a confirmed unsaved exit.
 pub fn cancel_for_library_change(app: &mut LightcraftApp) {
     let state = &mut app.ai;
+    state.comparison = None;
     let photos: Vec<_> = state.jobs.keys().copied().collect();
     // Revoke every round before any stop control, draft staging or storage can fail.
     for job in state.jobs.values() {
@@ -1855,7 +1865,11 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             })
         }
         "ai.task" => task_entry::navigate(&mut state, app),
-        "ai.returnCurrent" => task_entry::return_current(&mut state, app),
+        "ai.compare" => comparison::enter(&mut state, app, params),
+        "ai.returnCurrent" => {
+            state.comparison = None;
+            task_entry::return_current(&mut state, app)
+        }
         "ai.health" => {
             state.health.request(network::service_address(app.services.companion_address.as_deref()));
             Ok(state.health.status())
@@ -1941,6 +1955,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 "readonlyPhoto": state.readonly_task.map(|scope| scope.photo.0),
                 "viewedPhoto": viewed_photo.map(|p| p.0),
                 "task": state.task.as_ref().map(task_entry::Task::status),
+                "comparison": state.comparison.as_ref().map(comparison::Comparison::status),
                 "health": state.health.status(),
                 "transport": state.telemetry.status(state.connection.as_ref().is_some_and(|c| c.alive.load(Ordering::Relaxed) && !c.is_closing())),
                 "busy": photo.is_some_and(|p| state.jobs.contains_key(&p)),
@@ -2569,6 +2584,12 @@ fn composer_widget(ui: &egui::Ui, id: &str, rect: egui::Rect) {
 }
 
 fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact: bool) {
+    if app.ai.comparison.is_some() {
+        ui.label(tr("Historical preview"));
+        ui.label(tr("Return to the selected photo before starting a new AI task."));
+        comparison::return_button(app, ui);
+        return;
+    }
     let sizing = ui.is_sizing_pass();
     let busy = app.ai.jobs.contains_key(&photo);
     let editor_ready = app.ai.editor_photo == Some(photo) && app.ai.editors.contains_key(&photo);

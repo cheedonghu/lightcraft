@@ -56,6 +56,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("ai.start", "Analyze and Optimize", None, ""),
     ("ai.stop", "Stop AI", None, ""),
     ("ai.undo", "Undo AI Round", None, ""),
+    ("ai.compare", "Historical preview", None, ""),
     ("ai.retrySave", "Retry Saving", None, ""),
     ("ai.history", "Read AI history", None, ""),
     ("ai.bottom", "Back to bottom", None, ""),
