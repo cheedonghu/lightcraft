@@ -1,0 +1,5 @@
+    Checking lightcraft-engine v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-integration/lightcraft/crates/engine)
+   Compiling lightcraft-ui-egui v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-integration/lightcraft/crates/ui-egui)
+    Checking lightcraft-web v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-integration/lightcraft/apps/lightcraft-web)
+    Checking lightcraft v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-integration/lightcraft/apps/lightcraft)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 12.20s
