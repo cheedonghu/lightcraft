@@ -1,0 +1,46 @@
+{
+  "runtime": {
+    "clients": 32,
+    "active_rounds": 4,
+    "queued_rounds": 40
+  },
+  "checks": [
+    "A01 actual desktop command cannot grant consent; no model preview",
+    "A05 real initial/correction provider calls contain distinct actual previews and complete history",
+    "A06/A14 actual process relaunch retains qualified saved round and effect without resuming task",
+    "A06/A07/A08 historical native pair returns without restoring old effects; later edit refuses round revert"
+  ],
+  "photo": 1,
+  "modelCalls": 2,
+  "historicalDimensions": {
+    "before": {
+      "available": true,
+      "height": 400,
+      "width": 640
+    },
+    "after": {
+      "available": true,
+      "height": 400,
+      "width": 640
+    }
+  },
+  "perf": {
+    "fps": 14.70758999819699,
+    "frameMs": 0.64599609375,
+    "gpu": "Apple M1 Pro (Metal)",
+    "gpuFallback": null,
+    "gpuReason": null,
+    "lastMerge": null,
+    "lastRenderMs": 10.205208,
+    "logicMs": 66.14501953125,
+    "maxUpdateMs": 209.82275390625,
+    "mergeRunning": false,
+    "pendingSlots": [],
+    "renderQueue": 0,
+    "rendersDone": 5,
+    "rendersInFlight": 0,
+    "thumbTextures": 1,
+    "updateMs": 66.791015625,
+    "variantTextures": 0
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "configuredDefaults": {
+    "clients": 32,
+    "active": 4,
+    "queued": 40
+  },
+  "observedIndependent": {
+    "clients": 31,
+    "active": 4,
+    "queued": 40
+  },
+  "actualDesktopIsClient32": true,
+  "client33Refused": true,
+  "round45Refused": true,
+  "independentHeartbeatAcknowledgements": 31,
+  "desktopHeartbeatAcknowledgements": 1,
+  "modelTextAge": null,
+  "queuedDesktopRevocationSeconds": 0.5827433749999997,
+  "checks": [
+    "definitive queue rejection unlocks Q29",
+    "actual queued admission keeps Q29 lock",
+    "actual checkbox revocation cancels queued work and permits fresh manual edit",
+    "SSE heartbeats remain live"
+  ]
+}

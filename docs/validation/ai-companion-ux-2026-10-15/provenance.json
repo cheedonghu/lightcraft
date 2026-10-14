@@ -1,0 +1,11 @@
+{
+  "completed-zh.png": "22/native-cold-3/completed-zh.png",
+  "historical-en.png": "22/native-cold-3/historical-en.png",
+  "queued-en.png": "22/capacity-5/queued-en.png",
+  "comparison-narrow-zh.png": "19/screenshots/comparison-narrow-zh-hans.png",
+  "reading-narrow-zh.png": "21/fix-screens/input-narrow-zh-hans.png",
+  "interrupted-zh.png": "15/screenshots/interrupted-zh-hans.png",
+  "native-cold.json": "22/native-cold-3/result.json",
+  "capacity.json": "22/capacity-5/result.json",
+  "visual-checks.json": "22/visual-summary.json"
+}

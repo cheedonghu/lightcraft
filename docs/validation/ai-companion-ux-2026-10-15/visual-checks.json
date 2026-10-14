@@ -1,0 +1,42 @@
+[
+  {
+    "name": "format",
+    "exit": 0,
+    "seconds": 2.76
+  },
+  {
+    "name": "native",
+    "exit": 0,
+    "seconds": 21.87
+  },
+  {
+    "name": "reading",
+    "exit": 0,
+    "seconds": 63.63
+  },
+  {
+    "name": "migration",
+    "exit": 0,
+    "seconds": 21.96
+  },
+  {
+    "name": "strict",
+    "exit": 0,
+    "seconds": 30.64
+  },
+  {
+    "name": "wasm",
+    "exit": 0,
+    "seconds": 54.54
+  },
+  {
+    "name": "build",
+    "exit": 0,
+    "seconds": 53.47
+  },
+  {
+    "name": "fmt",
+    "exit": 0,
+    "seconds": 2.78
+  }
+]
