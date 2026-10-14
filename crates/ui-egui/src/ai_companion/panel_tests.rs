@@ -397,6 +397,8 @@ fn supported_short_tools_allow_idle_draft_clear_and_start_through_visible_widget
             reachable(&mut h, "button:aiClear", -1.0);
             short_snapshot(&mut h, &format!("short-idle-{}-{}-{}", if stacked { "stack" } else { "float" }, height as usize, language.code()));
             assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClear"}), timeout)["ok"], true);
+            assert!(h.app.session.photo_companion(photo).unwrap().is_some(), "original context remains until confirmation");
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClearConfirm"}), timeout)["ok"], true);
             assert!(h.app.session.photo_companion(photo).unwrap().is_none());
             assert_eq!(h.app.ai.prompt, "Please keep natural colors.");
             reachable(&mut h, "checkbox:aiConsent", 1.0);

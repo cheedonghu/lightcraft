@@ -965,6 +965,12 @@ pub enum Dialog {
         folder: String,
         catalog: Option<String>,
     },
+    /// Explicitly captured conversation scope; it never follows selection changes.
+    ConfirmCompanionClear {
+        photo: u64,
+        library_generation: u64,
+        expected_epoch: u64,
+    },
     /// Confirm moving photos to Recently Deleted.
     ConfirmDelete {
         count: usize,

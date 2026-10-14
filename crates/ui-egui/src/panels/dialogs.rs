@@ -253,6 +253,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
         Dialog::ContactSheet { .. } => "Contact Sheet PDF",
         Dialog::Merge { opts } => opts.title(),
         Dialog::Settings { .. } => "Settings",
+        Dialog::ConfirmCompanionClear { .. } => "Delete Conversation",
         Dialog::ConfirmDelete { .. } => "Delete Photos",
         Dialog::LightroomCatalog { .. } => "Lightroom Classic Catalog",
         Dialog::RemoveFolder { disk: true, .. } => "Remove Disk from Library",
@@ -1088,6 +1089,9 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                         .color(t.text_dim),
                     );
                 }
+                Dialog::ConfirmCompanionClear { .. } => {
+                    ui.label(crate::i18n::tr("Plans and comparisons in this conversation will also be deleted. Photo effects, edit history and the unsent draft are kept."));
+                }
                 Dialog::ConfirmDelete { count } => {
                     let what = if *count == 1 { crate::i18n::tr("this photo").to_string() } else { crate::i18n::tr_format!("these {count} photos", count = count) };
                     ui.label(crate::i18n::tr_format!("Move {what} to Recently Deleted?", what = what));
@@ -1208,7 +1212,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     Dialog::DenoiseModel { .. } => "Install",
                     Dialog::FaceModel { info, .. } if !informational && info["download"].is_string() => "Download",
                     Dialog::FaceModel { .. } if !informational => "Install",
-                    Dialog::ConfirmDelete { .. } | Dialog::DeleteKeyword { .. } => "Delete",
+                    Dialog::ConfirmDelete { .. } | Dialog::DeleteKeyword { .. } | Dialog::ConfirmCompanionClear { .. } => "Delete",
                     // (not "Merge": that is photo merging, HDR / panorama, in some languages)
                     Dialog::MoveKeyword { .. } => "Merge Keywords",
                     Dialog::KeywordSet { .. } => "Save",
@@ -1236,6 +1240,9 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                 let r = (!ok.is_empty()).then(|| ui.add_enabled(can_confirm, egui::Button::new(crate::i18n::tr(ok))));
                 if let Some(r) = &r {
                     crate::widgets::register(ui.ctx(), "button:dialogOk", r.rect);
+                    if matches!(dlg, Dialog::ConfirmCompanionClear { .. }) {
+                        crate::widgets::register(ui.ctx(), "button:aiClearConfirm", r.rect);
+                    }
                 }
                 if r.is_some_and(|r| r.clicked()) {
                     if informational {
@@ -1675,6 +1682,9 @@ pub fn confirm_dialog(app: &mut LightcraftApp, dlg: &Dialog) -> Result<serde_jso
         }
         Dialog::Merge { opts } => crate::merge::start_final(app, opts),
         Dialog::Import { opts } => crate::import::start(app, opts),
+        Dialog::ConfirmCompanionClear { photo, library_generation, expected_epoch } => {
+            app.run("ai.clear", json!({"confirm":true,"photo":photo,"library_generation":library_generation,"expected_epoch":expected_epoch}))
+        }
         Dialog::ConfirmDelete { .. } => app.run("photo.delete", json!({})),
         // the catalog found: no file dialog; none: File ▸ Import Lightroom Catalog… asks for it
         Dialog::LightroomCatalog { catalog, .. } => {

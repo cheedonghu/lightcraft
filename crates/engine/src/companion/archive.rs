@@ -39,6 +39,7 @@ pub(crate) struct Archive {
     pub(super) certificate_dirty: BTreeSet<PhotoId>,
     pub(super) core_save_error: Option<String>,
     pub(super) clear_errors: BTreeMap<PhotoId, String>,
+    pub(super) ephemeral_epochs: BTreeMap<PhotoId, u64>,
     dirty: bool,
     pub(super) blocked: Option<String>,
     pub(super) error: Option<String>,

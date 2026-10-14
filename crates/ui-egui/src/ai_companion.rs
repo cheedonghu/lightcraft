@@ -1752,9 +1752,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
     state.sync_task_selection(app);
     let photo = params.get("photo").and_then(Value::as_u64).map(PhotoId).or_else(|| app.session.active());
     let result = match id {
-        "ai.clear" | "ai.undo" if state.readonly_task.is_some() => {
-            Err(tr("Return to the selected photo before changing its AI conversation or edits.").into())
-        }
+        "ai.undo" if state.readonly_task.is_some() => Err(tr("Return to the selected photo before changing its AI conversation or edits.").into()),
         "ai.open" => {
             state.open = true;
             state.leave_task_view();
@@ -1806,6 +1804,16 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
             // Storage-only recovery. Do not poll jobs, reconnect, confirm a
             // backend receipt, end an interaction, or replay a rejected edit.
             state.stage_editors(app)?;
+            if let Some(photo) = viewed_photo
+                && let Some(epoch) = app.session.pending_companion_clear_epoch(photo).map_err(|e| e.to_string())?
+            {
+                clear(
+                    &mut state,
+                    app,
+                    photo,
+                    &json!({"confirm":true,"photo":photo.0,"library_generation":app.session.library_generation(),"expected_epoch":epoch}),
+                )?;
+            }
             state.flush_local_saves(app)?;
             app.session.persist().map_err(|e| tr(&e.to_string()).to_owned())?;
             if viewed_photo.is_some_and(|photo| app.session.companion_photo_unsaved(photo) || state.pending_local_saves.contains(&photo)) {
@@ -1932,7 +1940,21 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                     .ok_or_else(|| "请先选择照片。".to_owned())?;
                 undo(&mut state, app, target, round)
             }),
-        "ai.clear" => photo.ok_or_else(|| "请先选择照片。".into()).and_then(|p| clear(&mut state, app, p, params)),
+        "ai.clear" => (|| {
+            let target = params
+                .get("photo")
+                .map(|value| value.as_u64().map(PhotoId).ok_or_else(|| tr("Choose a valid photo to delete its conversation.").to_owned()))
+                .transpose()?;
+            if params.get("confirm").and_then(Value::as_bool) == Some(true) && target.is_none() {
+                return Err(tr("Choose a valid photo to delete its conversation.").into());
+            }
+            let target =
+                target.or_else(|| state.displayed_photo(app)).ok_or_else(|| tr("Select exactly one photo to start an AI task.").to_owned())?;
+            if state.readonly_task.is_some_and(|scope| scope.photo != target) {
+                return Err(tr("Choose the displayed photo to delete its conversation.").into());
+            }
+            clear(&mut state, app, target, params)
+        })(),
         _ => {
             app.ai = state;
             return None;
@@ -1988,41 +2010,68 @@ fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, params: &Va
         return Err(tr("This delete request belongs to another or closed library.").into());
     }
     if state.jobs.contains_key(&photo) || state.worker_busy(photo) {
-        return Err("处理期间不能删除对话，请先停止并等待结束。".into());
+        return Err(tr("Stop the AI task and wait for it to finish before deleting its conversation.").into());
     }
     if params.get("confirm").and_then(Value::as_bool) != Some(true) {
-        let epoch = if app.session.library.is_some() {
-            app.session.companion_photo_header(photo).map_err(|e| e.to_string())?.map(|h| h.conversation_epoch).unwrap_or(0)
-        } else {
-            0
-        };
+        let epoch = app.session.companion_conversation_epoch(photo).map_err(|e| e.to_string())?;
+        app.ui.dialog = Some(crate::state::Dialog::ConfirmCompanionClear {
+            photo: photo.0,
+            library_generation: app.session.library_generation(),
+            expected_epoch: epoch,
+        });
         return Ok(json!({"confirmationRequired":true,"photo":photo.0,"libraryGeneration":app.session.library_generation(),"expectedEpoch":epoch}));
     }
-    state.load(app, photo)?;
-    let names: BTreeSet<_> = state
-        .conversations
-        .get(&photo)
-        .into_iter()
-        .flat_map(|c| c.messages.iter())
-        .flat_map(|m| m.get("images").and_then(Value::as_array).into_iter().flatten())
-        .filter_map(|p| p.get("attachment").and_then(Value::as_str).map(str::to_owned))
-        .collect();
-    app.session.set_photo_companion(photo, None).map_err(|e| e.to_string())?;
-    app.session.pin_companion_prefix(photo, None).map_err(|e| e.to_string())?;
-    app.session.persist().map_err(|e| e.to_string())?;
-    state.conversations.insert(
-        photo,
-        Conversation { scope: Some(PhotoScope { library_generation: app.session.library_generation(), photo }), ..Default::default() },
-    );
-    if let Some(library) = app.session.library.as_mut() {
-        for name in names {
-            // V2 objects belong to immutable transaction graphs. Bounded retirement
-            // owns their cleanup; the empty HEAD already excludes them from projection.
-            if name.starts_with("companion/v2/") {
-                continue;
-            }
-            library.remove_companion_attachment(&name).map_err(|e| e.to_string())?;
+    let expected_epoch =
+        params.get("expected_epoch").and_then(Value::as_u64).ok_or_else(|| tr("Choose the conversation version to delete.").to_owned())?;
+    state.stage_editors(app)?;
+    let scope = PhotoScope { library_generation: app.session.library_generation(), photo };
+    let receipt = match app.session.companion_clear(scope, expected_epoch) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            let message = tr(if app.session.companion_history_unsaved(photo) {
+                "Conversation deletion has not been saved. Check storage, then retry saving."
+            } else {
+                "This conversation could not be deleted. Original history is retained."
+            })
+            .to_owned();
+            let conversation = state.conversations.entry(photo).or_default();
+            conversation.notice = message.clone();
+            conversation.storage_notice = app.session.companion_history_unsaved(photo);
+            state.text = message.clone();
+            return Err(message);
         }
+    };
+    state.paging.cancel();
+    state.attachments.cancel();
+    state.pending_local_saves.remove(&photo);
+    state.pending_confirmations.retain(|(identity, _)| identity.scope != scope);
+    state.save_retry_feedback.remove(&photo);
+    state.bottom_reading.remove(&photo);
+    state.conversations.insert(photo, Conversation { scope: Some(scope), ..Default::default() });
+    if let Some(editor) = state.editors.get_mut(&photo) {
+        editor.data.scroll_offset = 0.0;
+        editor.data.follow_tail = true;
+        editor.data.reading_cursor = None;
+        editor.data.reading_epoch = Some(receipt.conversation_epoch);
+        editor.data.reading_count = Some(0);
+        editor.restore_scroll = true;
+        // A removed photo's independently saved draft stays owned by the
+        // archive. Its obsolete reading epoch cannot select the new context.
+        if app.session.catalog.photo(photo).is_some() {
+            app.session.set_companion_editor(photo, editor.data.clone()).map_err(|e| e.to_string())?;
+        }
+    }
+    if state.task.as_ref().is_some_and(|task| task.identity.scope == scope) {
+        state.task = None;
+    }
+    if state.readonly_task == Some(scope) {
+        state.leave_task_view();
+    }
+    state.conversations.entry(photo).or_default().notice =
+        tr("The old conversation is cleared. Future requests start from the current photo.").into();
+    if matches!(&app.ui.dialog, Some(crate::state::Dialog::ConfirmCompanionClear { photo: target, library_generation, expected_epoch: epoch }) if *target == photo.0 && *library_generation == scope.library_generation && *epoch == expected_epoch)
+    {
+        app.ui.dialog = None;
     }
     Ok(json!({"cleared":true}))
 }
@@ -2197,12 +2246,27 @@ fn readonly_task_body(app: &mut LightcraftApp, ui: &mut egui::Ui, scope: PhotoSc
             ui.ctx().copy_text(trace);
         }
     }
+    let clear =
+        ui.add_enabled(!app.ai.jobs.contains_key(&scope.photo) && !app.ai.worker_busy(scope.photo), egui::Button::new(tr("Delete Conversation")));
+    composer_widget(ui, "button:aiClear", clear.rect);
+    if clear.clicked()
+        && let Err(error) = app.run("ai.clear", json!({"photo":scope.photo.0}))
+    {
+        app.ai.text = error;
+    }
     save_recovery(app, ui, scope.photo);
     let height = if compact { 240.0 } else { ui.available_height().max(0.0) };
     message_area(app, ui, scope.photo, height);
 }
 fn save_recovery(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
     let sizing = ui.is_sizing_pass();
+    if app.session.companion_cleanup_error(photo).is_some()
+        && !app.ai.feedback_needs_paint(ui.ctx())
+        && !ui.input(|input| input.pointer.any_down() || input.pointer.any_released())
+    {
+        let notice = ui.label(tr("File cleanup is still pending. Current conversation data is kept."));
+        composer_widget(ui, "indicator:aiCleanupPending", notice.rect);
+    }
     let protection_error = app.session.companion_revert_save_error(photo);
     // Ordinary dirty drafts and queued saves are not storage failures.
     let unsaved = protection_error.is_some()

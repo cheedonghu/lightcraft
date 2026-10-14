@@ -30,7 +30,8 @@ fn unopened_conversation_cannot_undo_after_manual_change_away_and_back() {
     app.run("develop.set", json!({"values":{"light.exposure":before.light.exposure}})).unwrap();
     assert_eq!(*app.session.develop_of(photo).unwrap(), *before);
     assert!(app.run("ai.undo", json!({"local_round_id":"old-round"})).unwrap_err().contains("History"));
-    app.run("ai.clear", json!({})).unwrap();
+    let confirmation = app.run("ai.clear", json!({})).unwrap();
+    app.run("ai.clear",json!({"confirm":true,"photo":confirmation["photo"],"library_generation":confirmation["libraryGeneration"],"expected_epoch":confirmation["expectedEpoch"]})).unwrap();
     assert!(app.session.photo_companion(photo).unwrap().is_none());
     assert_eq!(*app.session.develop_of(photo).unwrap(), *before);
 }
@@ -73,7 +74,8 @@ fn conversation_and_preview_survive_reopen_and_clear_preserves_the_recoverable_l
     assert!(status["text"].as_str().unwrap().contains("恢复对话"));
     assert_eq!(h.app.session.library.as_mut().unwrap().read_companion_attachment(&name).unwrap(), b"synthetic preview");
     let history_entries = h.app.session.undo.len();
-    h.app.run("ai.clear", json!({})).unwrap();
+    let confirmation = h.app.run("ai.clear", json!({})).unwrap();
+    h.app.run("ai.clear",json!({"confirm":true,"photo":confirmation["photo"],"library_generation":confirmation["libraryGeneration"],"expected_epoch":confirmation["expectedEpoch"]})).unwrap();
     assert_eq!(h.app.session.companion_messages_page(photo, 0, 1).unwrap().records, Vec::<serde_json::Value>::new());
     assert!(!h.app.run("ai.status", json!({})).unwrap()["text"].as_str().unwrap().contains("恢复对话"));
     assert_eq!(*h.app.session.develop_of(photo).unwrap(), *before);

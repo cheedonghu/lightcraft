@@ -682,12 +682,16 @@ impl LightcraftApp {
                 self.ui.unsaved_seen = true;
                 let t = ctx.input(|i| i.time);
                 self.ui.toast = Some((
-                    crate::i18n::tr_format!(
-                        "{n} change{} saved in memory but not written to disk: {e} — LightCraft will retry",
-                        if n == 1 { "" } else { "s" },
-                        n = n,
-                        e = e
-                    ),
+                    if self.session.companion_save_requires_explicit_retry() {
+                        crate::i18n::tr("Conversation deletion requires an explicit save retry in that photo's AI conversation.").to_owned()
+                    } else {
+                        crate::i18n::tr_format!(
+                            "{n} change{} saved in memory but not written to disk: {e} — LightCraft will retry",
+                            if n == 1 { "" } else { "s" },
+                            n = n,
+                            e = e
+                        )
+                    },
                     t + 6.0,
                     None,
                 ));

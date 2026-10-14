@@ -565,78 +565,107 @@ fn outgoing(h: &mut Headless, requests: &mpsc::Receiver<network::Request>, suffi
 }
 #[test]
 fn backend_failure_with_unconfirmed_feedback_keeps_actual_published_edit_and_original_global_scope() {
-    let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
-    app.ui.settings.gpu = false;
-    let (connection, requests, events) = network::test_connection();
-    app.ai.connection = Some(connection);
-    app.ai.generation = app.session.library_generation();
-    let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
-    h.app.run("ai.open", json!({})).unwrap();
-    frames(&mut h);
-    request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
-    let photo = h.app.session.active().unwrap();
-    h.app.run("ai.start", json!({"prompt":"Improve this photo"})).unwrap();
-    let create = outgoing(&mut h, &requests, "/v1/rounds");
-    let phase = |events: &mpsc::SyncSender<network::Event>, state: &str| {
-        events.send(network::Event::Server{kind:"round.state".into(),data:json!({"round_id":"published-round","payload":{"submission_seq":create.submission,"photo_ref":create.body["photo_ref"],"state":state}})}).unwrap()
-    };
-    phase(&events, "awaiting_input");
-    outgoing(&mut h, &requests, "/input");
-    phase(&events, "awaiting_initial_execution");
-    let operations = json!([{"type":"set_controls","values":{"light.exposure":0.4}}]);
-    events.send(network::Event::Server{kind:"message.completed".into(),data:json!({"round_id":"published-round","stage":"initial","payload":{"message_id":"proposal","model_call_id":"model-1","tool_calls":[{"id":"edit-tool","name":"apply_edit_plan","arguments":{"operations":operations}}]}})}).unwrap();
-    events.send(network::Event::Server{kind:"edit.plan".into(),data:json!({"round_id":"published-round","stage":"initial","payload":{"plan_id":"initial-plan","tool_call_id":"edit-tool","capability_version":"lightcraft-v2","expected_revision":h.app.session.photo_revision(photo),"reason":"Raise exposure slightly","operations":operations}})}).unwrap();
-    let execution = outgoing(&mut h, &requests, "/execution");
-    assert_eq!(execution.body["outcome"], "succeeded");
-    assert_eq!(execution.body["actual_state"]["light"]["exposure"], 0.4);
-    assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.4);
-    let other = h.app.session.catalog.photos().find(|p| p.id != photo).unwrap().id;
-    h.app.run("library.select", json!({"ids":[other.0]})).unwrap();
-    h.app.run("panel.close", json!({})).unwrap();
-    phase(&events, "analyzing_review");
-    events.send(network::Event::Server{kind:"round.ended".into(),data:json!({"round_id":"published-round","trace_id":"123456789abc","payload":{"terminal_state":"failed","reason_code":"model_failed","last_confirmed_plan_id":null}})}).unwrap();
-    frames(&mut h);
-    assert_eq!(h.app.session.active(), Some(other));
-    assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.4);
-    let status = h.app.run("ai.status", json!({"photo":photo.0})).unwrap();
-    let text = status["text"].as_str().unwrap();
-    assert!(text.contains("latest complete edit is kept") && !text.contains("starting settings"), "{status}");
-    assert_eq!(status["task"]["photo"], photo.0);
-    assert_eq!(status["task"]["terminal"], "failed");
-    assert_eq!(status["task"]["unread"], true);
-    request(&mut h, "ui.clickWidget", json!({"id":"button:aiTaskEntry"}));
-    frames(&mut h);
-    assert_eq!(h.app.session.active(), Some(photo));
-    assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.4);
-    request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
-    assert_eq!(h.view.clipboard, "123456789abc");
-    assert!(requests.try_recv().is_err());
-    h.app.session.execute("develop.set", &json!({"ids":[other.0],"values":{"light.exposure":0.7}})).unwrap();
-    h.app.session.execute("photo.delete", &json!({"ids":[photo.0]})).unwrap();
-    h.app.run("library.select", json!({"ids":[other.0]})).unwrap();
-    h.app.run("ai.task", json!({})).unwrap();
-    frames(&mut h);
-    assert_eq!(h.app.run("ai.status", json!({})).unwrap()["readonlyPhoto"], photo.0);
-    request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
-    assert_eq!(h.view.clipboard, "123456789abc");
-    // Catches a read-only A card opening selected B's History; misses native OS input delivery.
-    let id = format!("button:aiHistory:{}", status["task"]["localRoundId"].as_str().unwrap());
-    request(&mut h, "ui.clickWidget", json!({"id":id}));
-    frames(&mut h);
-    assert_eq!(request(&mut h, "ui.inspect", json!({}))["result"]["ui"]["right"], "ai");
-    // Catches default selected-B mutations while A is shown; misses the future clear confirmation UI.
-    assert!(h.app.run("ai.clear", json!({})).is_err(), "readonly task view rejects clearing the selected photo");
-    assert!(h.app.run("ai.undo", json!({})).is_err(), "readonly task view rejects an old effect restore");
-    assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiClear" || id == "button:aiUndo"));
-    // Catches readonly diagnostics clipped from a supported short pane; misses native window rendering.
-    h.app.run("ui.dock", json!({"operation":"float","panel":"tools","rect":[450,100,320,120]})).unwrap();
-    h.app.run("ai.task", json!({})).unwrap();
-    frames(&mut h);
-    super::panel_tests::reachable(&mut h, "button:aiCopyTrace", -1.0);
-    request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
-    assert_eq!(h.view.clipboard, "123456789abc");
-    assert_eq!(h.app.session.develop_of(other).unwrap().light.exposure, 0.7);
-    assert!(requests.try_recv().is_err());
+    for removed in [false, true] {
+        let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
+        app.ui.settings.gpu = false;
+        let (connection, requests, events) = network::test_connection();
+        app.ai.connection = Some(connection);
+        app.ai.generation = app.session.library_generation();
+        let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
+        h.app.run("ai.open", json!({})).unwrap();
+        frames(&mut h);
+        request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
+        let photo = h.app.session.active().unwrap();
+        h.app.run("ai.start", json!({"prompt":"Improve this photo"})).unwrap();
+        let create = outgoing(&mut h, &requests, "/v1/rounds");
+        let phase = |events: &mpsc::SyncSender<network::Event>, state: &str| {
+            events.send(network::Event::Server{kind:"round.state".into(),data:json!({"round_id":"published-round","payload":{"submission_seq":create.submission,"photo_ref":create.body["photo_ref"],"state":state}})}).unwrap()
+        };
+        phase(&events, "awaiting_input");
+        outgoing(&mut h, &requests, "/input");
+        phase(&events, "awaiting_initial_execution");
+        let operations = json!([{"type":"set_controls","values":{"light.exposure":0.4}}]);
+        events.send(network::Event::Server{kind:"message.completed".into(),data:json!({"round_id":"published-round","stage":"initial","payload":{"message_id":"proposal","model_call_id":"model-1","tool_calls":[{"id":"edit-tool","name":"apply_edit_plan","arguments":{"operations":operations}}]}})}).unwrap();
+        events.send(network::Event::Server{kind:"edit.plan".into(),data:json!({"round_id":"published-round","stage":"initial","payload":{"plan_id":"initial-plan","tool_call_id":"edit-tool","capability_version":"lightcraft-v2","expected_revision":h.app.session.photo_revision(photo),"reason":"Raise exposure slightly","operations":operations}})}).unwrap();
+        let execution = outgoing(&mut h, &requests, "/execution");
+        assert_eq!(execution.body["outcome"], "succeeded");
+        assert_eq!(execution.body["actual_state"]["light"]["exposure"], 0.4);
+        assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.4);
+        let other = h.app.session.catalog.photos().find(|p| p.id != photo).unwrap().id;
+        h.app.run("library.select", json!({"ids":[other.0]})).unwrap();
+        h.app.run("panel.close", json!({})).unwrap();
+        phase(&events, "analyzing_review");
+        events.send(network::Event::Server{kind:"round.ended".into(),data:json!({"round_id":"published-round","trace_id":"123456789abc","payload":{"terminal_state":"failed","reason_code":"model_failed","last_confirmed_plan_id":null}})}).unwrap();
+        frames(&mut h);
+        assert_eq!(h.app.session.active(), Some(other));
+        assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.4);
+        let status = h.app.run("ai.status", json!({"photo":photo.0})).unwrap();
+        let text = status["text"].as_str().unwrap();
+        assert!(text.contains("latest complete edit is kept") && !text.contains("starting settings"), "{status}");
+        assert_eq!(status["task"]["photo"], photo.0);
+        assert_eq!(status["task"]["terminal"], "failed");
+        assert_eq!(status["task"]["unread"], true);
+        request(&mut h, "ui.clickWidget", json!({"id":"button:aiTaskEntry"}));
+        frames(&mut h);
+        assert_eq!(h.app.session.active(), Some(photo));
+        assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.4);
+        request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
+        assert_eq!(h.view.clipboard, "123456789abc");
+        assert!(requests.try_recv().is_err());
+        h.app.session.execute("develop.set", &json!({"ids":[other.0],"values":{"light.exposure":0.7}})).unwrap();
+        request(&mut h, "ui.clickWidget", json!({"id":"field:aiPrompt"}));
+        request(&mut h, "ui.key", json!({"key":"A","cmd":true}));
+        request(&mut h, "ui.text", json!({"text":"Keep owned readonly draft"}));
+        assert_eq!(h.app.session.companion_editor(photo).unwrap().draft, "Keep owned readonly draft");
+        if removed {
+            h.app.session.commit("Remove task photo", lightcraft_catalog::Op::RemovePhoto { id: photo }).unwrap();
+        } else {
+            h.app.session.execute("photo.delete", &json!({"ids":[photo.0]})).unwrap();
+        }
+        h.app.run("library.select", json!({"ids":[other.0]})).unwrap();
+        h.app.run("ai.task", json!({})).unwrap();
+        frames(&mut h);
+        assert_eq!(h.app.run("ai.status", json!({})).unwrap()["readonlyPhoto"], photo.0);
+        request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
+        assert_eq!(h.view.clipboard, "123456789abc");
+        // Catches a read-only A card opening selected B's History; misses native OS input delivery.
+        let id = format!("button:aiHistory:{}", status["task"]["localRoundId"].as_str().unwrap());
+        request(&mut h, "ui.clickWidget", json!({"id":id}));
+        frames(&mut h);
+        assert_eq!(request(&mut h, "ui.inspect", json!({}))["result"]["ui"]["right"], "ai");
+        // Confirming deletion targets the displayed owned A, never the selected B.
+        let confirmation = h.app.run("ai.clear", json!({})).unwrap();
+        assert_eq!(confirmation["photo"], photo.0);
+        frames(&mut h);
+        request(&mut h, "ui.clickWidget", json!({"id":"button:dialogCancel"}));
+        assert!(h.app.run("ai.undo", json!({})).is_err(), "readonly task view rejects an old effect restore");
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiUndo"));
+        // Catches readonly diagnostics clipped from a supported short pane; misses native window rendering.
+        h.app.run("ui.dock", json!({"operation":"float","panel":"tools","rect":[450,100,320,120]})).unwrap();
+        h.app.run("ai.task", json!({})).unwrap();
+        frames(&mut h);
+        super::panel_tests::reachable(&mut h, "button:aiCopyTrace", -1.0);
+        request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
+        assert_eq!(h.view.clipboard, "123456789abc");
+        assert_eq!(h.app.session.develop_of(other).unwrap().light.exposure, 0.7);
+        assert!(requests.try_recv().is_err());
+        let before = serde_json::to_value(&h.app.session.catalog).unwrap();
+        let undo = h.app.session.undo.iter().map(|entry| entry.label.clone()).collect::<Vec<_>>();
+        assert!(h.app.run("ai.clear", json!({"photo":other.0})).is_err(), "readonly A is not authority to delete selected B");
+        super::panel_tests::reachable(&mut h, "button:aiClear", 1.0);
+        request(&mut h, "ui.clickWidget", json!({"id":"button:aiClear"}));
+        request(&mut h, "ui.clickWidget", json!({"id":"button:dialogOk"}));
+        let after = h.app.run("ai.status", json!({"photo":photo.0})).unwrap();
+        assert!(after["task"].is_null() && after["readonlyPhoto"].is_null());
+        assert_eq!(h.app.session.companion_editor(photo).unwrap().draft, "Keep owned readonly draft");
+        assert!(!after["text"].as_str().unwrap().contains("Raise exposure slightly"));
+        assert_eq!(h.app.session.active(), Some(other));
+        assert_eq!(serde_json::to_value(&h.app.session.catalog).unwrap(), before);
+        assert_eq!(h.app.session.undo.iter().map(|entry| entry.label.clone()).collect::<Vec<_>>(), undo);
+        let old_confirm = json!({"confirm":true,"photo":photo.0,"library_generation":confirmation["libraryGeneration"],"expected_epoch":confirmation["expectedEpoch"]});
+        assert!(h.app.run("ai.clear", old_confirm).is_err(), "old confirmation cannot delete the next context");
+        assert_eq!(h.app.run("ai.clear", json!({"photo":photo.0})).unwrap()["expectedEpoch"], 1);
+    }
 }
 
 // Verifies implemented UI through actual frame/control surfaces; no native OS compositor claim.

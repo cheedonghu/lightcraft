@@ -277,3 +277,140 @@ fn reopened_unacknowledged_clear_stays_protected_until_its_explicit_storage_retr
         drop(fresh);
     }
 }
+
+struct ClearCleanupFault {
+    memory: MemStore,
+    failed: Arc<AtomicBool>,
+}
+impl Store for ClearCleanupFault {
+    fn read(&mut self, k: &str) -> io::Result<Option<Vec<u8>>> {
+        self.memory.read(k)
+    }
+    fn read_limited(&mut self, k: &str, n: u64) -> io::Result<Option<Vec<u8>>> {
+        self.memory.read_limited(k, n)
+    }
+    fn read_range(&mut self, k: &str, o: u64, n: usize) -> io::Result<Vec<u8>> {
+        self.memory.read_range(k, o, n)
+    }
+    fn write_atomic(&mut self, k: &str, b: &[u8]) -> io::Result<()> {
+        self.memory.write_atomic(k, b)
+    }
+    fn append(&mut self, k: &str, b: &[u8]) -> io::Result<()> {
+        self.memory.append(k, b)
+    }
+    fn truncate(&mut self, k: &str, n: u64) -> io::Result<()> {
+        self.memory.truncate(k, n)
+    }
+    fn remove(&mut self, k: &str) -> io::Result<()> {
+        if k.ends_with("/pending.json") && self.failed.load(Ordering::Relaxed) {
+            return Err(io::Error::other("UX13 post-ack pending cleanup failed"));
+        }
+        self.memory.remove(k)
+    }
+    fn describe(&self) -> String {
+        self.memory.describe()
+    }
+    fn retention_namespace(&self) -> Option<String> {
+        self.memory.retention_namespace()
+    }
+}
+#[test]
+fn acknowledged_clear_cleanup_debt_allows_new_context_and_protects_the_held_old_reader() {
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut s = Session::new();
+    s.open_library_in(
+        LibraryStores {
+            catalog: Box::new(MemStore::new()),
+            files: Box::new(ClearCleanupFault { memory: MemStore::new(), failed: failed.clone() }),
+            dir: "clear-cleanup".into(),
+            on_disk: false,
+        },
+        true,
+    )
+    .unwrap();
+    let photo = s.active().unwrap();
+    s.save_companion_conversation(
+        photo,
+        json!({"schema_version":2,"messages":[{"role":"user","text":"Held old reader"}],"rounds":[],"round_records":[]}),
+    )
+    .unwrap();
+    let old = s.companion_photo_header(photo).unwrap().unwrap();
+    let held = s.retain_companion_history(&old).unwrap();
+    failed.store(true, Ordering::Relaxed);
+    let receipt = s.companion_clear(PhotoScope { photo, library_generation: s.library_generation() }, 0).unwrap();
+    assert_eq!(receipt.conversation_epoch, 1);
+    assert!(s.companion_cleanup_error(photo).is_some());
+    assert!(!s.companion_history_unsaved(photo), "cleanup debt is separate from the acknowledged empty context");
+    let fresh = s.companion_photo_header(photo).unwrap().unwrap();
+    let lease = s.acquire_companion_lease(photo, LocalRoundId::new().unwrap()).unwrap();
+    drop(lease);
+    s.save_companion_tail(photo, Some(&fresh), &[json!({"role":"user","text":"Only the new context"})], &[], &[], &json!({"schema_version":2}))
+        .expect("new context writes must not be blocked by post-ack cleanup debt");
+    assert_eq!(s.companion_messages_page(photo, 0, 32).unwrap().records[0]["text"], "Only the new context");
+    assert!(
+        s.save_companion_tail(photo, Some(&old), &[json!({"role":"user","text":"Late old callback"})], &[], &[], &json!({"schema_version":2}))
+            .is_err()
+    );
+    failed.store(false, Ordering::Relaxed);
+    for _ in 0..8 {
+        let _ = s.collect_companion(photo, 2);
+    }
+    assert_eq!(s.companion_messages_bounded(&old, 0, 32, 1024).unwrap().records[0]["text"], "Held old reader");
+    drop(held);
+}
+
+#[test]
+fn unowned_photo_clear_refuses_without_blocking_an_owned_removed_photos_history() {
+    let mut s = Session::new();
+    s.open_library_in(
+        LibraryStores { catalog: Box::new(MemStore::new()), files: Box::new(MemStore::new()), dir: "clear-ownership".into(), on_disk: false },
+        true,
+    )
+    .unwrap();
+    let photo = s.active().unwrap();
+    s.save_companion_conversation(
+        photo,
+        json!({"schema_version":2,"messages":[{"role":"user","text":"Owned removable history"}],"rounds":[],"round_records":[]}),
+    )
+    .unwrap();
+    let before = serde_json::to_value(&s.catalog).unwrap();
+    let unknown = lightcraft_catalog::PhotoId(999_999);
+    assert!(
+        s.companion_clear(PhotoScope { photo: unknown, library_generation: s.library_generation() }, 0).is_err(),
+        "unknown photo ID is not owned conversation authority"
+    );
+    assert!(s.companion_photo_header(unknown).unwrap().is_none());
+    assert_eq!(serde_json::to_value(&s.catalog).unwrap(), before);
+    s.commit("Remove owned photo", lightcraft_catalog::Op::RemovePhoto { id: photo }).unwrap();
+    assert!(s.catalog.photo(photo).is_none());
+    s.companion_clear(PhotoScope { photo, library_generation: s.library_generation() }, 0)
+        .expect("verified owned history can be cleared after photo removal");
+    assert!(s.companion_messages_page(photo, 0, 32).unwrap().records.is_empty());
+}
+
+#[test]
+fn fresh_clear_confirmation_can_replace_an_acknowledged_clear_with_cleanup_debt() {
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut s = Session::new();
+    s.open_library_in(
+        LibraryStores {
+            catalog: Box::new(MemStore::new()),
+            files: Box::new(ClearCleanupFault { memory: MemStore::new(), failed: failed.clone() }),
+            dir: "clear-again-cleanup".into(),
+            on_disk: false,
+        },
+        true,
+    )
+    .unwrap();
+    let photo = s.active().unwrap();
+    let scope = PhotoScope { photo, library_generation: s.library_generation() };
+    failed.store(true, Ordering::Relaxed);
+    let first = s.companion_clear(scope, 0).unwrap();
+    assert_eq!(s.companion_conversation_epoch(photo).unwrap(), 1);
+    let next = s.companion_clear(scope, 1).expect("fresh confirmation must not deadlock behind old acknowledged cleanup debt");
+    assert_eq!(next.conversation_epoch, 2);
+    assert_ne!(next.transaction_id, first.transaction_id);
+    assert!(s.companion_clear(scope, 0).is_err());
+    assert!(s.companion_messages_page(photo, 0, 32).unwrap().records.is_empty());
+    assert!(!s.companion_history_unsaved(photo));
+}

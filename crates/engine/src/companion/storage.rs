@@ -420,10 +420,6 @@ fn stage_with_epoch(
         return Err(error("invalid conversation epoch transition"));
     }
     let pending_key = format!("{}/pending.json", base(photo));
-    let existing: Option<PendingCommit> = read(store, &pending_key, SMALL)?;
-    if existing.as_ref().is_some_and(|p| p.publication_epoch.is_some() && p.publication_epoch != publication_epoch) {
-        return Err(error("confirmed conversation replacement is still pending"));
-    }
     let old = header(store, photo)?;
     if old.as_ref().map(|h| h.conversation_epoch).unwrap_or(0) != expected_epoch {
         return Err(error("conversation epoch changed"));
@@ -748,14 +744,49 @@ impl Session {
             .or_insert_with(|| "Conversation deletion is waiting for local saving. Retry deletion before starting a new AI task.".into());
         Ok(Some(pending.expected_epoch))
     }
+    /// The confirmation version also retains an interrupted confirmed clear's
+    /// original epoch, so retry cannot target its already-visible replacement.
+    pub fn companion_conversation_epoch(&mut self, photo: PhotoId) -> Result<u64> {
+        if self.library.is_none() {
+            return Ok(self.companion_archive.ephemeral_epochs.get(&photo).copied().unwrap_or(0));
+        }
+        if let Some(epoch) = self.pending_companion_clear_epoch(photo)? {
+            return Ok(epoch);
+        }
+        let header = self.companion_photo_header(photo)?;
+        if self.catalog.photo(photo).is_none() && header.is_none() {
+            return Err(error("no owned photo conversation"));
+        }
+        Ok(header.map(|header| header.conversation_epoch).unwrap_or(0))
+    }
     /// Confirmed context replacement bound to the owning photo/library and old
     /// conversation epoch. Effects, ordinary History and editor draft are kept.
     pub fn companion_clear(&mut self, scope: super::PhotoScope, expected_epoch: u64) -> Result<CommitReceipt> {
-        if scope.library_generation != self.library_generation() || self.library.is_none() {
+        if scope.library_generation != self.library_generation() {
             return Err(error("conversation belongs to another or closed library"));
+        }
+        if self.library.is_none() {
+            if self.catalog.photo(scope.photo).is_none() && !self.companion_archive.photos.contains_key(&scope.photo) {
+                return Err(error("no owned photo conversation"));
+            }
+            if self.companion_conversation_epoch(scope.photo)? != expected_epoch {
+                return Err(error("conversation epoch changed"));
+            }
+            let epoch = expected_epoch.checked_add(1).ok_or_else(|| error("conversation epoch exhausted"))?;
+            self.retire_companion_revert(scope.photo)?;
+            self.companion_archive.photos.remove(&scope.photo);
+            self.companion_archive.ephemeral_epochs.insert(scope.photo, epoch);
+            return Ok(CommitReceipt {
+                photo: scope.photo,
+                conversation_epoch: epoch,
+                transaction_id: super::LocalRoundId::new().map_err(error)?.as_str().into(),
+            });
         }
         if self.companion_archive.blocked.is_some() || self.companion_archive.legacy || self.companion_migration_pending() {
             return Err(error("conversation storage is protected or its producer is still active"));
+        }
+        if self.catalog.photo(scope.photo).is_none() && self.companion_photo_header(scope.photo)?.is_none() {
+            return Err(error("no owned photo conversation"));
         }
         let epoch = expected_epoch.checked_add(1).ok_or_else(|| error("conversation epoch exhausted"))?;
         let resumed = self.companion_pending(scope.photo)?;
@@ -822,6 +853,11 @@ impl Session {
             .get(&photo)
             .map(String::as_str)
             .or_else(|| self.companion_archive.marker_cleanup.values().find(|m| m.photo.is_none_or(|p| p == photo)).map(|m| m.error.as_str()))
+    }
+    /// Explicit confirmed context replacement cannot be completed by ordinary
+    /// save backoff; callers must offer the owning storage-only retry.
+    pub fn companion_save_requires_explicit_retry(&self) -> bool {
+        !self.companion_archive.clear_errors.is_empty()
     }
     pub fn companion_photo_unsaved(&self, photo: PhotoId) -> bool {
         self.companion_archive.core_save_error.is_some()

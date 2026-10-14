@@ -48,16 +48,31 @@ fn prepare_with_epoch(
     fingerprint: &str,
 ) -> Result<(PendingCommit, bool)> {
     let unresolved: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
-    if unresolved.as_ref().is_some_and(|p| p.publication_epoch.is_some() && p.publication_epoch != publication_epoch) {
-        // An old producer cannot alter or acknowledge a new-context intent,
-        // even while its failed HEAD still leaves the old prefix visible.
-        return Err(error("confirmed conversation replacement is still pending"));
-    }
+    let replaced_clear = if let Some(p) = unresolved.as_ref().filter(|p| p.publication_epoch.is_some() && p.publication_epoch != publication_epoch) {
+        let visible: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
+        validate(p, photo, &visible)?;
+        if publication_epoch.is_some_and(|publication| epoch.checked_add(1) != Some(publication))
+            || p.expected_epoch.checked_add(1) != p.publication_epoch
+            || p.publication_epoch != Some(epoch)
+            || visible.as_ref() != Some(&p.head)
+            || p.head.manifest_digest.is_empty()
+            || !retirement::publication_confirmed(store, p)?
+        {
+            // A pending old/new visibility transition is never new-context
+            // authority. Only the durable publication proof permits a new epoch.
+            return Err(error("confirmed conversation replacement is still pending"));
+        }
+        true
+    } else {
+        false
+    };
     if unresolved.as_ref().is_some_and(|p| p.receipt.is_some()) {
         pagination::recover_receipt(store, photo)?;
     }
     let visible: Option<Head> = read(store, &format!("{}/HEAD.json", base(photo)), SMALL)?;
-    let existing: Option<PendingCommit> = read(store, &format!("{}/pending.json", base(photo)), SMALL)?;
+    // A confirmed clear's ownership chain already protects its allocations.
+    // Replacing the leftover intent must not depend on unlinking that file.
+    let existing: Option<PendingCommit> = if replaced_clear { None } else { read(store, &format!("{}/pending.json", base(photo)), SMALL)? };
     if let Some(p) = existing {
         validate(&p, photo, &visible)?;
         if p.expected_epoch != epoch {
