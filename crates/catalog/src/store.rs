@@ -401,11 +401,35 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
     } // Windows directory handles are not available through std.
 }
 
+/// Shared immutable bytes for one memory-file revision. Captured readers keep
+/// this allocation alive; ordinary writes use copy-on-write and a fresh identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryFile {
+    bytes: Vec<u8>,
+    revision: Option<u64>,
+}
+impl MemoryFile {
+    fn next_revision() -> Option<u64> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).ok()
+    }
+    fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes, revision: Self::next_revision() }
+    }
+}
+impl std::ops::Deref for MemoryFile {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// In-memory files. Clones share the same files (so a test can "reopen" or corrupt them).
 #[derive(Clone)]
 pub struct MemStore {
     namespace: Option<u64>,
-    pub files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    pub files: Arc<Mutex<BTreeMap<String, Arc<MemoryFile>>>>,
     /// Offer a [`Store::background_writer`] (off by default: snapshots stay synchronous).
     pub background: bool,
 }
@@ -427,10 +451,10 @@ impl MemStore {
         MemStore::default()
     }
     pub fn get(&self, name: &str) -> Option<Vec<u8>> {
-        self.files.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|file| file.to_vec())
     }
     pub fn set(&self, name: &str, data: Vec<u8>) {
-        self.files.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), data);
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), Arc::new(MemoryFile::new(data)));
     }
 }
 
@@ -463,12 +487,12 @@ impl Store for MemStore {
         validate_name(name)?;
         let mut files = self.files.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = files.get(name).ok_or_else(source::changed)?;
-        if source::memory_identity(self, bytes) != *expected {
+        if source::memory_identity(self, bytes)? != *expected {
             return Err(source::changed());
         }
         let replacement = copy_bytes(data)?;
         source::authority(authorized)?;
-        files.insert(name.to_owned(), replacement);
+        files.insert(name.to_owned(), Arc::new(MemoryFile::new(replacement)));
         Ok(())
     }
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
@@ -509,13 +533,19 @@ impl Store for MemStore {
     }
     fn append(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
         validate_name(name)?;
-        self.files.lock().unwrap_or_else(|e| e.into_inner()).entry(name.to_string()).or_default().extend_from_slice(data);
+        let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        let file = files.entry(name.to_owned()).or_insert_with(|| Arc::new(MemoryFile::new(Vec::new())));
+        let file = Arc::make_mut(file);
+        file.bytes.extend_from_slice(data);
+        file.revision = MemoryFile::next_revision();
         Ok(())
     }
     fn truncate(&mut self, name: &str, len: u64) -> io::Result<()> {
         validate_name(name)?;
         if let Some(f) = self.files.lock().unwrap_or_else(|e| e.into_inner()).get_mut(name) {
-            f.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+            let file = Arc::make_mut(f);
+            file.bytes.truncate(usize::try_from(len).unwrap_or(usize::MAX));
+            file.revision = MemoryFile::next_revision();
         }
         Ok(())
     }

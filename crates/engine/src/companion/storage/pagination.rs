@@ -601,22 +601,7 @@ impl HistoryReader {
     /// Complete protocol fields from each captured record. Additive local data
     /// remains stored and never consumes the service input materialization budget.
     pub fn protocol_messages(&mut self, cursor: u64, count: usize, max_bytes: usize) -> Result<RecordPage> {
-        if count == 0 || count > PAGE_ITEMS || max_bytes > 32 * 1024 * 1024 {
-            return Err(error("invalid protocol read budget"));
-        }
-        let end = cursor.checked_add(count as u64).ok_or_else(|| error("protocol cursor overflow"))?.min(self.header.message_count);
-        let mut records = Vec::new();
-        let mut bytes = 0usize;
-        for ordinal in cursor..end {
-            let entry = entry(self.store.as_mut(), self.header.photo_id, self.header.message_root.as_ref(), self.header.message_count, ordinal)?;
-            let value = migration::protocol_record(self.store.as_mut(), self.header.photo_id, &entry, max_bytes.saturating_sub(bytes))?;
-            bytes = bytes.checked_add(serialized_length(&value)?).ok_or_else(|| error("protocol size overflow"))?;
-            if bytes > max_bytes {
-                return Err(error("complete history exceeds service read budget; local history retained"));
-            }
-            records.push(value);
-        }
-        Ok(RecordPage { records, next_cursor: (end < self.header.message_count).then_some(end) })
+        protocol_messages(self.store.as_mut(), &self.header, cursor, count, max_bytes)
     }
     pub fn slice(&mut self, cursor: HistoryCursor, bytes: usize) -> Result<HistorySlice> {
         slice(self.store.as_mut(), &self.header, cursor, bytes)
@@ -633,6 +618,24 @@ impl HistoryReader {
             read_preview_reference(self.store.as_mut(), image)
         }
     }
+}
+fn protocol_messages(store: &mut dyn Store, header: &PhotoHeader, cursor: u64, count: usize, max_bytes: usize) -> Result<RecordPage> {
+    if count == 0 || count > PAGE_ITEMS || max_bytes > 32 * 1024 * 1024 {
+        return Err(error("invalid protocol read budget"));
+    }
+    let end = cursor.checked_add(count as u64).ok_or_else(|| error("protocol cursor overflow"))?.min(header.message_count);
+    let mut records = Vec::new();
+    let mut bytes = 0usize;
+    for ordinal in cursor..end {
+        let entry = entry(store, header.photo_id, header.message_root.as_ref(), header.message_count, ordinal)?;
+        let value = migration::protocol_record(store, header.photo_id, &entry, max_bytes.saturating_sub(bytes))?;
+        bytes = bytes.checked_add(serialized_length(&value)?).ok_or_else(|| error("protocol size overflow"))?;
+        if bytes > max_bytes {
+            return Err(error("complete history exceeds service read budget; local history retained"));
+        }
+        records.push(value);
+    }
+    Ok(RecordPage { records, next_cursor: (end < header.message_count).then_some(end) })
 }
 fn bounded_messages(store: &mut dyn Store, header: &PhotoHeader, cursor: u64, budget: usize, max_bytes: usize) -> Result<RecordPage> {
     if budget == 0 || budget > PAGE_ITEMS || max_bytes > 32 * 1024 * 1024 {
@@ -681,6 +684,10 @@ impl Session {
             return Err(error("no such photo"));
         }
         migration::preview(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), photo, image)
+    }
+    /// Complete verified protocol fields, excluding additive local metadata.
+    pub fn companion_protocol_messages_bounded(&mut self, header: &PhotoHeader, cursor: u64, count: usize, bytes: usize) -> Result<RecordPage> {
+        protocol_messages(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, cursor, count, bytes)
     }
     pub fn companion_messages_bounded(&mut self, header: &PhotoHeader, cursor: u64, count: usize, bytes: usize) -> Result<RecordPage> {
         bounded_messages(self.library.as_mut().ok_or_else(|| error("library closed"))?.files.as_mut(), header, cursor, count, bytes)

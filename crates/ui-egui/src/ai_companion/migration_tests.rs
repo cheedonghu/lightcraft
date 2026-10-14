@@ -15,6 +15,32 @@ struct Pause {
     final_released: bool,
     fail_backup: bool,
     fail_final_visible: bool,
+    owning_thread: Option<std::thread::ThreadId>,
+    owning_source_bytes: usize,
+}
+// Observe actual Store source ranges without replacing migration logic.
+struct ObservedSource {
+    inner: Box<dyn SourceSnapshot>,
+    gate: Arc<(Mutex<Pause>, Condvar)>,
+}
+impl SourceSnapshot for ObservedSource {
+    fn identity(&self) -> &SourceIdentity {
+        self.inner.identity()
+    }
+    fn read_range(&mut self, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        let mut gate = self.gate.0.lock().unwrap();
+        if gate.owning_thread == Some(std::thread::current().id()) {
+            gate.owning_source_bytes += length;
+        }
+        drop(gate);
+        self.inner.read_range(offset, length)
+    }
+    fn verify_current(&mut self) -> std::io::Result<()> {
+        self.inner.verify_current()
+    }
+    fn clone_reader(&self) -> std::io::Result<Box<dyn SourceSnapshot>> {
+        Ok(Box::new(Self { inner: self.inner.clone_reader()?, gate: self.gate.clone() }))
+    }
 }
 struct PausedStore {
     native: FsStore,
@@ -71,7 +97,7 @@ impl Store for PausedStore {
             }
         }
         drop(gate);
-        self.native.source_snapshot(name)
+        Ok(self.native.source_snapshot(name)?.map(|inner| Box::new(ObservedSource { inner, gate: self.gate.clone() }) as Box<dyn SourceSnapshot>))
     }
     fn copy_source_atomic(&mut self, name: &str, source: &mut dyn SourceSnapshot) -> std::io::Result<()> {
         let mut gate = self.gate.0.lock().unwrap();
@@ -145,7 +171,7 @@ fn paused_native_migration_keeps_real_frames_photo_edits_and_latest_draft_live()
     let source=serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():{"schema_version":1,"messages":[{"role":"user","text":"legacy large source ".repeat(60000)}],"rounds":[],"checkpoint":null}}})).unwrap();
     let mut files = FsStore::open(&directory).unwrap();
     files.write_atomic("companion/state.json", &source).unwrap();
-    let gate = Arc::new((Mutex::new(Pause::default()), Condvar::new()));
+    let gate = Arc::new((Mutex::new(Pause { owning_thread: Some(std::thread::current().id()), ..Default::default() }), Condvar::new()));
     let gate_worker = gate.clone();
     let worker_dir = directory.clone();
     let worker_catalog = catalog.clone();
@@ -186,15 +212,18 @@ fn paused_native_migration_keeps_real_frames_photo_edits_and_latest_draft_live()
     headless.app.run("develop.set", json!({"ids":[photo.0],"values":{"light.exposure":0.5}})).unwrap();
     headless.step();
     assert!(before.elapsed() < Duration::from_secs(1), "ordinary control/frame waited for migration filesystem");
-    headless
-        .app
-        .session
-        .set_companion_editor(photo, lightcraft_engine::companion::EditorState { draft: "latest live draft 草稿".into(), ..Default::default() })
-        .unwrap();
     headless.step();
     assert_eq!(files.read_limited("companion/state.json", 4 * 1024 * 1024).unwrap(), Some(source.clone()));
+    mutex.lock().unwrap().owning_source_bytes = 0;
+    headless.app.run("ai.open", json!({})).unwrap();
+    headless.step();
+    headless.step();
+    assert_eq!(headless.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), Duration::from_secs(5))["ok"], true);
+    assert_eq!(headless.request("ui.text", json!({"text":"latest live draft 草稿"}), Duration::from_secs(5))["ok"], true);
+    let source_bytes = mutex.lock().unwrap().owning_source_bytes;
     mutex.lock().unwrap().released = true;
     changed.notify_all();
+    assert_eq!(source_bytes, 0, "pre-stage panel/frame must not scan the original source on its owning thread");
     let deadline = Instant::now() + Duration::from_secs(20);
     while headless.app.session.companion_migration_pending() && Instant::now() < deadline {
         headless.step();
@@ -1552,6 +1581,15 @@ fn small_legacy_png_with_deep_additive_image_metadata_keeps_visible_text_and_ima
             let image = h.paint();
             let center = rect.center();
             assert_eq!(image.pixels[center.y as usize * image.size[0] + center.x as usize], egui::Color32::from_rgb(24, 196, 212));
+            if !native {
+                let (connection, requests, _) = network::test_connection();
+                h.app.ai.connection = Some(connection);
+                assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(5))["ok"], true);
+                let submitted = h.app.run("ai.start", json!({"prompt":"Continue from the complete original history"}));
+                assert!(submitted.is_ok(), "complete retained history must remain submit-capable: {submitted:?}");
+                requests.recv_timeout(Duration::from_secs(5)).unwrap();
+                h.app.run("ai.stop", json!({})).unwrap();
+            }
             assert!(h.settle(Duration::from_secs(10)));
             h.app.session.close_library().unwrap();
             drop(h);

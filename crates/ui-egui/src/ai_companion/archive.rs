@@ -40,6 +40,11 @@ impl State {
             let metadata = app.session.companion_metadata_at(&header).map_err(|e| e.to_string())?;
             conversation.prefix = Some(header);
             Some(metadata)
+        } else if pending {
+            // The owning migration producer will publish a bounded completed
+            // header. Until then retain the independent editor and wait; never
+            // scan/materialize the original v1 conversation on a frame.
+            None
         } else {
             app.session.load_companion_conversation(photo).map_err(|e| e.to_string())?
         };
@@ -165,7 +170,7 @@ impl State {
         if let Some(prefix) = prefix {
             let mut cursor = 0;
             while cursor < prefix.message_count {
-                let page = app.session.companion_messages_bounded(&prefix, cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
+                let page = app.session.companion_protocol_messages_bounded(&prefix, cursor, 1, 32 * 1024 * 1024).map_err(|e| e.to_string())?;
                 for message in &page.records {
                     projection.push(message, |picture| {
                         let name = picture.get("attachment").and_then(Value::as_str).ok_or("AI 预览附件无效。")?;

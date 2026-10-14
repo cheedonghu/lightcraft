@@ -1,6 +1,6 @@
 # AI companion history storage
 
-The companion owns `companion/`; it does not change the core Catalog format or add catalog operations. Fresh conversations use `companion/state.json` version 2 (`photo-head-v2`). The root contains no photo array. A photo's `HEAD.json` points to one immutable manifest. Existing version 1 remains on its compatibility path until the migration implementation.
+The companion owns `companion/`; it does not change the core Catalog format or add catalog operations. Fresh conversations use `companion/state.json` version 2 (`photo-head-v2`). The root contains no photo array. A photo's `HEAD.json` points to one immutable manifest. Existing version 1 migrates through verified bounded source snapshots; its exact original bytes remain in `companion/state.v1.backup.json` before the small version 2 root activates.
 
 ## Pages and records
 
@@ -11,6 +11,10 @@ Packed data files are at most 4 MiB. Large logical records stream over consecuti
 These are I/O engineering bounds, not a local history quota. A logical record may be larger than a block. A UI page scans at most 32 records and retains at most 256 KiB plus a bounded ordered item list; oversized message text remains readable in consecutive decoded UTF-8 fragments. New entries include an optional `text_range` byte span in their serialized record; this avoids exposing record metadata in the text view, preserves escaped Unicode/newlines and excludes the same local execution-detail suffix as ordinary messages. The ordered `HistorySlice.items` interface references the owned record/fragment buffers with logical record identity and continuation offset; callers render those items in sequence before the current mutable tail. Forward continuation retains every visible character; the older control returns to that message’s beginning. The full-value compatibility reader and materialized pages have a 32 MiB allocation budget and direct callers to fragments/streaming when it is exceeded. That refusal does not prevent storage or delete records. Large metadata is retained on disk and deferred by the small header reader, without fabricating a checkpoint.
 
 ## Actual client path
+
+While legacy migration is pending, the panel loads only completed bounded graph headers/pages. Before a selected photo's graph is ready, it shows the existing migration waiting state and preserves its independent editor; it does not scan or materialize the original conversation on the frame. Both native and synchronous fallback context projection share the complete verified protocol-field selector, so additive local metadata remains archived without blocking otherwise valid history submission.
+
+Memory source snapshots retain the immutable file revision shared with their Store. A range checks that exact allocation under the Store mutex and copies only the bounded range; ordinary file writes replace the revision, and append/truncate use copy-on-write while readers retain it. Unrelated files do not invalidate a source. Capture, explicit full verification and conditional source publication still calculate the complete digest.
 
 `companion_photo_header`, `companion_metadata` and `companion_history_slice_at` replace eager whole-conversation loading. `Conversation.view` owns a single bounded history page, while its mutable tail contains only the new round's generated records. Saved inactive read caches are limited to 16 photo entries and a 2 MiB target; the selected current round and dirty unsaved results are runtime data, separate from the read cache. Each subsequent submission seals the completed tail into an immutable prefix before appending its new request. Dirty unsaved results are preserved rather than evicted after a real disk failure.
 

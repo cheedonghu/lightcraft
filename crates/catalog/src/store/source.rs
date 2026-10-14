@@ -1,6 +1,6 @@
 //! Identity-checked bounded source readers for format migration. Files are not
 //! silently recopied into RAM. The native reader owns one file handle; the memory
-//! reader shares its actual adapter and checks content under its mutex.
+//! reader shares immutable bytes and checks the captured revision under its mutex.
 use super::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -129,27 +129,29 @@ impl SourceSnapshot for Native {
         Ok(Box::new(Native { file, path: self.path.clone(), identity: self.identity.clone() }))
     }
 }
-pub(super) fn memory_identity(store: &MemStore, bytes: &[u8]) -> SourceIdentity {
-    SourceIdentity {
-        length: bytes.len() as u64,
-        digest: format!("{:x}", Sha256::digest(bytes)),
-        token: format!("memory-source:{:?}", store.namespace),
-    }
+pub(super) fn memory_identity(store: &MemStore, file: &MemoryFile) -> io::Result<SourceIdentity> {
+    let revision = file.revision.ok_or_else(|| invalid("memory source identity exhausted"))?;
+    Ok(SourceIdentity {
+        length: file.len() as u64,
+        digest: format!("{:x}", Sha256::digest(&file.bytes)),
+        token: format!("memory-source:{:?}:{revision}", store.namespace),
+    })
 }
 struct Memory {
     store: MemStore,
     name: String,
     identity: SourceIdentity,
+    file: Arc<MemoryFile>,
 }
 pub(super) fn memory_snapshot(store: &MemStore, name: &str) -> io::Result<Option<Box<dyn SourceSnapshot>>> {
     let files = store.files.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(bytes) = files.get(name) else { return Ok(None) };
-    let identity = memory_identity(store, bytes);
-    Ok(Some(Box::new(Memory { store: store.clone(), name: name.to_owned(), identity })))
+    let identity = memory_identity(store, bytes)?;
+    Ok(Some(Box::new(Memory { store: store.clone(), name: name.to_owned(), identity, file: bytes.clone() })))
 }
 impl SourceSnapshot for Memory {
     fn clone_reader(&self) -> io::Result<Box<dyn SourceSnapshot>> {
-        Ok(Box::new(Memory { store: self.store.clone(), name: self.name.clone(), identity: self.identity.clone() }))
+        Ok(Box::new(Memory { store: self.store.clone(), name: self.name.clone(), identity: self.identity.clone(), file: self.file.clone() }))
     }
     fn identity(&self) -> &SourceIdentity {
         &self.identity
@@ -158,7 +160,7 @@ impl SourceSnapshot for Memory {
         bound(&self.identity, offset, length)?;
         let files = self.store.files.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = files.get(&self.name).ok_or_else(changed)?;
-        if memory_identity(&self.store, bytes) != self.identity {
+        if !Arc::ptr_eq(bytes, &self.file) {
             return Err(changed());
         }
         let start = usize::try_from(offset).map_err(|_| short_range())?;
@@ -168,7 +170,7 @@ impl SourceSnapshot for Memory {
     fn verify_current(&mut self) -> io::Result<()> {
         let files = self.store.files.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = files.get(&self.name).ok_or_else(changed)?;
-        if memory_identity(&self.store, bytes) != self.identity {
+        if !Arc::ptr_eq(bytes, &self.file) || memory_identity(&self.store, bytes)? != self.identity {
             return Err(changed());
         }
         Ok(())
