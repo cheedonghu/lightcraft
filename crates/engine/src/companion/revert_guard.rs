@@ -172,15 +172,26 @@ pub(crate) fn begin_load(store: &mut dyn Store) -> Result<LoadProtection> {
     let pending = load_pending(store)?;
     let failed_close = close_pending(store)? == Some(true) || core_pending(store)?;
     let storage_identity = identity(store, false);
-    if pending || storage_identity.as_ref().is_ok_and(|identity| identity.is_some()) || storage_identity.is_err() {
+    let missing_owned_identity = if storage_identity.as_ref().is_ok_and(Option::is_none) {
+        match store.read_limited(CORE, 1) {
+            Ok(None) => None,
+            Ok(Some(_)) => Some(format!("{IDENTITY}: missing identity for existing {CORE}")),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Some(format!("{IDENTITY}: missing identity for existing {CORE}")),
+            Err(e) => Some(format!("{CORE}: ownership could not be checked without {IDENTITY}: {e}")),
+        }
+    } else {
+        None
+    };
+    if pending || storage_identity.as_ref().is_ok_and(|identity| identity.is_some()) || storage_identity.is_err() || missing_owned_identity.is_some()
+    {
         // A malformed identity must remain available for diagnosis. The separate
         // durable load fence denies every old certificate before core replay.
         // If this write fails, opening still fails: memory is not a safe fence.
         store.write_atomic(LOAD, br#"{"version":1,"pending":true}"#).map_err(error)?;
         return Ok(LoadProtection {
             fenced: true,
-            uncertain: pending || failed_close || storage_identity.is_err(),
-            protected_reason: storage_identity.err().map(|reason| reason.to_string()),
+            uncertain: pending || failed_close || storage_identity.is_err() || missing_owned_identity.is_some(),
+            protected_reason: storage_identity.err().map(|reason| format!("{IDENTITY}: {reason}")).or(missing_owned_identity),
         });
     }
     Ok(LoadProtection { fenced: false, uncertain: false, protected_reason: None })

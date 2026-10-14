@@ -121,3 +121,77 @@ fn duplicate_storage_identity_fields_are_protected_and_cannot_regrant_a_saved_ro
     assert!(cold.acquire_companion_lease(photo, LocalRoundId::new().unwrap()).is_err());
     assert_eq!(files.read("companion/v2/store-identity.json").unwrap().unwrap(), original.as_bytes());
 }
+
+#[test]
+fn protected_outer_root_survives_close_and_verified_backup_recovery_never_revives_old_round_authority() {
+    for broken in [
+        br#"{"format":"lightcraft-companion","version":99,"layout":"photo-head-v2"}"#.as_slice(),
+        br#"{"format":"lightcraft-companion","version":2,"version":2,"layout":"photo-head-v2"}"#.as_slice(),
+        b"{torn outer root".as_slice(),
+    ] {
+        let (catalog, mut files) = (MemStore::new(), MemStore::new());
+        let mut session = open(&catalog, &files);
+        let photo = session.active().unwrap();
+        let round = publish(&mut session, photo);
+        session.close_library().unwrap();
+        drop(session);
+        let backup = files.read("companion/state.json").unwrap().unwrap();
+        files.set("companion/state.json", broken.to_vec());
+
+        let mut protected = open(&catalog, &files);
+        let expected_core = serde_json::to_value(&protected.catalog).unwrap();
+        assert!(protected.companion_archive_protected_reason().is_some());
+        assert!(protected.verify_round_revert(photo, &round).is_err());
+        assert!(
+            protected
+                .companion_clear(lightcraft_engine::companion::PhotoScope { photo, library_generation: protected.library_generation() }, 0)
+                .is_err()
+        );
+        protected.close_library().unwrap();
+        assert_eq!(files.read("companion/state.json").unwrap().unwrap(), broken);
+        drop(protected);
+
+        // Restore the actual verified bytes of this library's original backup,
+        // retaining its protective metadata rather than guessing a new container.
+        files.set("companion/state.json", backup);
+        let mut repaired = open(&catalog, &files);
+        assert_eq!(serde_json::to_value(&repaired.catalog).unwrap(), expected_core);
+        assert!(repaired.companion_archive_protected_reason().is_none());
+        assert!(repaired.verify_round_revert(photo, &round).is_err(), "verified repair is not old round authority");
+        assert!(repaired.acquire_companion_lease(photo, LocalRoundId::new().unwrap()).is_ok());
+    }
+}
+
+#[test]
+fn missing_identity_with_a_saved_core_anchor_is_protected_until_repair_and_does_not_revive_old_permission() {
+    for damaged_root in [false, true] {
+        let (catalog, mut files) = (MemStore::new(), MemStore::new());
+        let mut session = open(&catalog, &files);
+        let photo = session.active().unwrap();
+        let round = publish(&mut session, photo);
+        session.close_library().unwrap();
+        drop(session);
+        let identity_backup = files.read("companion/v2/store-identity.json").unwrap().unwrap();
+        let root_backup = files.read("companion/state.json").unwrap().unwrap();
+        files.remove("companion/v2/store-identity.json").unwrap();
+        if damaged_root {
+            files.set("companion/state.json", b"{damaged root with missing identity".to_vec());
+        }
+
+        let mut protected = open(&catalog, &files);
+        let expected_core = serde_json::to_value(&protected.catalog).unwrap();
+        assert!(protected.companion_archive_protected_reason().is_some(), "an owning anchor without its identity is not a fresh AI store");
+        assert!(protected.verify_round_revert(photo, &round).is_err());
+        assert!(protected.acquire_companion_lease(photo, LocalRoundId::new().unwrap()).is_err());
+        protected.close_library().unwrap();
+        assert!(files.read("companion/v2/store-identity.json").unwrap().is_none(), "do not invent replacement ownership while protected");
+        drop(protected);
+
+        files.set("companion/v2/store-identity.json", identity_backup);
+        files.set("companion/state.json", root_backup);
+        let mut repaired = open(&catalog, &files);
+        assert_eq!(serde_json::to_value(&repaired.catalog).unwrap(), expected_core);
+        assert!(repaired.verify_round_revert(photo, &round).is_err());
+        assert!(repaired.acquire_companion_lease(photo, LocalRoundId::new().unwrap()).is_ok());
+    }
+}

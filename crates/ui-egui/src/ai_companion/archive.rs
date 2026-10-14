@@ -38,9 +38,17 @@ impl State {
             None
         };
         let archive = if let Some(header) = header {
-            let metadata = app.session.companion_metadata_at(&header).map_err(|e| e.to_string())?;
+            let metadata = match app.session.companion_metadata_at(&header) {
+                Ok(metadata) => Some(metadata),
+                Err(error) => {
+                    // The owning manifest is verified independently. Its good
+                    // message blocks remain readable when inner metadata fails.
+                    conversation.history_error = Some(format!("{}: {error}", header.metadata));
+                    None
+                }
+            };
             conversation.prefix = Some(header);
-            Some(metadata)
+            metadata
         } else if pending {
             // The owning migration producer will publish a bounded completed
             // header. Until then retain the independent editor and wait; never
@@ -51,16 +59,19 @@ impl State {
         };
         if let Some(archive) = archive {
             if !matches!(archive.get("schema_version").and_then(Value::as_u64), Some(1 | 2)) {
-                return Err("AI 对话格式不支持，未删减历史。".into());
+                let source = conversation.prefix.as_ref().map(|header| header.metadata.as_str()).unwrap_or("companion/state.json");
+                conversation.history_error = Some(format!("{source}: unsupported conversation schema"));
             }
-            conversation.schema_version = archive["schema_version"].as_u64().unwrap_or(1);
-            conversation.records = archive.get("round_records").and_then(Value::as_array).cloned().unwrap_or_default();
+            conversation.schema_version = archive["schema_version"].as_u64().unwrap_or(0);
+            if conversation.history_error.is_none() {
+                conversation.records = archive.get("round_records").and_then(Value::as_array).cloned().unwrap_or_default();
+                conversation.rounds = archive.get("rounds").and_then(Value::as_array).cloned().unwrap_or_default();
+            }
             conversation.messages = if conversation.prefix.is_some() {
                 Vec::new()
             } else {
                 archive.get("messages").and_then(Value::as_array).ok_or("AI 对话记录无效。")?.clone()
             };
-            conversation.rounds = archive.get("rounds").and_then(Value::as_array).cloned().unwrap_or_default();
             // A disk record is historical display data. Runtime publication or a
             // separately verified durable certificate must grant revert authority;
             // never replace a saved version/source with the current photo's identity.
@@ -80,6 +91,9 @@ impl State {
             self.pending_local_saves.remove(&photo);
             return Ok(());
         };
+        if conversation.history_error.is_some() {
+            return Err(projection::invalid());
+        }
         if conversation.scope.is_some_and(|scope| scope != PhotoScope { library_generation: app.session.library_generation(), photo }) {
             return Err("AI 会话属于已关闭的图库，未写入当前图库。".into());
         }

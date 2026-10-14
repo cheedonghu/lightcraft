@@ -14,6 +14,8 @@ mod card_tests;
 #[cfg(test)]
 mod clear_tests;
 #[cfg(test)]
+mod damaged_tests;
+#[cfg(test)]
 #[path = "ai_companion/disconnect_tests.rs"]
 mod disconnect_tests;
 mod drafts;
@@ -174,6 +176,7 @@ struct Conversation {
     legacy_cursor: u64,
     preview_cursor: u64,
     legacy_readonly: bool,
+    history_error: Option<String>,
     prefix: Option<lightcraft_engine::companion::storage::PhotoHeader>,
     view: Option<HistoryView>,
     dirty: bool,
@@ -194,6 +197,7 @@ impl Default for Conversation {
             legacy_cursor: 0,
             preview_cursor: 0,
             legacy_readonly: false,
+            history_error: None,
             prefix: None,
             view: None,
             dirty: false,
@@ -386,6 +390,9 @@ impl State {
                 None => return Err(tr("Checking photo availability. Please try again.").into()),
             }
         }
+        if self.conversations.get(&photo).is_some_and(|conversation| conversation.history_error.is_some()) {
+            return Err(projection::invalid());
+        }
         Ok(photo)
     }
     #[cfg(test)]
@@ -413,6 +420,10 @@ impl State {
         if prompt.len() > 4096 {
             return Err("请求过长。".into());
         }
+        self.load(app, photo)?;
+        if self.conversations.get(&photo).is_some_and(|conversation| conversation.history_error.is_some()) {
+            return Err(projection::invalid());
+        }
         if self.connection.is_none() {
             self.connection_generation = self.connection_generation.checked_add(1).ok_or("AI 连接编号耗尽，请重新启动客户端。")?;
             self.connection = Some(self.connect(app)?);
@@ -430,7 +441,6 @@ impl State {
         };
         let lease = app.session.acquire_companion_lease(photo, identity.local_round_id.clone()).map_err(|e| tr(&e.to_string()).to_owned())?;
         let cancel = Arc::new(AtomicBool::new(false));
-        self.load(app, photo)?;
         let reader = self
             .conversations
             .get(&photo)
@@ -2009,6 +2019,9 @@ fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, params: &Va
     {
         return Err(tr("This delete request belongs to another or closed library.").into());
     }
+    if app.session.companion_archive_protected_reason().is_some() {
+        return Err(tr("This conversation format is protected. Original history is retained.").into());
+    }
     if state.jobs.contains_key(&photo) || state.worker_busy(photo) {
         return Err(tr("Stop the AI task and wait for it to finish before deleting its conversation.").into());
     }
@@ -2312,6 +2325,24 @@ fn save_recovery(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
         ui.label(tr("Saved. Retry the edit explicitly when ready."));
     }
 }
+fn storage_recovery(app: &LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) -> bool {
+    let outer = app.session.companion_archive_protected_reason();
+    let inner = app.ai.conversations.get(&photo).and_then(|conversation| conversation.history_error.as_deref());
+    let Some(reason) = outer.or(inner) else { return false };
+    ui.label(tr(if outer.is_some() {
+        "AI history is protected. Original files are kept. Back up the library, restore a verified companion backup, then reopen it."
+    } else {
+        "Some AI history could not be verified. Readable records are kept. Repair the damaged data or delete this conversation before submitting again."
+    }));
+    let copy = ui.button(tr("Copy Storage Diagnostic"));
+    composer_widget(ui, "button:aiCopyStorageDiagnostic", copy.rect);
+    if !ui.is_sizing_pass() && copy.clicked() {
+        ui.ctx().copy_text(
+            json!({"kind":"ai-storage-recovery","library_generation":app.session.library_generation(),"photo":photo.0,"reason":reason}).to_string(),
+        );
+    }
+    true
+}
 fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
     let mut locate = false;
     let mut revert = None;
@@ -2353,6 +2384,7 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
         area = area.vertical_scroll_offset(offset);
     }
     let scroll = area.show(ui, |ui| {
+        let protected = storage_recovery(app, ui, photo);
         if let Some(conversation) = app.ai.conversations.get_mut(&photo) {
             app.ai.attachments.sync(app.session.library_generation(), photo, conversation);
             reading::show(ui, conversation, &mut app.ai.attachments);
@@ -2381,7 +2413,7 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
                     None => {}
                 }
             }
-        } else if !app.ai.text.is_empty() {
+        } else if !protected && !app.ai.text.is_empty() {
             ui.label(&app.ai.text);
         }
         if restore.is_some() && tail {

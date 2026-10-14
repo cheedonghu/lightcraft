@@ -486,7 +486,9 @@ impl Session {
         });
         self.mutation_guard = Default::default();
         self.mutation_guard.loaded_seq = self.library.as_ref().map(|l| l.journal.seq()).unwrap_or(0);
+        let archive_protected = self.companion_archive_protected_reason().is_some();
         self.mutation_guard.clean_load = !protection.uncertain
+            && !archive_protected
             && self.library.as_ref().is_some_and(|l| {
                 !l.report.created
                     && l.report.failed == 0
@@ -496,7 +498,7 @@ impl Session {
                     && l.report.upgraded_from.is_none()
             });
         self.mutation_guard.load_fenced = protection.fenced;
-        self.mutation_guard.protected_load = protection.protected_reason.is_some();
+        self.mutation_guard.protected_load = protection.protected_reason.is_some() || archive_protected;
         self.mutation_guard.retire_load = protection.fenced && !self.mutation_guard.clean_load;
         self.load_companion_core_proof();
         self.finish_companion_load()?;
