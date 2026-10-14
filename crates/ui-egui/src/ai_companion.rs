@@ -1267,6 +1267,7 @@ impl State {
             self.editors.clear();
             self.dirty_editors.clear();
             self.editor_photo = None;
+            self.bottom_reading.clear();
             self.prompt.clear();
             self.completed.clear();
             self.pending_local_saves.clear();

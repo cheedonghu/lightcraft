@@ -85,3 +85,78 @@ fn invalid_library_keeps_the_round_and_new_library_archives_it() {
     app.session.close_library().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+use crate::{LightcraftApp, Services, headless::Headless};
+use lightcraft_catalog::{MemStore, PhotoId};
+use lightcraft_engine::{
+    Session,
+    companion::{EditorState, storage::HistoryCursor},
+    library::LibraryStores,
+};
+use serde_json::json;
+use std::time::{Duration, Instant};
+fn bottom_library_fixture(name: &str) -> (Session, MemStore, MemStore, PhotoId) {
+    let core = MemStore::new();
+    let files = MemStore::new();
+    let mut s = Session::new();
+    s.open_library_in(LibraryStores { catalog: Box::new(core.clone()), files: Box::new(files.clone()), dir: name.into(), on_disk: false }, true)
+        .unwrap();
+    let p = s.active().unwrap();
+    s.save_companion_tail(p,None,&[json!({"role":"assistant","local_message_id":format!("{name}-giant"),"text":format!("{}END_{name}","readable sentence α🙂.\n".repeat(30000))})],&[],&[],&json!({"schema_version":2})).unwrap();
+    let head = s.companion_photo_header(p).unwrap().unwrap();
+    s.set_companion_editor(
+        p,
+        EditorState {
+            draft: format!("draft-{name}"),
+            follow_tail: false,
+            reading_cursor: Some(HistoryCursor { record: 0, offset: 0 }),
+            reading_epoch: Some(head.conversation_epoch),
+            reading_count: Some(head.message_count),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    s.persist().unwrap();
+    (s, core, files, p)
+}
+fn settle_library_history(h: &mut Headless) {
+    let start = Instant::now();
+    loop {
+        h.step();
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["historyLoading"] == false {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(15));
+        std::thread::yield_now();
+    }
+    for _ in 0..3 {
+        h.step();
+    }
+}
+#[test]
+fn library_switch_drops_an_old_bottom_request_before_restoring_equal_photo_reading() {
+    for pending in [false, true] {
+        let (a, _, _, pa) = bottom_library_fixture("A");
+        let (mut b, core, files, pb) = bottom_library_fixture("B");
+        assert_eq!(pa, pb);
+        b.close_library().unwrap();
+        drop(b);
+        let mut h = Headless::new(LightcraftApp::new(a, Services::default()), [1400.0, 1000.0], 1.0);
+        h.app.run("ai.open", json!({})).unwrap();
+        settle_library_history(&mut h);
+        if pending {
+            h.app.run("ai.bottom", json!({})).unwrap();
+        }
+        h.app
+            .session
+            .open_library_in(LibraryStores { catalog: Box::new(core), files: Box::new(files), dir: "B".into(), on_disk: false }, true)
+            .unwrap();
+        // First real frame owns generation transition: no AI command before polling.
+        h.step();
+        settle_library_history(&mut h);
+        let ed = h.app.session.companion_editor(pb).unwrap();
+        assert_eq!(ed.draft, "draft-B");
+        assert_eq!(ed.reading_cursor, Some(HistoryCursor { record: 0, offset: 0 }), "A's pending bottom continuation leaked to B");
+    }
+}
