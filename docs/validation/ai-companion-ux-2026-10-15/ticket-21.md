@@ -647,9 +647,9 @@ The actual integration153run exported **24fresh CPU Headless PNGs** under `/tmp/
 
 Direct merger pixel inspections:
 
-- [return-normal-en.png](/tmp/lightcraft-ux-execution-20261013/merger/21/screens/return-normal-en.png): visible You/Assistant/System rows, semibold Natural colors, bullet Preserve sky, closed Tool process and Back to bottom; ordinary canvas/filmstrip and composer controls remain readable.
-- [input-float120-zh-hans.png](/tmp/lightcraft-ux-execution-20261013/merger/21/screens/input-float120-zh-hans.png): complete Chinese draft visible in the120px floating Tools pane after actual scrolling, with normal photo/library surface preserved.
-- [return-stack240-zh-hans.png](/tmp/lightcraft-ux-execution-20261013/merger/21/screens/return-stack240-zh-hans.png): complete Chinese 回到底部 label and reachable history controls inside stacked Tools, ordinary Library remains present.
+- return-normal-en.png (historical local run detail): visible You/Assistant/System rows, semibold Natural colors, bullet Preserve sky, closed Tool process and Back to bottom; ordinary canvas/filmstrip and composer controls remain readable.
+- input-float120-zh-hans.png (historical local run detail): complete Chinese draft visible in the120px floating Tools pane after actual scrolling, with normal photo/library surface preserved.
+- return-stack240-zh-hans.png (historical local run detail): complete Chinese 回到底部 label and reachable history controls inside stacked Tools, ordinary Library remains present.
 
 Original worker/reviewer screenshot inspections remain recorded separately. These are fresh merged-source Headless pixels, not a physical window/compositor claim.
 

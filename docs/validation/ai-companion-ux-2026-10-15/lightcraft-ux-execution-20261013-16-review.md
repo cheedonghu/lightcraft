@@ -1,0 +1,60 @@
+# UX-16 independent whole-range review
+
+Fixed range: `72717addc30f439d753989512674c0e800866cbc..a41331f9cc77a5290cc5da4f3e36bb1c88a66d0b`.
+Checkout: `/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-16/lightcraft`.
+Review is read-only on candidate/index/HEAD. No subagents, push, paid model, .env, OS input or user photographs were used. All path:line references below are relative to this exact checkout.
+
+Read context/review-contract/skill-update/16-implementation/baseline/review-rulings, requesting-code-review/code-reviewer.md, installed tdd/codebase-design instructions, repository AGENTS.md and docs/collaboration.md, original 16-round-result-cards ticket, and authoritative design/implementation-plan card, storage, UI and validation sections. Audited the whole diff and surrounding actual callers, candidate transformations, persistence, native/fallback readers, editor state and shared Tools rendering.
+
+## Strengths
+
+- The new card module centralizes grouping, display capture and rendering behind a small interface. Initial/correction target values remain absolute; actual publication is distinct from execution receipt confirmation. Published correction + failed receipt retains the latest complete result and says so. Pure-answer records resolve ownership without creating an editing card.
+- New execution records freeze effective RAW Kelvin or rendered relative WB, mode, tint, and source context during proposal/publication; old display values are read directly rather than recomputed from today's SourceInfo. Capture compares the full settings, including crop/flip/treatment/curves/Point Color/local parameters and brush vertices.
+- Captured history finds exact message/fragment LocalRoundId, not a nearby round. Native scans remain off-frame; fallback scans preserve lexical/parser/hash continuation and normally advance at most 256 KiB logical input per step. Selected budgets are stated honestly separately from physical chunk work and active-view allocation. The whole-record digest is checked before publication.
+- Valid message slices survive explicit selected-card errors; loading/read-position handling now waits for actual cards/page completion. Existing draft/read-cursor/scroll and native cancellation/retirement regressions pass in the independently executed suite. History button only opens ordinary History and does not restore or edit a photo.
+- EN/ZH normal/narrow/120/240 floating/stacked parameter galley reachability is exercised by the real headless widgets/paint/wheel seam. Independently inspected normal ZH and floating 120 EN screenshots; the short screenshot shows a scrolled portion, and the bidirectional paint test establishes complete literals reachable across scrolling, not simultaneous visibility of every control.
+
+## Issues
+
+### Critical
+
+None found.
+
+### Important — must fix before merge
+
+1. **Color-range sample changes disappear when sample count stays the same.** `crates/ui-egui/src/ai_companion/card.rs:398` (sample selection at :373; legal shape schema `crates/engine/src/companion/schemas.rs:57`). The array branch serializes `samples` only as `len()`. A legal `update_manual_mask` changes one sampled OkLab color from `(0.5, 0.1, 0.1)` to `(0.5, -0.1, 0.1)` with the same refine value/count. The actual candidate changes the mask, but all readable values compare equal; capture_pair drops the change and the expanded card has no row. This is the same omission already corrected for same-count brush movement, and violates full actual dependent-value display. Persist readable sampled color values (with their actual OkLab semantics) and show before/target/actual; exercise actual candidate → Session → client status/paint. Independent public candidate probe returned `candidate changed=true`, then `changes=[]`.
+
+2. **Updating an existing manual mask can change combine/invert semantics without any card row.** `crates/ui-egui/src/ai_companion/card.rs:333`; actual transformation `crates/engine/src/companion.rs:271`. Composition serializes only `component.shape`, omitting `MaskComponent.op` and `MaskComponent.invert`. Existing subtract/intersect or inverted manual components are accepted by `is_manual`; `update_manual_mask` replaces them with Add/non-inverted, even if the supplied shape itself is unchanged. That changes actual coverage, yet the card can display an empty change list. Persist/render these actual associated changes rather than restricting capture to shape fields. Independent public candidate with the same color-range shape changed Subtract/invert=true to Add/invert=false; candidate changed=true and client changes=[]. This uses an existing supported update operation, not a newly requested operation.
+
+3. **Zero chunk payload panics before validation in the new fallback scanner.** `crates/engine/src/companion/storage/pagination/scan.rs:52` (payload read :49, validation occurs only later in `pagination.rs:76`). `entry()` validates bounds/key/digest-backed index structure but does not validate chunk_payload. A malformed captured round index with chunk_payload=0 reaches `absolute % payload` before range can return the intended invalid-layout error. The real Session interface panic was observed at :52 using an isolated MemStore and a valid-digest malformed index; catch_unwind recorded `zero chunk payload panicked=true`. The fallback UI caller in `ai_companion/paging.rs:132` calls this directly during normal polling, so this cannot be deferred to future damaged-history repair. Validate layout before any modulo/division, preferably at the common entry/reader interface so the new native round/owner consumers are safe as well. Return an actionable error while preserving the valid message slice. Probe does not claim naturally occurring disk corruption bypasses digests; it proves a supported public reader accepts a structurally malformed, checksum-consistent input until panic.
+
+4. **Oversized legacy settings are silently omitted instead of reporting unavailable parameter detail.** `crates/engine/src/companion/storage/pagination/scan.rs:288`, consumed by `crates/ui-egui/src/ai_companion/card.rs:99` and :144. Large records discard before/proposed/applied/recent settings above 64 KiB; old records without the new frozen display fields then return successfully with an Applied card and `changes=[]`. No marker/notice distinguishes unavailable history from a genuine no-change stage. Independent public Session→Headless probe saved an existing schema2 round with a large unchanged brush and exposure 0→+0.35, no frozen display fields; its readable message survived, but status returned changes=[] and text only `VALID_LEGACY_MESSAGE`, with no degradation notice. Do not restore unbounded settings materialization or recompute historical WB from current source: either retain a bounded truthful scalar projection where possible, or mark parameter details explicitly unavailable while retaining the known execution fact/message. This is current card-reader degradation, separate from UX-15 unfinished-round recovery.
+
+### Minor
+
+- `crates/ui-egui/src/ai_companion/card.rs:211`: failed-stage actual retained string bypasses `tr()`, unlike the before→target strings immediately above. In ZH, categorical actual values such as “As Shot”, “Off”, or “Not present” remain English. Pass categorical actual values through the same translation path; numerical values remain unchanged.
+
+## Checks actually executed by this reviewer
+
+- Confirmed exact HEAD and empty `git status --porcelain`; `git diff --check BASE HEAD` passed. No source/index/HEAD mutation.
+- Executed the existing worker-built test artifact `.../target/ux-agent-16/debug/deps/lightcraft_ui_egui-d7241b0d37537103 ai_companion::card_tests:: --nocapture`: 15 passed, 0 failed.
+- Executed that artifact with `ai_companion::` and normal test threads: 110 passed, 0 failed, 0 ignored. Output: `16-review-ai-tests.log`. This is an independent execution of an existing artifact, not an independently rebuilt cargo certification.
+- Compiled standalone public-interface probes into this evidence directory with rustc, using consistent existing rlib dependency fingerprints (no candidate build or modification). `16-review-probe.rs` calls real candidate, Session save and Headless/status; log confirms both supported mask changes and missing rows. `16-review-extra-probe.rs` exercises legacy card loading and companion_display_step; log confirms silent empty legacy detail and caught divisor-zero panic. First direct-link attempt mismatched serde metadata and did not run; corrected fingerprint matching succeeded. No failing fixture/build is counted as a product result.
+- Viewed existing `16/card-normal-zh-hans.png` and `16/card-float120-en.png`. Read the complete layout test for 12 scenarios; its current execution passed. Did not claim independent fresh screenshot generation.
+
+Worker-recorded checks reviewed, not independently rerun: engine companion56, i18n30, changed-crate strict no-deps clippy, layers/parity, WASM compile, fmt and all locale JSON parsing. Their logs and documented WASM/baseline limitations are evidence, not my own execution claims. No full workspace, physical OS compositor, provider or other-platform execution claimed.
+
+## Declined to judge / retained future requirements
+
+- UX-09 actual HistoryView retention binding is still a required later combination: acquire HistoryRetention via Session::retain_companion_history(&PhotoHeader) BEFORE the first fallback step; retain across inactive pauses/successive scans until actual view retirement. This fixed range has no such consumer, and the 09 candidate is still unapproved while release-triggered automatic collection is being fixed. Whichever merges later must implement and root-verify the real consumer plus native physical-drop/store-identity behavior. No claim this is already implemented, no waiver.
+- UX-15 bounded old-v2 unfinished-activity summary and complete shutdown/switch retirement remain separate required lifecycle work; this display whitelist is not reliable recovery data. It must extend the shared parser for its own required fields. No fabricated recovery claim.
+- UX-17/18 explicit round-bound revert, durable source/version certificates, equality/Undo/Redo non-requalification and Q30 fail-before-edit guard remain required separate assignments. Current card binding/hash/History navigation grants no new qualification; no assessment of incomplete future revert interfaces.
+- UX-19 actual historical before/after preview mode remains separately required. Current card's typed preview identity does not implement it, and History navigation is read-only.
+- UX-10 full streaming v1 migration/backup, UX-13 confirmed clear/epoch handling, UX-14 damaged-container repair, UX-20 health/global entry, and UX-21 rich long reading remain separately assigned; preserving valid messages on the new card reader's own failures was reviewed here and is not deferred.
+- UX-22 full paired native fixture/acceptance matrix and honest platform reporting remain required. No universal RAW/camera corpus, Windows/Linux/browser runtime, paid provider, actual physical power-loss, or native compositor certification is inferred from procedural macOS/headless evidence.
+
+## Recommendations and assessment
+
+Address each Important finding in a separate agreed caller-interface red→minimal-green slice, preserving current successful WB/receipt/large-history/layout/draft regressions. Keep selected input/work budgets and explicit degradation; do not expand them into unbounded reads. Rerun affected engine/UI checks and rereview the final fixed tree. Preserve the required 09/16 binding checklist for whichever branch merges later.
+
+**Ready to merge: No.** The main user path is substantially implemented and existing tests pass, but two supported mask changes lose their actual parameter facts, malformed chunk arithmetic can panic, and oversized legacy parameter loss is silent. These are current UX-16 correctness/error-handling issues, not waived future scopes.
