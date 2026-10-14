@@ -292,6 +292,7 @@ impl State {
             card_scan: None,
         });
         self.accept_page(app, photo, cursor);
+        self.begin_interruption_check(app, photo);
         self.prune_cache(app, photo);
         Ok(())
     }

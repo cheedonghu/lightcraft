@@ -1,8 +1,170 @@
 //! Exercise library/exit through caller commands, widgets and varying filesystem/transport adapters.
 use super::*;
+#[test]
+fn cold_saved_unfinished_round_is_reported_without_resuming_or_granting_old_permission() {
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        for (background, padding, native) in
+            [(false, 0, false), (false, 2 * 1024 * 1024, false), (true, 2 * 1024 * 1024, false), (true, 2 * 1024 * 1024, true)]
+        {
+            let libraries = NativeLibraries::new();
+            let directory = libraries.path("saved-interruption");
+            let (catalog, mut files) = (MemStore::new(), MemStore::new());
+            files.background = background;
+            let stores = || LibraryStores {
+                catalog: Box::new(catalog.clone()),
+                files: if native { Box::new(lightcraft_catalog::FsStore::open(&directory).unwrap()) } else { Box::new(files.clone()) },
+                dir: directory.clone(),
+                on_disk: false,
+            };
+            let mut session = lightcraft_engine::Session::new();
+            session.open_library_in(stores(), true).unwrap();
+            let photo = session.active().unwrap();
+            let round = LocalRoundId::new().unwrap();
+            let settings = session.develop_of(photo).unwrap();
+            session.save_companion_conversation(photo, json!({"schema_version":2,"messages":[{"role":"user","text":"Reliable saved request"}],"rounds":[],"round_records":[{"local_round_id":round,"photo_id":photo.0,"request_text":"Reliable saved request","submission_seq":1,"connection_generation":1,"runtime_library_generation":session.library_generation(),"phase":"queued","original":settings,"stages":[],"opaque_extension":"x".repeat(padding)}]})).unwrap();
+            session
+                .set_companion_editor(
+                    photo,
+                    lightcraft_engine::companion::EditorState { draft: "Leave this draft unsent".into(), ..Default::default() },
+                )
+                .unwrap();
+            session.close_library().unwrap();
+            drop(session);
+            let mut cold = lightcraft_engine::Session::new();
+            cold.open_library_in(stores(), true).unwrap();
+            let generation = cold.library_generation();
+            let mut app = LightcraftApp::new(cold, crate::Services::default());
+            app.ui.language = language;
+            app.ui.settings.gpu = false;
+            app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+            app.services.png = Some(Box::new(|image| {
+                lightcraft_engine::export::encode_image(
+                    image,
+                    &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+                )
+                .unwrap()
+            }));
+            let (connection, outgoing, _events) = network::test_connection();
+            app.ai.next_connection = Some(connection);
+            let mut h = Headless::new(app, [1400.0, 1000.0], 1.0);
+            h.app.run("ai.open", json!({})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                h.step();
+                let status = h.app.run("ai.status", json!({})).unwrap();
+                if status["task"]["terminal"] == "interrupted" {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "verified saved activity was not displayed: {status}");
+                std::thread::yield_now();
+            }
+            for _ in 0..4 {
+                h.step();
+            }
+            let status = h.app.run("ai.status", json!({})).unwrap();
+            assert_eq!(status["task"]["terminal"], "interrupted", "only verified saved activity can produce this fact: {status}");
+            assert_eq!(status["task"]["localRoundId"], round.as_str());
+            assert_eq!(status["task"]["photo"], photo.0);
+            assert_eq!(status["task"]["libraryGeneration"], generation);
+            assert_eq!(status["busy"], false);
+            assert_eq!(status["task"]["unread"], false, "saved interrupted activity is not a newly produced result");
+            let notice = match language {
+                crate::i18n::Locale::En => "The previous task was interrupted. It was not resumed.",
+                _ => "上次任务已中断，未自动继续。",
+            };
+            assert!(h.painted_text().iter().any(|text| text == notice));
+            assert!(h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"));
+            assert!(outgoing.try_recv().is_err(), "loading a saved task never creates a backend request");
+            assert!(h.app.session.verify_round_revert(photo, &round).is_err());
+            let lease = h
+                .app
+                .session
+                .acquire_companion_lease(photo, LocalRoundId::new().unwrap())
+                .expect("display-only recovery does not hold an editing lease");
+            drop(lease);
+            assert_eq!(h.app.session.develop_of(photo).unwrap(), settings);
+            assert_eq!(h.app.session.companion_editor(photo).unwrap().draft, "Leave this draft unsent");
+            if native && let Ok(output) = std::env::var("LIGHTCRAFT_UX15_SCREENSHOTS") {
+                let path = std::path::Path::new(&output).join(format!("interrupted-{}.png", language.code()));
+                let response = h.request("ui.screenshot", json!({"path":path,"headless":true}), Duration::from_secs(10));
+                assert_eq!(response["ok"], true, "{response}");
+            }
+        }
+    }
+}
+
 use crate::headless::Headless;
 use lightcraft_catalog::{MemStore, Store};
 use lightcraft_engine::library::LibraryStores;
+
+#[test]
+fn malformed_saved_round_identity_never_invents_an_interrupted_task() {
+    for background in [false, true] {
+        for variant in ["empty", "foreign", "terminal", "unknown-phase", "missing-proof", "superseded"] {
+            let (catalog, mut files) = (MemStore::new(), MemStore::new());
+            files.background = background;
+            let stores = || LibraryStores {
+                catalog: Box::new(catalog.clone()),
+                files: Box::new(files.clone()),
+                dir: "unknown-activity".into(),
+                on_disk: false,
+            };
+            let mut session = lightcraft_engine::Session::new();
+            session.open_library_in(stores(), true).unwrap();
+            let photo = session.active().unwrap();
+            let mut record = json!({"local_round_id":LocalRoundId::new().unwrap(),"photo_id":photo.0,"request_text":"Readable unknown activity","submission_seq":1,"connection_generation":1,"runtime_library_generation":session.library_generation(),"phase":"queued","stages":[]});
+            let mut records = Vec::new();
+            match variant {
+                "empty" => record["local_round_id"] = json!(""),
+                "foreign" => record["photo_id"] = json!(session.catalog.photos().find(|candidate| candidate.id != photo).unwrap().id.0),
+                "terminal" => record["local_terminal"] = json!("completed"),
+                "unknown-phase" => record["phase"] = json!("not-a-known-activity"),
+                "missing-proof" => {
+                    record.as_object_mut().unwrap().remove("submission_seq");
+                }
+                "superseded" => {
+                    records.extend((0..129).map(|_| record.clone()));
+                    record["local_terminal"] = json!("completed");
+                }
+                _ => {}
+            }
+            records.push(record);
+            session
+                .save_companion_conversation(
+                    photo,
+                    json!({"schema_version":2,"messages":[{"role":"user","text":"Readable unknown activity"}],"rounds":[],"round_records":records}),
+                )
+                .unwrap();
+            session.close_library().unwrap();
+            drop(session);
+            let mut cold = lightcraft_engine::Session::new();
+            cold.open_library_in(stores(), true).unwrap();
+            let mut app = LightcraftApp::new(cold, crate::Services::default());
+            app.ui.settings.gpu = false;
+            let (connection, outgoing, _events) = network::test_connection();
+            app.ai.next_connection = Some(connection);
+            let mut h = Headless::new(app, [1400.0, 1000.0], 1.0);
+            h.app.run("ai.open", json!({})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                h.step();
+                if h.app.run("ai.status", json!({})).unwrap()["historyLoading"] == false {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "saved history read did not retire");
+                std::thread::yield_now();
+            }
+            for _ in 0..8 {
+                h.step();
+            }
+            let status = h.app.run("ai.status", json!({})).unwrap();
+            assert!(status["task"].is_null(), "unknown identity cannot be claimed as reliable previous activity: {status}");
+            assert!(h.painted_text().iter().any(|text| text == "Readable unknown activity"));
+            assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"));
+            assert!(outgoing.try_recv().is_err());
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct Files {

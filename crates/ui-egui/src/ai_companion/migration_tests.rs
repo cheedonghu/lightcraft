@@ -4,6 +4,162 @@ use lightcraft_catalog::{FsStore, MemStore, SourceIdentity, SourceSnapshot, Stor
 use lightcraft_engine::library::LibraryStores;
 use std::io::Write;
 use std::sync::{Condvar, Mutex};
+
+#[test]
+fn menu_exit_retry_waits_for_native_migration_and_preserves_each_latest_draft() {
+    let directory = std::env::temp_dir().join(format!("lc-ux15-close-{}", LocalRoundId::new().unwrap().as_str()));
+    std::fs::create_dir(&directory).unwrap();
+    let catalog = MemStore::new();
+    let mut original = lightcraft_engine::Session::new();
+    original
+        .open_library_in(
+            LibraryStores {
+                catalog: Box::new(catalog.clone()),
+                files: Box::new(FsStore::open(&directory).unwrap()),
+                dir: directory.clone(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let first = original.active().unwrap();
+    let second = original.catalog.photos().find(|p| p.id != first).unwrap().id;
+    original.close_library().unwrap();
+    drop(original);
+    let source = serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{first.0.to_string():{"schema_version":1,"messages":[{"role":"user","text":"Original saved source"}],"rounds":[]}}})).unwrap();
+    let mut files = FsStore::open(&directory).unwrap();
+    files.write_atomic("companion/state.json", &source).unwrap();
+    let gate = Arc::new((Mutex::new(Pause { released: true, pause_final: true, ..Default::default() }), Condvar::new()));
+    let mut session = lightcraft_engine::Session::new();
+    session
+        .open_library_in(
+            LibraryStores {
+                catalog: Box::new(catalog.clone()),
+                files: Box::new(PausedStore { native: FsStore::open(&directory).unwrap(), gate: gate.clone() }),
+                dir: directory.clone(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1400.0, 1000.0], 1.0);
+    h.app.ui.settings.gpu = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !gate.0.lock().unwrap().final_entered && Instant::now() < deadline {
+        h.step();
+        let _ = h.app.session.persist();
+        std::thread::yield_now();
+    }
+    assert!(gate.0.lock().unwrap().final_entered);
+    h.app.run("ai.open", json!({})).unwrap();
+    for (photo, text) in [(first, "First latest unsent draft"), (second, "Second latest unsent draft 草稿")] {
+        h.app.run("library.select", json!({"ids":[photo.0],"active":photo.0})).unwrap();
+        h.step();
+        h.step();
+        assert_eq!(h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), Duration::from_secs(5))["ok"], true);
+        assert_eq!(h.request("ui.text", json!({"text":text}), Duration::from_secs(5))["ok"], true);
+    }
+    let generation = h.app.session.library_generation();
+    assert_eq!(h.request("ui.menu.invoke", json!({"command":"app.quit"}), Duration::from_secs(5))["ok"], true);
+    assert!(!h.quit_requested(), "a live root publisher cannot be reported as a saved close");
+    assert_eq!(h.app.session.library_generation(), generation);
+    assert_eq!(h.app.session.active(), Some(second));
+    assert!(files.read_limited("companion/state.json", 32 * 1024).unwrap().as_deref() == Some(source.as_slice()));
+    gate.0.lock().unwrap().final_released = true;
+    gate.1.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while h.app.session.companion_migration_pending() && Instant::now() < deadline {
+        h.step();
+        let _ = h.app.session.persist();
+        std::thread::yield_now();
+    }
+    assert!(!h.app.session.companion_migration_pending());
+    h.step();
+    h.step();
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"button:quitRetry"}), Duration::from_secs(5))["ok"], true);
+    h.step();
+    h.step();
+    assert!(h.quit_requested());
+    // The headless host exposes the permitted exit; the native host then calls
+    // this same Session close before shutting down its renderer.
+    h.app.session.close_library().unwrap();
+    drop(h);
+    let mut reopened = lightcraft_engine::Session::new();
+    reopened
+        .open_library_in(
+            LibraryStores { catalog: Box::new(catalog), files: Box::new(FsStore::open(&directory).unwrap()), dir: directory.clone(), on_disk: false },
+            true,
+        )
+        .unwrap();
+    assert_eq!(reopened.companion_editor(first).unwrap().draft, "First latest unsent draft");
+    assert_eq!(reopened.companion_editor(second).unwrap().draft, "Second latest unsent draft 草稿");
+    reopened.close_library().unwrap();
+    drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn committed_exit_cancels_a_paused_native_migration_before_root_publication() {
+    let directory = std::env::temp_dir().join(format!("lc-ux15-exit-{}", LocalRoundId::new().unwrap().as_str()));
+    std::fs::create_dir(&directory).unwrap();
+    let catalog = MemStore::new();
+    let mut original = lightcraft_engine::Session::new();
+    original
+        .open_library_in(
+            LibraryStores {
+                catalog: Box::new(catalog.clone()),
+                files: Box::new(FsStore::open(&directory).unwrap()),
+                dir: directory.clone(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let photo = original.active().unwrap();
+    let settings = original.develop_of(photo).unwrap();
+    original.close_library().unwrap();
+    drop(original);
+    let source = serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():{"schema_version":1,"messages":[{"role":"user","text":"Saved migration source ".repeat(50000)}],"rounds":[],"checkpoint":null}}})).unwrap();
+    let mut files = FsStore::open(&directory).unwrap();
+    files.write_atomic("companion/state.json", &source).unwrap();
+    let gate = Arc::new((Mutex::new(Pause { released: true, pause_final: true, ..Default::default() }), Condvar::new()));
+    let mut session = lightcraft_engine::Session::new();
+    session
+        .open_library_in(
+            LibraryStores {
+                catalog: Box::new(catalog),
+                files: Box::new(PausedStore { native: FsStore::open(&directory).unwrap(), gate: gate.clone() }),
+                dir: directory.clone(),
+                on_disk: false,
+            },
+            true,
+        )
+        .unwrap();
+    let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1400.0, 1000.0], 1.0);
+    h.app.ui.settings.gpu = false;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !gate.0.lock().unwrap().final_entered && Instant::now() < deadline {
+        h.step();
+        let _ = h.app.session.persist();
+        std::thread::yield_now();
+    }
+    assert!(gate.0.lock().unwrap().final_entered, "actual native final publication must be paused");
+    before_exit(&mut h.app);
+    before_exit(&mut h.app);
+    gate.0.lock().unwrap().final_released = true;
+    gate.1.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.app.session.companion_migration_busy() && Instant::now() < deadline {
+        h.step();
+        std::thread::yield_now();
+    }
+    assert!(!h.app.session.companion_migration_busy(), "actual migration must retire after release");
+    let preserved = files.read_limited("companion/state.json", 4 * 1024 * 1024).unwrap();
+    assert!(preserved.as_deref() == Some(source.as_slice()), "committed exit revokes the old root publisher");
+    assert_eq!(h.app.session.develop_of(photo).unwrap(), settings);
+    drop(h);
+    std::fs::remove_dir_all(directory).unwrap();
+}
 #[derive(Default)]
 struct Pause {
     entered: bool,

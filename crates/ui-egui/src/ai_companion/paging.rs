@@ -9,6 +9,7 @@ struct PageRequest {
     cursor: HistoryCursor,
     legacy_cursor: u64,
     preview_cursor: u64,
+    recover: bool,
     presentation: BTreeMap<u64, Value>,
 }
 struct ReadMessage {
@@ -19,6 +20,7 @@ struct ReadMessage {
     transaction: String,
     cursor: HistoryCursor,
     result: ReadContent,
+    recovered: Option<interrupted::Record>,
 }
 enum ReadContent {
     Page(
@@ -87,6 +89,8 @@ impl State {
             if conversation.scope != Some(message.scope) || conversation.prefix.as_ref().is_none_or(|h| h.transaction_id != message.transaction) {
                 continue;
             }
+            let recover = self.paging.desired.as_ref().is_some_and(|request| request.recover) && matches!(&message.result, ReadContent::Page(_));
+            let recovery_header = message.header.clone();
             self.paging.completed = message.request;
             match message.result {
                 ReadContent::Page(Ok((page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages))) => {
@@ -162,6 +166,9 @@ impl State {
                         card_scan: None,
                     });
                 }
+            }
+            if recover {
+                self.accept_interruption(app, &recovery_header, message.recovered);
             }
         }
         if let Some(photo) = self.displayed_photo(app)
@@ -308,6 +315,7 @@ impl State {
             cursor,
             legacy_cursor: self.conversations.get(&photo).map(|c| c.legacy_cursor).unwrap_or(0),
             preview_cursor: self.conversations.get(&photo).map(|c| c.preview_cursor).unwrap_or(0),
+            recover: self.needs_interruption_check(app, photo),
             presentation: self
                 .conversations
                 .get(&photo)
@@ -422,7 +430,9 @@ impl State {
                         (page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages)
                     });
                     if !cancel.load(Ordering::Relaxed) {
+                        let recovered = request.recover.then(|| interrupted::read(&mut reader, request.scope)).flatten();
                         let _ = tx.try_send(ReadMessage {
+                            recovered,
                             retention: reader.into_retention(),
                             request: request.id,
                             scope: request.scope,
@@ -465,6 +475,7 @@ impl State {
                         let preview = historical::read_native(&mut reader, &page, request.preview_cursor);
                         if !cancel.load(Ordering::Relaxed) {
                             let _ = tx.try_send(ReadMessage {
+                                recovered: None,
                                 retention: reader.into_retention(),
                                 request: request.id,
                                 scope: request.scope,

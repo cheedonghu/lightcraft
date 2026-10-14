@@ -29,6 +29,7 @@ mod history_tests;
 #[cfg(test)]
 #[path = "ai_companion/identity_tests.rs"]
 mod identity_tests;
+mod interrupted;
 mod legacy;
 #[cfg(test)]
 #[path = "ai_companion/library_tests.rs"]
@@ -93,6 +94,7 @@ pub struct State {
     connection_generation: u64,
     connection: Option<network::Connection>,
     retiring_connection: Option<Arc<AtomicBool>>,
+    retiring_migrations: BTreeMap<u64, lightcraft_engine::companion::MigrationRetirement>,
     #[cfg(test)]
     next_connection: Option<network::Connection>,
     pending_confirmations: Vec<(RoundIdentity, Option<String>)>,
@@ -134,6 +136,7 @@ impl Default for State {
             connection_generation: 0,
             connection: None,
             retiring_connection: None,
+            retiring_migrations: BTreeMap::new(),
             #[cfg(test)]
             next_connection: None,
             pending_confirmations: Vec::new(),
@@ -209,6 +212,8 @@ struct Conversation {
     preview_cursor: u64,
     legacy_readonly: bool,
     history_error: Option<HistoryError>,
+    recovery_checked: bool,
+    recovery_scan: Option<interrupted::Scan>,
     prefix: Option<lightcraft_engine::companion::storage::PhotoHeader>,
     view: Option<HistoryView>,
     dirty: bool,
@@ -230,6 +235,8 @@ impl Default for Conversation {
             preview_cursor: 0,
             legacy_readonly: false,
             history_error: None,
+            recovery_checked: false,
+            recovery_scan: None,
             prefix: None,
             view: None,
             dirty: false,
@@ -1284,7 +1291,9 @@ impl State {
             self.text = error;
         }
         self.workers.retain(|_, alive| alive.load(Ordering::Relaxed));
+        self.retiring_migrations.retain(|_, receipt| !receipt.retired());
         self.poll_pages(app);
+        self.poll_interruption(app, ctx);
         for (photo, c) in &mut self.conversations {
             if c.storage_notice && !app.session.companion_history_unsaved(*photo) && !self.pending_local_saves.contains(photo) {
                 c.notice = tr("AI history saved. Photo changes are kept.").into();
@@ -1757,6 +1766,11 @@ pub fn cancel_for_library_change(app: &mut LightcraftApp) {
 pub fn before_exit(app: &mut LightcraftApp) {
     app.ai.exiting = true;
     cancel_for_library_change(app);
+    if let Some(receipt) = app.session.cancel_companion_migration() {
+        // One actual producer per live generation. Repeated host/user exit
+        // callbacks replace the same receipt without accumulating duplicates.
+        app.ai.retiring_migrations.insert(app.session.library_generation(), receipt);
+    }
 }
 pub fn before_library_change(app: &mut LightcraftApp) -> Result<(), String> {
     cancel_for_library_change(app);

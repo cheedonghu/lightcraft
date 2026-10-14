@@ -23,6 +23,7 @@ fn terminal_text(terminal: &str) -> &'static str {
         "cancelled" => "Stopped",
         "timed_out" => "Timed out",
         "disconnected" => "Disconnected",
+        "interrupted" => "Interrupted",
         _ => "Failed",
     }
 }

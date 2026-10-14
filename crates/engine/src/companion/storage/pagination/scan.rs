@@ -199,6 +199,11 @@ impl ValueScan {
 }
 impl Fields {
     fn save(&mut self) -> Result<()> {
+        if !self.in_stage && self.name == "backend_terminal" {
+            // Recovery needs presence, never the complete terminal payload.
+            // Keep additive data streaming instead of giving it a display quota.
+            self.root.insert(self.name.clone(), Value::Bool(true));
+        }
         if self.capture {
             self.retained += self.value.bytes.len();
             let value = if self.value.raw_images {
@@ -313,6 +318,12 @@ impl Fields {
                                             | "local_message_id"
                                             | "photo_id"
                                             | "local_terminal"
+                                            | "phase"
+                                            | "request_text"
+                                            | "submission_seq"
+                                            | "connection_generation"
+                                            | "runtime_library_generation"
+                                            | "backend_round_id"
                                             | "trace_id"
                                             | "before_preview_message_id"
                                             | "recent_complete_hash"
@@ -329,6 +340,13 @@ impl Fields {
                         self.value.raw_images = !self.in_stage && self.name == "images";
                         self.legacy = matches!(self.name.as_str(), "before_state" | "proposed_state" | "applied_state" | "recent_complete_result")
                             || self.value.raw_images;
+                        // Current submissions are at most 4096 UTF-8 bytes.
+                        // A larger legacy request stays in its original record
+                        // and readable message; it cannot consume the card budget.
+                        if !self.in_stage && self.name == "request_text" && self.value.bytes.len() >= 32 * 1024 {
+                            self.capture = false;
+                            self.value.bytes.clear();
+                        }
                         // Compatibility settings can contain arbitrary old mask geometry.
                         // Retain a small complete setting only; otherwise keep scanning
                         // without a buffer and use the execution-time display fields.
