@@ -52,12 +52,31 @@ struct Unreadable {
     unreadable: Arc<Mutex<Vec<String>>>,
 }
 
-impl Store for Unreadable {
-    fn read(&mut self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+impl Unreadable {
+    fn readable(&self, name: &str) -> std::io::Result<()> {
         if self.unreadable.lock().unwrap().iter().any(|n| n == name) {
             return Err(std::io::Error::other("locked by another process"));
         }
+        Ok(())
+    }
+}
+
+impl Store for Unreadable {
+    fn read(&mut self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+        self.readable(name)?;
         self.files.read(name)
+    }
+    fn read_limited(&mut self, name: &str, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+        self.readable(name)?;
+        self.files.read_limited(name, max)
+    }
+    fn read_range(&mut self, name: &str, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        self.readable(name)?;
+        self.files.read_range(name, offset, length)
+    }
+    fn source_snapshot(&mut self, name: &str) -> std::io::Result<Option<Box<dyn lightcraft_catalog::store::source::SourceSnapshot>>> {
+        self.readable(name)?;
+        self.files.source_snapshot(name)
     }
     fn write_atomic(&mut self, name: &str, data: &[u8]) -> std::io::Result<()> {
         self.files.write_atomic(name, data)

@@ -130,6 +130,8 @@ fn white_balance_commands_write_kelvin_on_raws_whose_camera_has_matrices() {
     use lightcraft_catalog::{MediaKind, Op, Photo, Source};
     use lightcraft_develop::{DevelopSettings, WbMode, WbScale};
     let mut s = Session::new();
+    // This fixture supplies virtual online files; Missing-photo behavior has separate coverage.
+    s.media.availability.set_probe(std::sync::Arc::new(|_| true));
     let add = |s: &mut Session, name: &str, camera: &str, as_shot: (f64, f64)| {
         let id = s.catalog.alloc_photo_id();
         let mut p = Photo::new(id, Source::File { path: format!("/photos/{name}") }, name, "ARW", 64, 64, "2026-01-01T00:00:00");

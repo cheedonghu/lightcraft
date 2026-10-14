@@ -422,8 +422,8 @@ fn auto_import_watched_folder() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Smart previews: with the original offline the photo still renders (and edits apply) from
-/// its proxy; without the proxy it can't be opened.
+/// Smart previews: with the original offline the photo still renders from its proxy,
+/// but UX A13 keeps it read-only; without the proxy it can't be opened.
 #[test]
 fn smart_previews_stand_in_for_offline_originals() {
     let src = temp_dir("smartsrc");
@@ -444,9 +444,15 @@ fn smart_previews_stand_in_for_offline_originals() {
     let offline = s.render_now(id, 48, 32).expect("renders from the smart preview").image;
     let diff: f64 = online.data.iter().zip(&offline.data).map(|(a, b)| (a[0] as f64 - b[0] as f64).abs()).sum::<f64>() / online.data.len() as f64;
     assert!(diff < 6.0, "the proxy looks like the original: {diff}");
-    s.execute("develop.set", &json!({"control": "light.exposure", "value": 1.0})).unwrap();
+    // UX A13 makes a missing original read-only, even while its smart preview
+    // remains usable for viewing. A rejected edit changes neither settings nor History.
+    let settings = s.develop_of(id).unwrap();
+    let history = s.undo.len();
+    assert!(s.execute("develop.set", &json!({"control": "light.exposure", "value": 1.0})).is_err());
+    assert_eq!(s.develop_of(id).unwrap(), settings);
+    assert_eq!(s.undo.len(), history);
     s.media.forget(id);
-    assert_ne!(s.render_now(id, 48, 32).unwrap().image.data, offline.data, "edits apply offline");
+    assert_eq!(s.render_now(id, 48, 32).unwrap().image.data, offline.data, "the proxy remains viewable without editing the missing original");
     // without the proxy it can't be opened
     s.execute("library.smartPreviews", &json!({"discard": true})).unwrap();
     s.media.forget(id);

@@ -371,6 +371,8 @@ fn migrated_custom_import_white_balance_returns_to_the_logical_default_look() {
     use lightcraft_catalog::{MediaKind, Op, Photo, PhotoId, Source};
     use lightcraft_develop::{DevelopSettings, WbMode, WbScale};
     let mut s = Session::new();
+    // This fixture supplies virtual online files; Missing-photo behavior has separate coverage.
+    s.media.availability.set_probe(std::sync::Arc::new(|_| true));
     let id = PhotoId(101);
     let mut p = Photo::new(id, Source::File { path: "/photos/legacy.ARW".into() }, "legacy.ARW", "ARW", 64, 64, "");
     p.kind = MediaKind::Raw;

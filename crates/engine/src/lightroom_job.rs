@@ -357,6 +357,8 @@ mod tests {
     #[test]
     fn prepared_reimport_preserves_current_edit_and_uses_one_undo_per_import() {
         let mut session = crate::Session::new();
+        // This fixture supplies virtual online files; Missing-photo behavior has separate coverage.
+        session.media.availability.set_probe(std::sync::Arc::new(|_| true));
         let path = "/missing/lightroom-job-edit.jpg";
         let prepared = prepared_for(&session, path, 4);
         let first = commit_prepared(&mut session, prepared).unwrap();

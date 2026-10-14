@@ -968,6 +968,8 @@ mod tests {
     #[test]
     fn preserves_existing_edits_and_rejects_invalid_structure_before_mutation() {
         let mut s = crate::Session::new();
+        // This fixture supplies virtual online files; Missing-photo behavior has separate coverage.
+        s.media.availability.set_probe(std::sync::Arc::new(|_| true));
         let data = sample();
         apply(&mut s, data.clone(), false).unwrap();
         let id = s.catalog.photos().find(|p| p.copy_of.is_none()).unwrap().id;
@@ -1231,6 +1233,8 @@ mod tests {
     fn persistent_reimport_keeps_copy_and_collection_ids_and_capture_time() {
         let dir = std::env::temp_dir().join(format!("lightcraft-lrcat-reimport-{}", std::process::id()));
         let mut s = crate::Session::new();
+        // This fixture supplies virtual online files; Missing-photo behavior has separate coverage.
+        s.media.availability.set_probe(std::sync::Arc::new(|_| true));
         s.open_library(&dir, false).unwrap();
         let mut data = sample();
         data.collections.reverse(); // Parent must be committed before its child regardless of row order.

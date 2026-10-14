@@ -12,6 +12,8 @@ fn setup(name: &str) -> (LightcraftApp, PathBuf, PhotoId) {
     let dir = std::env::temp_dir().join(format!("lc-model-flow-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut s = Session::new().with_fs();
+    // Installation flows use virtual online RAW files, not Missing-photo behavior.
+    s.media.availability.set_probe(std::sync::Arc::new(|_| true));
     s.open_library(dir.join("library"), true).unwrap();
     s.set_denoise_models_dir(Some(dir.join("denoise")));
     s.execute("denoise.settings", &json!({"runOn": "cpu"})).unwrap();
