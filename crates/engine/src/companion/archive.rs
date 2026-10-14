@@ -61,6 +61,12 @@ pub(super) fn error(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("AI archive: {e}"))
 }
 impl Archive {
+    pub(crate) fn protect_metadata(&mut self, reason: &str) {
+        self.blocked = Some(match self.blocked.take() {
+            Some(existing) => format!("{existing}; {reason}"),
+            None => reason.to_owned(),
+        });
+    }
     pub(crate) fn load(store: &mut dyn Store, _dir: &Path, _on_disk: bool) -> Self {
         let pins = super::storage::reader_pins::for_store(store);
         let mut archive = Self::default();

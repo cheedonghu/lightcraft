@@ -31,6 +31,7 @@ pub(crate) struct MutationGuard {
     pub(crate) clean_load: bool,
     pub(super) core_proof: Option<super::revert_guard::CoreProof>,
     pub(crate) load_fenced: bool,
+    pub(crate) protected_load: bool,
     pub(crate) retire_load: bool,
     pub(crate) rejected_interaction: bool,
 }

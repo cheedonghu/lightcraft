@@ -122,13 +122,19 @@ fn seal_pending(store: &mut dyn Store, photo: PhotoId) -> Result<bool> {
     }
     Ok(true)
 }
+#[derive(Deserialize)]
+struct StorageIdentity {
+    version: u32,
+    identity: String,
+}
 fn identity(store: &mut dyn Store, create: bool) -> Result<Option<String>> {
     if let Some(bytes) = store.read_limited(IDENTITY, LIMIT).map_err(error)? {
-        let v: Value = serde_json::from_slice(&bytes).map_err(error)?;
-        if v["version"] != 1 || v["identity"].as_str().is_none_or(str::is_empty) {
+        // Typed owning fields reject duplicates instead of last-key-wins authority.
+        let value: StorageIdentity = serde_json::from_slice(&bytes).map_err(error)?;
+        if value.version != 1 || value.identity.is_empty() {
             return Err(error("unknown companion storage identity protected"));
         }
-        return Ok(v["identity"].as_str().map(str::to_owned));
+        return Ok(Some(value.identity));
     }
     if !create {
         return Ok(None);
@@ -157,14 +163,27 @@ fn load_pending(store: &mut dyn Store) -> Result<bool> {
     Ok(true)
 }
 /// Fence before core replay can repair or replace files and erase its warning.
-pub(crate) fn begin_load(store: &mut dyn Store) -> Result<(bool, bool)> {
+pub(crate) struct LoadProtection {
+    pub(crate) fenced: bool,
+    pub(crate) uncertain: bool,
+    pub(crate) protected_reason: Option<String>,
+}
+pub(crate) fn begin_load(store: &mut dyn Store) -> Result<LoadProtection> {
     let pending = load_pending(store)?;
     let failed_close = close_pending(store)? == Some(true) || core_pending(store)?;
-    if pending || identity(store, false)?.is_some() {
+    let storage_identity = identity(store, false);
+    if pending || storage_identity.as_ref().is_ok_and(|identity| identity.is_some()) || storage_identity.is_err() {
+        // A malformed identity must remain available for diagnosis. The separate
+        // durable load fence denies every old certificate before core replay.
+        // If this write fails, opening still fails: memory is not a safe fence.
         store.write_atomic(LOAD, br#"{"version":1,"pending":true}"#).map_err(error)?;
-        return Ok((true, pending || failed_close));
+        return Ok(LoadProtection {
+            fenced: true,
+            uncertain: pending || failed_close || storage_identity.is_err(),
+            protected_reason: storage_identity.err().map(|reason| reason.to_string()),
+        });
     }
-    Ok((false, false))
+    Ok(LoadProtection { fenced: false, uncertain: false, protected_reason: None })
 }
 impl Session {
     /// Validate the previous acknowledged core anchor before any new save. A
@@ -289,7 +308,9 @@ impl Session {
         }
     }
     pub(crate) fn finish_companion_load(&mut self) -> Result<()> {
-        if !self.mutation_guard.load_fenced {
+        if !self.mutation_guard.load_fenced || self.mutation_guard.protected_load {
+            // Protected metadata and its acknowledged fence survive ordinary
+            // core saves. Repair/reopen must not recover authority from equality.
             return Ok(());
         }
         let Some(lib) = self.library.as_mut() else { return Ok(()) };
@@ -310,6 +331,11 @@ impl Session {
         Ok(())
     }
     pub(crate) fn begin_companion_close(&mut self) -> Result<()> {
+        if self.mutation_guard.protected_load {
+            // Opening acknowledged a persistent load fence and denied all AI
+            // authority. Keep it through closing instead of rewriting bad identity.
+            return Ok(());
+        }
         let live = self.mutation_guard.reverts.values().any(|p| p.eligible);
         let Some(lib) = self.library.as_mut() else { return Ok(()) };
         if live || identity(lib.files.as_mut(), false)?.is_some() {

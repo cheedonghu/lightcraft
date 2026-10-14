@@ -370,10 +370,13 @@ impl Session {
         // what was learned about the old library's faces is saved, and none of it carries over (photo ids are per library)
         #[cfg(not(target_arch = "wasm32"))]
         self.faces.library_changed();
-        let (load_fenced, uncertain_load) = crate::companion::revert_guard::begin_load(files.as_mut())?;
+        let protection = crate::companion::revert_guard::begin_load(files.as_mut())?;
         crate::companion::archive::discard_legacy_ops(catalog.as_mut())?;
         let (mut journal, mut catalog, report) = Journal::open(catalog)?;
         self.companion_archive = crate::companion::archive::Archive::load(files.as_mut(), &dir, on_disk);
+        if let Some(reason) = &protection.protected_reason {
+            self.companion_archive.protect_metadata(reason);
+        }
         // A loaded catalog counts revisions from 0, like every other one. Caches (sidebar counts,
         // keyword tree, the grid's list…) are keyed on the revision, so give each library loaded
         // in this process its own range: otherwise an empty library opened after one that was
@@ -483,7 +486,7 @@ impl Session {
         });
         self.mutation_guard = Default::default();
         self.mutation_guard.loaded_seq = self.library.as_ref().map(|l| l.journal.seq()).unwrap_or(0);
-        self.mutation_guard.clean_load = !uncertain_load
+        self.mutation_guard.clean_load = !protection.uncertain
             && self.library.as_ref().is_some_and(|l| {
                 !l.report.created
                     && l.report.failed == 0
@@ -492,8 +495,9 @@ impl Session {
                     && l.report.damaged.is_none()
                     && l.report.upgraded_from.is_none()
             });
-        self.mutation_guard.load_fenced = load_fenced;
-        self.mutation_guard.retire_load = load_fenced && !self.mutation_guard.clean_load;
+        self.mutation_guard.load_fenced = protection.fenced;
+        self.mutation_guard.protected_load = protection.protected_reason.is_some();
+        self.mutation_guard.retire_load = protection.fenced && !self.mutation_guard.clean_load;
         self.load_companion_core_proof();
         self.finish_companion_load()?;
         // forget untouched Local records of folders not browsed for a while (journaled at once)
