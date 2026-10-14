@@ -6,7 +6,7 @@ Blocked by: 04, 07
 
 **What to build:** 用户停止工具处理或遇到方案校验失败后，下一轮仍能携带全部有效历史继续，工具结果与真实执行事实正确配对。
 
-**Blocked by:** [04：停止与撤销同意真正阻断未发送内容](04-stop-and-consent-cancellation.md)、[07：新会话从提交到保存、重开完整可用](07-new-conversation-persistence.md)
+**Blocked by:** [04：停止与撤销同意真正阻断未发送内容](../../../../photo-companion/.scratch/ai-companion-client-ux/issues/04-stop-and-consent-cancellation.md)、[07：新会话从提交到保存、重开完整可用](../../../../photo-companion/.scratch/ai-companion-client-ux/issues/07-new-conversation-persistence.md)
 
 **Triage:** ready-for-agent；仅当阻塞任务全部resolved后可认领。
 
@@ -22,7 +22,7 @@ Blocked by: 04, 07
 
 ## References
 
-[客户端spec](../../photo-companion-v1/client-spec.md)、[设计定稿](../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A02、A10。
+[客户端spec](../../../../photo-companion/.scratch/photo-companion-v1/client-spec.md)、[设计定稿](../../../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A02、A10。
 
 原首版阶段对照：12；该对照不是阻塞依赖，不自动修改或关闭原阶段任务。
 

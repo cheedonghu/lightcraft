@@ -1,0 +1,25 @@
+## Standards
+
+Final read-only review covers client base `363e5d592a64af41cefbe3ff0642ee347c61cf18` through `1df0effc` plus final working changes, and backend base `1e48bb88f0e2eddd8343b3dc6f574a9000958785` through `3c18b46`. Read repository AGENTS/collaboration/architecture, backend CONTRIBUTING/domain/ADR and client storage/control/attribution rules. Root owns final quality checks; this report does not count pending checks as passed.
+
+**Documented breaches: none remaining.** Prior P2 absolute-documentation links are fixed. Independent scans checked all 240 local tracker references and 40 client archive references: all resolve, no absolute Markdown file targets. Original screenshot provenance and the attributed PNG pattern cover the archived assets.
+
+**Resolved P2 composition defect:** duplicated generation reset in `crates/ui-egui/src/ai_companion.rs:1256–1283` and `:1830–1858` omitted `bottom_reading.clear()` from polling. Independent public Headless/Session probe demonstrated A’s pending `ai.bottom` moved B’s same-PhotoId saved cursor `(0,0)` to `(0,786489)`, while the control case preserved `(0,0)`. Root added the missing clear and permanent public library regression. Relinked the unchanged independent probe against the rebuilt current UI rlib and fingerprint-matched dependencies: exit 0, both cases retain `draft-B`, `follow_tail=false` and cursor `(0,0)`. Exact source/red/green logs are `22-standards-bottom-probe.rs`, `22-standards-bottom-red.log`, `22-standards-bottom-green.log` beside this report. No product edits or Cargo builds by reviewer.
+
+**Optional P3 judgement call, possible Duplicated Code:** a shared owning State reset method would keep future fields consistent across command and poll entry points. The confirmed navigation leak is fixed; this broader refactor remains optional.
+
+Final source follows existing bounds/ownership. Web limited reads check length under mirror lock before cloning; ranges use checked arithmetic and copy only validated requested slices. Unreadable adapters gate forwarded bounded/source reads. Notices retain source text and translate at display; failed-delete language-switch coverage also preserves authored content. Virtual-online RAW probes preserve existing assertions; real Missing-original smart-preview coverage verifies read-only edits and continued viewing without production bypasses.
+
+Native fixtures retire owned processes/handlers, actual consent uses checkbox events, credentials/photos are synthetic. Evidence separates native processes, public Headless and compositor fallback; no physical power-loss, foreign-runtime or paid-provider certification claim.
+
+Totals: 0 unresolved documented breaches or confirmed defects; 1 optional heuristic (P3 shared reset).
+
+## Spec
+
+Final read-only follow-up covers the original whole-implementation review (client base `363e5d592a64af41cefbe3ff0642ee347c61cf18`, backend base `1e48bb88f0e2eddd8343b3dc6f574a9000958785`) and the subsequent working fixes for notice localization, real browser bounded storage, virtual-fixture availability, physically offline smart previews, unreadable settings, and abnormal native process validation.
+
+**The original P2 finding is resolved in the reviewed source.** Design §11 requires “全部用户可见文案走现有i18n…用户语言选择优先”. History-preflight cancellation now records an English app-owned source key, and visible/status notice rendering translates that key using the current locale. Completion, cancellation, interruption, revert, and saved notices likewise retain source keys. The deletion-save-failure branch now stores its source key while preserving localized command errors. Request/model message rows stay separate and unchanged. The existing physical history-read barrier regression verifies English → Chinese → English; the failed-deletion regression verifies both live switch directions and unchanged authored text. Their exact cases are marked `ok` in `review-fix-ai.log`; preflight's standalone green result is 1/1. Original real-native and failed-deletion reds remain recorded.
+
+The real browser FilesStore implements bounded reads before cloning and overflow-checked ranges; existing web-library tests are 22/22 green and the new bounded edge case 1/1 green. This restores ordinary storage without enabling AI on WASM. Virtual-file fixtures retain assertions with explicit availability. Physically missing originals with valid smart proxies remain viewable but readonly, as explicitly required by design §7/A13 and ticket 19; the updated test retains rendering and adds unchanged settings/Undo assertions. Unreadable-settings bounded access preserves its named-file fault gate and original not-overwrite assertions.
+
+No additional concrete missing requirement, incorrect implementation, or unasked product scope was found. **Remaining Spec findings: 0.** Pending whole-AI, final affected checks, rebuilt native locale/abnormal-restart validation, final archive/integration verification, and ticket-22 closure remain root completion gates; this report does not certify pending runs as passed.

@@ -1,0 +1,75 @@
+warning: unused imports: `HDR_REFERENCE_WHITE_NITS`, `Samples`, and `pq_encode`
+ --> crates/codecs/src/jxl_encode.rs:6:46
+  |
+6 | use crate::encode::{EncodeImage, EncodeMeta, HDR_REFERENCE_WHITE_NITS, Samples, pq_encode};
+  |                                              ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-codecs` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-codecs` to apply 1 suggestion)
+warning: constant `DROP_WAIT` is never used
+  --> crates/preview/src/pool.rs:43:7
+   |
+43 | const DROP_WAIT: Duration = Duration::from_secs(2);
+   |       ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-preview` (lib) generated 1 warning
+warning: variable does not need to be mutable
+  --> crates/engine/src/devices.rs:90:13
+   |
+90 |         let mut s = self.state();
+   |             ----^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-engine` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-engine` to apply 1 suggestion)
+    Checking lightcraft-ui-egui v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/ui-egui)
+warning: unused import: `Cancel`
+  --> crates/ui-egui/src/lightroom_import.rs:11:35
+   |
+11 | use lightcraft_engine::activity::{Cancel, TaskGuard};
+   |                                   ^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variants `Inspect` and `Import` are never constructed
+  --> crates/ui-egui/src/lightroom_import.rs:18:5
+   |
+17 | enum Kind {
+   |      ---- variants in this enum
+18 |     Inspect,
+   |     ^^^^^^^
+19 |     Import,
+   |     ^^^^^^
+   |
+   = note: `Kind` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variants `Inspected`, `Prepared`, and `Finalized` are never constructed
+  --> crates/ui-egui/src/lightroom_import.rs:23:5
+   |
+22 | enum Message {
+   |      ------- variants in this enum
+23 |     Inspected(Result<Value, String>),
+   |     ^^^^^^^^^
+24 |     Prepared(Result<Box<lightcraft_engine::lightroom_job::PreparedLightroom>, String>),
+   |     ^^^^^^^^
+25 |     Finalized(Result<(), String>),
+   |     ^^^^^^^^^
+
+warning: method `cancel` is never used
+   --> crates/ui-egui/src/lightroom_import.rs:114:8
+    |
+ 48 | impl LightroomTask {
+    | ------------------ method in this implementation
+...
+114 |     fn cancel(&mut self) {
+    |        ^^^^^^
+
+warning: `lightcraft-ui-egui` (lib) generated 4 warnings (run `cargo fix --lib -p lightcraft-ui-egui` to apply 1 suggestion)
+    Checking lightcraft-web v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/apps/lightcraft-web)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 2.13s

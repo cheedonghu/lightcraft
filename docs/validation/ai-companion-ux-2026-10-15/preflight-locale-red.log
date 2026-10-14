@@ -1,0 +1,23 @@
+    Blocking waiting for file lock on build directory
+   Compiling lightcraft-ui-egui v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/ui-egui)
+    Finished `test` profile [optimized + debuginfo] target(s) in 5m 07s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_ui_egui-e9a7f97cc3954f29)
+
+running 1 test
+test ai_companion::paging_tests::cancelling_blocked_native_style_history_preflight_never_enqueues_creation_or_late_publication ... FAILED
+
+failures:
+
+---- ai_companion::paging_tests::cancelling_blocked_native_style_history_preflight_never_enqueues_creation_or_late_publication stdout ----
+
+thread 'ai_companion::paging_tests::cancelling_blocked_native_style_history_preflight_never_enqueues_creation_or_late_publication' (5294441) panicked at crates/ui-egui/src/ai_companion/paging_tests.rs:190:5:
+{"activePhotos":[],"activeRounds":[],"busy":false,"cleanupError":null,"cleanupPending":true,"comparison":null,"comparisonWorkerBusy":false,"health":{"diagnostic":null,"probe":0,"state":"unchecked"},"historicalPreview":null,"historyError":null,"historyLoading":true,"legacyPlans":[],"localRoundId":null,"migrationBusy":false,"migrationError":null,"migrationPending":false,"photo":21,"readonlyPhoto":null,"resultCards":[],"round":null,"saveState":"saved","task":{"libraryGeneration":2,"localRoundId":"local-b18b6cbd36e8e915330279ee036c89c5","name":"LC01347.JPG","phase":"submitting","photo":21,"terminal":"cancelled","unread":true},"text":"Please review this photo and optimize it naturally.\n\n已停止，未发送模型请求。","transport":{"connectionAlive":true,"heartbeatSequence":null,"heartbeats":0,"lastHeartbeatAgeMs":null,"lastTextAgeMs":null},"viewedPhoto":21,"workerBusy":false}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    ai_companion::paging_tests::cancelling_blocked_native_style_history_preflight_never_enqueues_creation_or_late_publication
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 970 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p lightcraft-ui-egui --lib`

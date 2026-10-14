@@ -21,7 +21,7 @@ Type: task
 
 ## References
 
-[客户端spec](../../photo-companion-v1/client-spec.md)、[设计定稿](../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A03、A05、A14。
+[客户端spec](../../../../photo-companion/.scratch/photo-companion-v1/client-spec.md)、[设计定稿](../../../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A03、A05、A14。
 
 原首版阶段对照：11；该对照不是阻塞依赖，不自动修改或关闭原阶段任务。
 

@@ -1,0 +1,22 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_ui_egui-e9a7f97cc3954f29)
+
+running 15 tests
+test ai_companion::reading_tests::back_to_bottom_reaches_the_final_fragment_of_the_last_message_without_losing_draft ... ok
+test ai_companion::reading_tests::fallback_intermediate_role_scan_never_exposes_tool_payload_in_paint_or_default_status ... ok
+test ai_companion::reading_tests::oversized_tool_fragments_stay_folded_and_forward_page_preserves_assistant_role ... ok
+test ai_companion::reading_tests::saved_history_displays_roles_markdown_and_folds_tool_payload_without_changing_records ... ok
+test ai_companion::reading_tests::submitted_authored_state_json_survives_pre_input_stop_in_status_and_conversation ... ok
+test ai_companion::reading_tests::typed_requests_keep_user_authored_feedback_and_state_markers_visible ... ok
+test ai_companion::reading_tests::readable_legacy_and_runtime_inline_previews_are_displayed_from_their_recorded_bytes ... ok
+test ai_companion::reading_tests::genuine_input_enrichment_hides_machine_state_and_preserves_authored_json ... ok
+test ai_companion::reading_tests::upward_reading_survives_stream_completion_until_explicit_back_to_bottom ... ok
+test ai_companion::reading_tests::reading_controls_and_input_are_accessible_in_bilingual_tools_layouts ... ok
+test ai_companion::reading_tests::late_photo_a_preview_cannot_paint_photo_b_with_the_same_message_id ... ok
+test ai_companion::reading_tests::known_assistant_without_display_kind_remains_prose_for_small_and_giant_messages ... ok
+test ai_companion::reading_tests::giant_typed_requests_and_answers_retain_authored_markers_and_final_continuation ... ok
+test ai_companion::reading_tests::native_previews_load_for_visible_rows_and_missing_preview_is_local ... ok
+test ai_companion::reading_tests::old_v2_empty_and_cropped_hints_reopen_without_losing_typed_text_or_exposing_feedback ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 957 filtered out; finished in 12.11s
+

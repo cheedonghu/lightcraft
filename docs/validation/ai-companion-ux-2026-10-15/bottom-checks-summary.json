@@ -1,0 +1,101 @@
+[
+  {
+    "name": "library",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "lightcraft-ui-egui",
+      "ai_companion::library_tests",
+      "--lib"
+    ],
+    "exit": 0,
+    "seconds": 12.14
+  },
+  {
+    "name": "lifecycle",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "lightcraft-ui-egui",
+      "ai_companion::lifecycle_tests",
+      "--lib"
+    ],
+    "exit": 0,
+    "seconds": 5.42
+  },
+  {
+    "name": "reading",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "lightcraft-ui-egui",
+      "ai_companion::reading_tests",
+      "--lib"
+    ],
+    "exit": 0,
+    "seconds": 12.37
+  },
+  {
+    "name": "strict",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "lightcraft-engine",
+      "-p",
+      "lightcraft-ui-egui",
+      "-p",
+      "lightcraft",
+      "-p",
+      "lightcraft-web",
+      "--all-targets",
+      "--no-deps",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit": 0,
+    "seconds": 9.66
+  },
+  {
+    "name": "wasm",
+    "command": [
+      "cargo",
+      "check",
+      "-p",
+      "lightcraft-ui-egui",
+      "-p",
+      "lightcraft-web",
+      "--target",
+      "wasm32-unknown-unknown"
+    ],
+    "exit": 0,
+    "seconds": 2.18
+  },
+  {
+    "name": "build",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "lightcraft"
+    ],
+    "exit": 0,
+    "seconds": 38.14
+  },
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit": 0,
+    "seconds": 2.82
+  }
+]

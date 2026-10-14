@@ -1,0 +1,12 @@
+    Blocking waiting for file lock on build directory
+   Compiling lightcraft-engine v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/engine)
+   Compiling lightcraft-ui-egui v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/ui-egui)
+   Compiling lightcraft-web v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/apps/lightcraft-web)
+    Finished `test` profile [optimized + debuginfo] target(s) in 1m 11s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_web-8a0c3b0a8da01403)
+
+running 1 test
+test files::tests::bounded_reader_refuses_oversized_and_out_of_range_requests ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+

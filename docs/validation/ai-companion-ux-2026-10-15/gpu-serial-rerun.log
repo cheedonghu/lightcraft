@@ -1,0 +1,31 @@
+
+running 26 tests
+test backend::tests::a_panic_inside_the_scope_still_removes_the_marker ... ok
+test backend::tests::dx12_compiles_with_fxc_unless_asked ... ok
+test backend::tests::indirect_call_validation_is_off_unless_asked_for ... ok
+test backend::tests::init_marker_is_written_during_creation_and_removed_after ... ok
+test backend::tests::lightcraft_variable_wins_over_wgpu_backend ... ok
+test backend::tests::overlapping_scopes_share_one_marker_until_the_last_ends ... ok
+test backend::tests::parses_backend_names ... ok
+test backend::tests::resolves_against_the_build ... ok
+test backend::tests::window_renderer_fallback_order ... ok
+test backend::tests::window_renderer_names_round_trip ... ok
+test backend::tests::windows_defaults_to_dx12_only ... ok
+test ctx::tests::dispatches_stay_within_the_workgroup_limit ... ok
+test ctx::tests::limits_override_parses ... ok
+test exit::tests::closed_gate_lets_nothing_in_and_waits_for_what_is_inside ... ok
+test exit::tests::work_that_panics_still_leaves ... ok
+test nn::tests::a_runner_serves_many_tiles_from_many_threads ... ok
+test nn::tests::a_tile_of_the_wrong_size_is_an_error_not_a_crash ... ok
+test nn::tests::networks_the_kernels_cannot_run_are_refused ... ok
+test nn::tests::partial_tiles_remain_correct_when_reusing_a_runner ... ok
+test nn::tests::real_model_on_the_gpu_matches_cpu ... ignored, needs the real model: see the doc comment
+test nn::tests::the_gpu_gives_what_the_reference_gives ... ok
+test nn::tests::time_a_shader_build ... ignored, a probe for shader compile times
+test render::tests::bench_kernels ... ignored
+test render::tests::coverage_mask_matches_per_pixel_decision ... ok
+test render::tests::coverage_mask_with_the_horizon_in_view ... ok
+test render::tests::orient_map_matches_image_oriented ... ok
+
+test result: ok. 23 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 4.86s
+

@@ -1,0 +1,24 @@
+    Blocking waiting for file lock on build directory
+   Compiling lightcraft-engine v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/engine)
+   Compiling lightcraft-ui-egui v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/ui-egui)
+    Finished `test` profile [optimized + debuginfo] target(s) in 4m 23s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_ui_egui-e9a7f97cc3954f29)
+
+running 1 test
+test ai_companion::clear_tests::confirmation_and_failed_deletion_are_localized_and_reachable_in_small_tools ... FAILED
+
+failures:
+
+---- ai_companion::clear_tests::confirmation_and_failed_deletion_are_localized_and_reachable_in_small_tools stdout ----
+
+thread 'ai_companion::clear_tests::confirmation_and_failed_deletion_are_localized_and_reachable_in_small_tools' (5337807) panicked at crates/ui-egui/src/ai_companion/clear_tests.rs:414:13:
+failure notice follows live language selection: {"activePhotos":[],"activeRounds":[],"busy":false,"cleanupError":null,"cleanupPending":false,"comparison":null,"comparisonWorkerBusy":false,"health":{"diagnostic":"无法连接本地 AI 服务，请先启动 Go 后端。","probe":1,"state":"unreachable"},"historicalPreview":null,"historyError":null,"historyLoading":false,"legacyPlans":[],"localRoundId":null,"migrationBusy":false,"migrationError":null,"migrationPending":false,"photo":21,"readonlyPhoto":null,"resultCards":[],"round":null,"saveState":"unsaved","task":null,"text":"Original conversation\n\n对话删除尚未保存。请检查存储，然后重试保存。","transport":{"connectionAlive":false,"heartbeatSequence":null,"heartbeats":0,"lastHeartbeatAgeMs":null,"lastTextAgeMs":null},"viewedPhoto":21,"workerBusy":false}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    ai_companion::clear_tests::confirmation_and_failed_deletion_are_localized_and_reachable_in_small_tools
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 970 filtered out; finished in 1.07s
+
+error: test failed, to rerun pass `-p lightcraft-ui-egui --lib`

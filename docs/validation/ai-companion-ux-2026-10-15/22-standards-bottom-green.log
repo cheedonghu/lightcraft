@@ -1,0 +1,2 @@
+pending_A=false B_editor=EditorState { draft: "draft-B", scroll_offset: 0.0, follow_tail: false, reading_cursor: Some(HistoryCursor { record: 0, offset: 0 }), reading_epoch: Some(0), reading_count: Some(1) }
+pending_A=true B_editor=EditorState { draft: "draft-B", scroll_offset: 0.0, follow_tail: false, reading_cursor: Some(HistoryCursor { record: 0, offset: 0 }), reading_epoch: Some(0), reading_count: Some(1) }

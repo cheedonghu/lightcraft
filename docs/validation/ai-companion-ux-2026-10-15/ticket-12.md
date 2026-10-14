@@ -6,7 +6,7 @@ Blocked by: 06, 07
 
 **What to build:** 用户切照片或编辑工具后找回各自未发送文字和阅读位置；发送清空、失败/停止恢复请求供编辑。
 
-**Blocked by:** [06：右侧AI面板与编辑工具共用区域](06-shared-ai-sidebar.md)、[07：新会话从提交到保存、重开完整可用](07-new-conversation-persistence.md)
+**Blocked by:** [06：右侧AI面板与编辑工具共用区域](../../../../photo-companion/.scratch/ai-companion-client-ux/issues/06-shared-ai-sidebar.md)、[07：新会话从提交到保存、重开完整可用](../../../../photo-companion/.scratch/ai-companion-client-ux/issues/07-new-conversation-persistence.md)
 
 **Triage:** ready-for-agent；仅当阻塞任务全部resolved后可认领。
 
@@ -22,7 +22,7 @@ Blocked by: 06, 07
 
 ## References
 
-[客户端spec](../../photo-companion-v1/client-spec.md)、[设计定稿](../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A08、A14。
+[客户端spec](../../../../photo-companion/.scratch/photo-companion-v1/client-spec.md)、[设计定稿](../../../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A08、A14。
 
 原首版阶段对照：12、15；该对照不是阻塞依赖，不自动修改或关闭原阶段任务。
 

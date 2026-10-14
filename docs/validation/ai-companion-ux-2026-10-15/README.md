@@ -1,6 +1,6 @@
 # AI companion UX 验收记录
 
-日期：2026-10-15。第 01–21 项已逐项审查、合入并验证；第 22 项正在执行最终工作区检查和两轴审查。本记录不把进行中的检查记为通过。
+日期：2026-10-15。第 01–21 项已逐项审查、合入并验证；第 22 项全部验收与两轴审查已完成，合入后的检查和工单状态见执行任务地图。
 
 环境：macOS / Apple M1 Pro，Rust 1.99、Go 工具链，实际桌面客户端及实际 Go HTTP/SSE 服务。桌面以独立临时 Fs 图库运行，图片由脚本生成，供应商仅为本机 loopback 可控接口；没有实际凭据或用户照片。运行时配置 `{}`，保持默认 32 客户端、4 执行、40 排队。字体来自已许可的 craft-fonts。
 
@@ -34,4 +34,16 @@
 
 限制：未验证真实断电、Windows/Linux 原生运行、浏览器运行或付费模型。WASM 编译仅代表构建通过。观测的 native-cold 渲染约 10.2ms；整组编辑观测 16.3ms，最大 update 包含导入/控制/截图，可达 800ms；不能由这些样本宣称所有交互达到 16ms。失败截图与错误前提的试跑未作为成功证据归档。
 
-最终检查状态：进行中。`cargo xtask ci` 首次停止于 pipeline 的 Rust 1.99 `chunks_exact_to_as_chunks` lint；剩余检查独立执行，最终结果及既有失败逐项核对后补录。工单 22 尚未关闭。
+最终检查：`cargo xtask ci` 首次停止于原有 pipeline 的 Rust 1.99 `chunks_exact_to_as_chunks` lint；被跳过的检查均单独执行，见 `final-checks-summary.json`。没有将全工作区首轮失败写成全绿。
+
+全工作区 `cargo test --workspace --no-fail-fast` 执行一次，报告 99 个测试目标、3422 通过、18 失败、28 忽略；原始结果完整保留在 `final-workspace.log`，没有跳过失败模块。7 个新增引擎失败已逐项修正并单独通过：5 个虚拟在线文件的测试前提、原图离线有代理时依定稿只读、Unreadable 测试适配器的有界读取合同。Web 镜像适配器缺少有界读取导致的 2 个普通图库失败已修复，原 22 项通过，额外公共 Store 边界测试 1 项通过。
+
+GPU 2 个并行标记断言在未改动的 GPU 模块失败，整个 GPU 模块串行复跑 23 通过、3 忽略；保留初次失败，不将未知故障统一豁免。已独立复现的基线是 catalog 2 秒子进程启动、macOS 非 UTF8 文件名、原有高窗导出矩形；严格全工作区 lint 的 pipeline `chunks_exact` 与原始基线同一未改动行。模型安装的虚拟在线文件前提已明确，按当前桌面已有 denoise 功能配置复验 7 项全部通过，首轮 4 项不记作基线豁免。
+
+Go vet/race/build、HEIF strict/test、engine HEIC、parity、layers、assets、全工程 WASM 均完成且为 0。审查修复后的 AI 206 项、本地化 30 项、模型安装 7 项、四个受影响 crate 全目标 no-deps 严格 lint、原生重建、fmt 和 WASM 均为 0，见 `review-fix-summary.json`。历史预检和删除保存失败的实际中英切换已覆盖；系统提示存源键，显示时翻译，用户及模型文字保持原样。语言问题保留公共回归失败日志及通过结果。
+
+最终独立探针额外发现 A 图库未完成的“回到底部”导致 B 同编号照片从已存 `(0,0)` 跳到 `(0,786489)`。poll 的 generation 重置现在清除旧 bottom 请求。未改动的外部公共探针重新链接后两个对照均保留 B 草稿、follow_tail=false、cursor=(0,0)，见 `22-standards-bottom-{red,green}.log`。永久公共回归 1 项、图库 2 项、生命周期 7 项、阅读 15 项以及严格 lint/WASM/原生重建/fmt 全部通过，见 `bottom-checks-summary.json`。
+
+最终原生运行使用 `verify-ux.py --mode multi --check-locale-switch`，见 `native-delivery.json` 及对应两张截图：真实完成后中文切英文，系统提示按当前语言显示；分析屏障停止到解锁 0.4612 秒；三次真实桌面进程含强制结束后重开，保留效果与历史，最新可靠任务为 interrupted、unread=false，无活动轮次或旧授权。默认容量下排队撤权为 0.5827 秒。截图仍明确为 compositor 超时后的 CPU offscreen，不是物理屏幕认证。
+
+最终独立设计审查 0 个遗留问题，规范审查 0 个遗留违反/已确认缺陷；保留 1 个可选 P3 共享 reset 方法建议。两轴原文分别为 `22-review-spec-final.md`、`22-review-standards-final.md`。

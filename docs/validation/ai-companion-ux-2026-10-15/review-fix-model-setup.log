@@ -1,0 +1,17 @@
+   Compiling lightcraft-engine v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/engine)
+   Compiling lightcraft-gpu v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/gpu)
+   Compiling lightcraft-ui-egui v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/ui-egui)
+    Finished `test` profile [optimized + debuginfo] target(s) in 2m 48s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_ui_egui-560364b9b8c5cadd)
+
+running 7 tests
+test tests_model_setup::hostile_or_inapplicable_toggle_arguments_are_errors_without_changes ... ok
+test tests_model_setup::dismissing_the_setup_without_a_model_leaves_ai_denoise_off ... ok
+test tests_model_setup::accepting_a_local_model_installs_in_background_and_resumes_the_pending_action ... ok
+test tests_model_setup::model_installation_waits_for_an_active_slider_gesture_to_finish ... ok
+test tests_model_setup::denoise_installation_enables_only_the_requesting_photo_once_and_is_undoable ... ok
+test tests_model_setup::pending_actions_do_not_cross_libraries_or_relinked_sources ... ok
+test tests_model_setup::cancelled_denoise_requests_do_not_apply_after_installation ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 964 filtered out; finished in 0.51s
+

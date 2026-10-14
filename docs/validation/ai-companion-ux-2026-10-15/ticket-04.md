@@ -6,7 +6,7 @@ Blocked by: 03
 
 **What to build:** 用户停止或撤销同意后，未发送创建/图片请求不再交付，迟到候选不再发布，最近完整结果保留。
 
-**Blocked by:** [03：单任务提交与任务照片编辑锁](03-single-task-and-edit-lock.md)
+**Blocked by:** [03：单任务提交与任务照片编辑锁](../../../../photo-companion/.scratch/ai-companion-client-ux/issues/03-single-task-and-edit-lock.md)
 
 **Triage:** ready-for-agent；仅当阻塞任务全部resolved后可认领。
 
@@ -23,7 +23,7 @@ Blocked by: 03
 
 ## References
 
-[客户端spec](../../photo-companion-v1/client-spec.md)、[设计定稿](../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A01、A02、A04、A14。
+[客户端spec](../../../../photo-companion/.scratch/photo-companion-v1/client-spec.md)、[设计定稿](../../../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A01、A02、A04、A14。
 
 原首版阶段对照：11；该对照不是阻塞依赖，不自动修改或关闭原阶段任务。
 

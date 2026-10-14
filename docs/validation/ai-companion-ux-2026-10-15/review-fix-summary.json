@@ -1,0 +1,103 @@
+[
+  {
+    "name": "ai",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "lightcraft-ui-egui",
+      "ai_companion",
+      "--lib"
+    ],
+    "exit": 0,
+    "seconds": 435.95
+  },
+  {
+    "name": "model-setup",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "lightcraft-ui-egui",
+      "tests_model_setup",
+      "--lib",
+      "--features",
+      "lightcraft-engine/denoise"
+    ],
+    "exit": 0,
+    "seconds": 170.69
+  },
+  {
+    "name": "i18n",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "lightcraft-ui-egui",
+      "i18n::tests",
+      "--lib"
+    ],
+    "exit": 0,
+    "seconds": 2.16
+  },
+  {
+    "name": "strict",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "lightcraft-engine",
+      "-p",
+      "lightcraft-ui-egui",
+      "-p",
+      "lightcraft",
+      "-p",
+      "lightcraft-web",
+      "--all-targets",
+      "--no-deps",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit": 0,
+    "seconds": 11.37
+  },
+  {
+    "name": "build",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "lightcraft"
+    ],
+    "exit": 0,
+    "seconds": 40.66
+  },
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit": 0,
+    "seconds": 2.76
+  },
+  {
+    "name": "wasm",
+    "command": [
+      "cargo",
+      "check",
+      "-p",
+      "lightcraft-ui-egui",
+      "-p",
+      "lightcraft-web",
+      "--target",
+      "wasm32-unknown-unknown"
+    ],
+    "exit": 0,
+    "seconds": 3.73
+  }
+]

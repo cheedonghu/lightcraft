@@ -1,0 +1,141 @@
+[
+  {
+    "name": "ci",
+    "command": [
+      "cargo",
+      "xtask",
+      "ci"
+    ],
+    "exit": 1,
+    "seconds": 70.85
+  },
+  {
+    "name": "workspace",
+    "command": [
+      "cargo",
+      "test",
+      "--workspace",
+      "--no-fail-fast"
+    ],
+    "exit": 101,
+    "seconds": 929.18
+  },
+  {
+    "name": "go-vet",
+    "command": [
+      "go",
+      "vet",
+      "./..."
+    ],
+    "exit": 0,
+    "seconds": 1.16
+  },
+  {
+    "name": "go-race",
+    "command": [
+      "go",
+      "test",
+      "-race",
+      "./..."
+    ],
+    "exit": 0,
+    "seconds": 19.78
+  },
+  {
+    "name": "go-build",
+    "command": [
+      "go",
+      "build",
+      "./..."
+    ],
+    "exit": 0,
+    "seconds": 1.34
+  },
+  {
+    "name": "heif-clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "lightcraft-codecs",
+      "--features",
+      "heif",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit": 0,
+    "seconds": 32.4
+  },
+  {
+    "name": "heif-test",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "lightcraft-codecs",
+      "-p",
+      "lightcraft-heif",
+      "--features",
+      "lightcraft-codecs/heif"
+    ],
+    "exit": 0,
+    "seconds": 49.62
+  },
+  {
+    "name": "engine-heic",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "lightcraft-engine",
+      "--lib",
+      "--features",
+      "lightcraft-codecs/heif",
+      "heic"
+    ],
+    "exit": 0,
+    "seconds": 329.61
+  },
+  {
+    "name": "parity",
+    "command": [
+      "cargo",
+      "xtask",
+      "parity"
+    ],
+    "exit": 0,
+    "seconds": 312.31
+  },
+  {
+    "name": "layers",
+    "command": [
+      "cargo",
+      "xtask",
+      "layers"
+    ],
+    "exit": 0,
+    "seconds": 0.56
+  },
+  {
+    "name": "assets",
+    "command": [
+      "cargo",
+      "xtask",
+      "assets"
+    ],
+    "exit": 0,
+    "seconds": 0.41
+  },
+  {
+    "name": "wasm",
+    "command": [
+      "cargo",
+      "xtask",
+      "wasm"
+    ],
+    "exit": 0,
+    "seconds": 186.83
+  }
+]

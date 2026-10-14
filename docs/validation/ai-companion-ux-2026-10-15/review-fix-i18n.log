@@ -1,0 +1,37 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.52s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_ui_egui-e9a7f97cc3954f29)
+
+running 30 tests
+test i18n::tests::date_picker_words_are_translated ... ok
+test i18n::tests::every_language_has_a_catalog_covering_the_source ... ok
+test i18n::tests::formats_render_in_every_language ... ok
+test i18n::tests::catalogs_contain_core_workflows ... ok
+test i18n::tests::date_headings_in_every_language ... ok
+test i18n::tests::choice_values_read_as_words_in_every_language ... ok
+test i18n::tests::language_commands_cover_every_language ... ok
+test i18n::tests::locale_tags_normalize ... ok
+test i18n::tests::menu_labels_translate_but_user_names_survive ... ok
+test i18n::tests::catalogs_agree_on_placeholders_and_report_gaps ... ok
+test i18n::tests::display_label_gaps_are_reported ... ok
+test i18n::tests::interface_symbols_are_paintable ... ok
+test i18n::tests::startup_failure_message_names_the_error_and_the_log ... ok
+test i18n::tests::switching_language_translates_and_restores ... ok
+test i18n::tests::problems_read_in_every_language ... ok
+test i18n::tests::preferences_round_trip_and_old_settings_remain_readable ... ok
+test i18n::tests::traditional_chinese_switches_through_menu_and_control_and_persists ... ok
+test i18n::tests::german_switches_via_menu_and_control_persists_and_formats_dates ... ok
+test i18n::tests::ukrainian_coverage_of_catalogs_commands_controls_and_rules_is_reported ... ok
+test i18n::tests::catalog_characters_are_paintable ... ok
+test i18n::tests::craft_fonts_render_cjk_in_the_ui ... ok
+test i18n::tests::ukrainian_switches_persists_formats_dates_and_preserves_values ... ok
+test i18n::tests::translated_catalogs_do_not_use_missing_menu_triangles ... ok
+test i18n::tests::the_ui_works_without_craft_fonts ... ok
+test i18n::tests::traditional_chinese_presets_and_panel_headers_are_painted ... ok
+test i18n::tests::simplified_chinese_settings_paint_translated_model_tabs ... ok
+test i18n::tests::every_language_is_painted_and_menu_ids_stay_the_same ... ok
+test i18n::tests::ukrainian_panels_dialogs_and_letters_paint_with_bundled_fonts ... ok
+test i18n::tests::german_panels_dialogs_and_glyphs_are_painted_without_extra_fonts ... ok
+test i18n::tests::german_and_ukrainian_buttons_fit_the_bottom_bar_and_export_dialog ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 941 filtered out; finished in 1.57s
+

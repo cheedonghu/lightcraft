@@ -6,7 +6,7 @@ Blocked by: 01
 
 **What to build:** 所有入口每实例仅允许一个活动任务；点击提交即保护任务照片，其他照片可浏览和独立编辑。
 
-**Blocked by:** [01：预整理轮次身份，保持现有AI闭环可用](01-round-identity-prefactor.md)
+**Blocked by:** [01：预整理轮次身份，保持现有AI闭环可用](../../../../photo-companion/.scratch/ai-companion-client-ux/issues/01-round-identity-prefactor.md)
 
 **Triage:** ready-for-agent；仅当阻塞任务全部resolved后可认领。
 
@@ -22,7 +22,7 @@ Blocked by: 01
 
 ## References
 
-[客户端spec](../../photo-companion-v1/client-spec.md)、[设计定稿](../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A01、A03、A04。
+[客户端spec](../../../../photo-companion/.scratch/photo-companion-v1/client-spec.md)、[设计定稿](../../../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A01、A03、A04。
 
 原首版阶段对照：11；该对照不是阻塞依赖，不自动修改或关闭原阶段任务。
 

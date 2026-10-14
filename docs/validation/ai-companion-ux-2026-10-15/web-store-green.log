@@ -1,0 +1,53 @@
+    Blocking waiting for file lock on build directory
+   Compiling wgpu-types v30.0.1
+   Compiling color v0.3.3
+   Compiling peniko v0.6.1
+   Compiling wgpu-naga-bridge v30.0.1
+   Compiling wgpu-hal v30.0.1
+   Compiling vello_common v0.1.0
+   Compiling wgpu-core-deps-apple v30.0.1
+   Compiling harfrust v0.12.0
+   Compiling wgpu-core v30.0.1
+   Compiling vello_cpu v0.1.0
+   Compiling skrifa v0.44.0
+   Compiling epaint v0.36.2
+   Compiling lightcraft-codecs v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/codecs)
+   Compiling wgpu v30.0.1
+   Compiling lightcraft-gpu v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/gpu)
+   Compiling lightcraft-preview v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/preview)
+   Compiling egui v0.36.2
+   Compiling lightcraft-merge v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/merge)
+   Compiling lightcraft-ui-egui v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/ui-egui)
+   Compiling lightcraft-catalog v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/catalog)
+   Compiling lightcraft-engine v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/engine)
+   Compiling craft-ui v0.1.0 (https://github.com/storytold/craft-libs?rev=5c874d51eeb3de70e735c8ce87a59a7dedd47675#5c874d51)
+   Compiling lightcraft-web v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/apps/lightcraft-web)
+    Finished `test` profile [optimized + debuginfo] target(s) in 3m 56s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_web-8a0c3b0a8da01403)
+
+running 22 tests
+test backup::tests::size_limits_are_errors_not_panics ... ok
+test backup::tests::restore_keys_are_safe ... ok
+test store::tests::download_names ... ok
+test files::tests::appends_coalesce_and_rewrites_win ... ok
+test backup::tests::written_backups_read_back ... ok
+test backup::tests::originals_must_match_their_content_hash ... ok
+test store::tests::paths ... ok
+test files::tests::modification_order_puts_snapshot_before_log_reset ... ok
+test wire::tests::a_failed_worker_attempt_leaves_no_gap_in_the_slots ... ok
+test store::tests::miss_queues_a_load_once ... ok
+test wire::tests::clearing_index_changes_disk_namespace_and_survives_restart ... ok
+test wire::tests::thumb_index_prunes_lru ... ok
+test wire::tests::replacing_the_cache_before_the_first_request_invalidates_stored_thumbnails ... ok
+test wire::tests::a_normal_start_keeps_stored_thumbnails ... ok
+test wire::tests::clearing_previews_before_the_first_request_invalidates_stored_thumbnails ... ok
+test wire::tests::a_job_without_a_window_field_has_no_window ... ok
+test files::tests::flush_failures_show_as_unsaved_and_are_retried ... ok
+test files::tests::library_survives_reload_through_flushes ... ok
+test wire::tests::worker_reads_originals_once ... ok
+test wire::tests::wire_job_renders_like_the_engine ... ok
+test store::tests::import_and_render_from_memory ... ok
+test wire::tests::a_window_job_crosses_the_wire_and_renders_the_same_window ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+

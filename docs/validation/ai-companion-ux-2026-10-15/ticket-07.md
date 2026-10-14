@@ -6,7 +6,7 @@ Blocked by: 01, 02
 
 **What to build:** 在没有旧会话的图库中完成一轮请求，将完整消息、实际预览、轮次和执行事实保存到新格式，重开后回看。
 
-**Blocked by:** [01：预整理轮次身份，保持现有AI闭环可用](01-round-identity-prefactor.md)、[02：预整理会话存储能力，保留旧读写行为](02-bounded-storage-prefactor.md)
+**Blocked by:** [01：预整理轮次身份，保持现有AI闭环可用](../../../../photo-companion/.scratch/ai-companion-client-ux/issues/01-round-identity-prefactor.md)、[02：预整理会话存储能力，保留旧读写行为](../../../../photo-companion/.scratch/ai-companion-client-ux/issues/02-bounded-storage-prefactor.md)
 
 **Triage:** ready-for-agent；仅当阻塞任务全部resolved后可认领。
 
@@ -22,7 +22,7 @@ Blocked by: 01, 02
 
 ## References
 
-[客户端spec](../../photo-companion-v1/client-spec.md)、[设计定稿](../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A05、A14。
+[客户端spec](../../../../photo-companion/.scratch/photo-companion-v1/client-spec.md)、[设计定稿](../../../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A05、A14。
 
 原首版阶段对照：12；该对照不是阻塞依赖，不自动修改或关闭原阶段任务。
 

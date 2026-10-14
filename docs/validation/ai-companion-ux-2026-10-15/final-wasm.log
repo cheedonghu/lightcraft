@@ -1,0 +1,419 @@
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.12s
+     Running `/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/xtask wasm`
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-catalog
+   Compiling wasm-bindgen v0.2.129
+    Checking either v1.18.0
+    Checking bytemuck v1.25.2
+    Checking rayon v1.12.0
+    Checking jxl-render v0.12.4
+    Checking miniz_oxide v0.8.9
+    Checking zune-jpeg v0.5.15
+    Checking js-sys v0.3.106
+    Checking jxl-oxide v0.12.6
+    Checking lightcraft-raster v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/raster)
+    Checking lightcraft-raw v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/raw)
+    Checking lightcraft-develop v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/develop)
+    Checking log v0.4.34
+    Checking web-time v1.1.0
+    Checking lightcraft-catalog v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/catalog)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 12.80s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-codecs
+   Compiling syn v3.0.6
+   Compiling num-traits v0.2.19
+    Checking moxcms v0.8.1
+    Checking jpeg-decoder v0.3.2
+    Checking moxcms v0.9.1
+   Compiling bytemuck_derive v1.12.1
+   Compiling serde_derive v1.0.229
+    Checking bytemuck v1.25.2
+    Checking jxl-render v0.12.4
+   Compiling thiserror-impl v2.0.21
+    Checking serde v1.0.229
+    Checking lightcraft-geom v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/geom)
+    Checking lightcraft-color v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/color)
+    Checking lightcraft-raster v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/raster)
+    Checking jxl-oxide v0.12.6
+    Checking image v0.25.10
+    Checking thiserror v2.0.21
+    Checking lightcraft-codecs v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/codecs)
+warning: unused imports: `HDR_REFERENCE_WHITE_NITS`, `Samples`, and `pq_encode`
+ --> crates/codecs/src/jxl_encode.rs:6:46
+  |
+6 | use crate::encode::{EncodeImage, EncodeMeta, HDR_REFERENCE_WHITE_NITS, Samples, pq_encode};
+  |                                              ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-codecs` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-codecs` to apply 1 suggestion)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 30.46s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-color
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling syn v3.0.6
+   Compiling serde_derive v1.0.229
+    Checking serde v1.0.229
+    Checking lightcraft-geom v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/geom)
+    Checking lightcraft-color v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/color)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 20.81s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-denoise
+    Blocking waiting for file lock on build directory
+    Checking once_cell v1.21.4
+    Checking memchr v2.8.3
+    Checking wasm-bindgen v0.2.129
+    Checking serde_json v1.0.151
+    Checking js-sys v0.3.106
+    Checking web-time v1.1.0
+    Checking lightcraft-denoise-core v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/denoise-core)
+    Checking lightcraft-denoise v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/denoise)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1m 04s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-denoise-core
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.28s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-develop
+    Checking lightcraft-develop v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/develop)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1.30s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-engine
+    Checking lightcraft-raw v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/raw)
+    Checking lightcraft-codecs v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/codecs)
+warning: unused imports: `HDR_REFERENCE_WHITE_NITS`, `Samples`, and `pq_encode`
+ --> crates/codecs/src/jxl_encode.rs:6:46
+  |
+6 | use crate::encode::{EncodeImage, EncodeMeta, HDR_REFERENCE_WHITE_NITS, Samples, pq_encode};
+  |                                              ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-codecs` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-codecs` to apply 1 suggestion)
+    Checking lightcraft-scenes v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/scenes)
+    Checking smallvec v1.16.2
+   Compiling lightcraft-engine v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/engine)
+    Checking lightcraft-preview v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/preview)
+warning: constant `DROP_WAIT` is never used
+  --> crates/preview/src/pool.rs:43:7
+   |
+43 | const DROP_WAIT: Duration = Duration::from_secs(2);
+   |       ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-preview` (lib) generated 1 warning
+    Checking harfrust v0.12.0
+    Checking lightcraft-pipeline v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/pipeline)
+    Checking lightcraft-gpu v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/gpu)
+    Checking lightcraft-catalog v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/catalog)
+    Checking lightcraft-merge v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/merge)
+    Checking lightcraft-faces v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/faces)
+    Checking lightcraft-denoise-core v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/denoise-core)
+warning: variable does not need to be mutable
+  --> crates/engine/src/devices.rs:90:13
+   |
+90 |         let mut s = self.state();
+   |             ----^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-engine` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-engine` to apply 1 suggestion)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 13.81s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-faces
+   Compiling num-traits v0.2.19
+    Checking num-complex v0.4.6
+    Checking num-integer v0.1.47
+    Checking ndarray v0.17.2
+    Checking lightcraft-faces v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/faces)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 4.18s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-fetch
+    Checking lightcraft-fetch v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/fetch)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.26s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-geocode
+    Checking lightcraft-geocode v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/geocode)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.32s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-geom
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.09s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-gpu
+    Checking lightcraft-tiff v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/tiff)
+    Checking lightcraft-develop v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/develop)
+    Checking lightcraft-meta v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/meta)
+    Checking lightcraft-raw v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/raw)
+    Checking lightcraft-pipeline v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/pipeline)
+    Checking lightcraft-gpu v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/gpu)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 4.83s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-heif
+    Checking heic-rs v0.1.1
+    Checking lightcraft-heif v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/heif)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1.05s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-inpaint
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.07s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-lensdb
+    Checking lightcraft-develop v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/develop)
+    Checking lightcraft-lensdb v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/lensdb)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1.63s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-mcp
+warning: unused imports: `HDR_REFERENCE_WHITE_NITS`, `Samples`, and `pq_encode`
+ --> crates/codecs/src/jxl_encode.rs:6:46
+  |
+6 | use crate::encode::{EncodeImage, EncodeMeta, HDR_REFERENCE_WHITE_NITS, Samples, pq_encode};
+  |                                              ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-codecs` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-codecs` to apply 1 suggestion)
+warning: constant `DROP_WAIT` is never used
+  --> crates/preview/src/pool.rs:43:7
+   |
+43 | const DROP_WAIT: Duration = Duration::from_secs(2);
+   |       ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-preview` (lib) generated 1 warning
+warning: variable does not need to be mutable
+  --> crates/engine/src/devices.rs:90:13
+   |
+90 |         let mut s = self.state();
+   |             ----^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-engine` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-engine` to apply 1 suggestion)
+    Checking lightcraft-mcp v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/mcp)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.64s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-merge
+    Checking lightcraft-raw v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/raw)
+warning: unused imports: `HDR_REFERENCE_WHITE_NITS`, `Samples`, and `pq_encode`
+ --> crates/codecs/src/jxl_encode.rs:6:46
+  |
+6 | use crate::encode::{EncodeImage, EncodeMeta, HDR_REFERENCE_WHITE_NITS, Samples, pq_encode};
+  |                                              ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-codecs` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-codecs` to apply 1 suggestion)
+    Checking lightcraft-scenes v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/scenes)
+    Checking lightcraft-merge v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/merge)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 3.11s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-meta
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.09s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-pipeline
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.10s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-preview
+    Checking lightcraft-raster v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/raster)
+    Checking lightcraft-preview v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/preview)
+warning: constant `DROP_WAIT` is never used
+  --> crates/preview/src/pool.rs:43:7
+   |
+43 | const DROP_WAIT: Duration = Duration::from_secs(2);
+   |       ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-preview` (lib) generated 1 warning
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.62s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-raster
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.09s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-raw
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.09s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-scenes
+    Checking lightcraft-scenes v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/scenes)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.34s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-segment
+    Checking lightcraft-segment v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/segment)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.58s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-sysmem
+    Checking lightcraft-sysmem v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/sysmem)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.23s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-tiff
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.09s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-ui-egui
+    Checking emath v0.36.2
+warning: unused imports: `HDR_REFERENCE_WHITE_NITS`, `Samples`, and `pq_encode`
+ --> crates/codecs/src/jxl_encode.rs:6:46
+  |
+6 | use crate::encode::{EncodeImage, EncodeMeta, HDR_REFERENCE_WHITE_NITS, Samples, pq_encode};
+  |                                              ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-codecs` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-codecs` to apply 1 suggestion)
+    Checking web-sys v0.3.106
+    Checking ecolor v0.36.2
+warning: constant `DROP_WAIT` is never used
+  --> crates/preview/src/pool.rs:43:7
+   |
+43 | const DROP_WAIT: Duration = Duration::from_secs(2);
+   |       ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-preview` (lib) generated 1 warning
+    Checking lightcraft-catalog v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/catalog)
+    Checking epaint v0.36.2
+    Checking egui v0.36.2
+    Checking lightcraft-denoise-core v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/denoise-core)
+    Checking lightcraft-engine v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/engine)
+    Checking craft-ui v0.1.0 (https://github.com/storytold/craft-libs?rev=5c874d51eeb3de70e735c8ce87a59a7dedd47675#5c874d51)
+   Compiling lightcraft-ui-egui v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/ui-egui)
+warning: variable does not need to be mutable
+  --> crates/engine/src/devices.rs:90:13
+   |
+90 |         let mut s = self.state();
+   |             ----^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-engine` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-engine` to apply 1 suggestion)
+warning: unused import: `Cancel`
+  --> crates/ui-egui/src/lightroom_import.rs:11:35
+   |
+11 | use lightcraft_engine::activity::{Cancel, TaskGuard};
+   |                                   ^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variants `Inspect` and `Import` are never constructed
+  --> crates/ui-egui/src/lightroom_import.rs:18:5
+   |
+17 | enum Kind {
+   |      ---- variants in this enum
+18 |     Inspect,
+   |     ^^^^^^^
+19 |     Import,
+   |     ^^^^^^
+   |
+   = note: `Kind` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variants `Inspected`, `Prepared`, and `Finalized` are never constructed
+  --> crates/ui-egui/src/lightroom_import.rs:23:5
+   |
+22 | enum Message {
+   |      ------- variants in this enum
+23 |     Inspected(Result<Value, String>),
+   |     ^^^^^^^^^
+24 |     Prepared(Result<Box<lightcraft_engine::lightroom_job::PreparedLightroom>, String>),
+   |     ^^^^^^^^
+25 |     Finalized(Result<(), String>),
+   |     ^^^^^^^^^
+
+warning: method `cancel` is never used
+   --> crates/ui-egui/src/lightroom_import.rs:114:8
+    |
+ 48 | impl LightroomTask {
+    | ------------------ method in this implementation
+...
+114 |     fn cancel(&mut self) {
+    |        ^^^^^^
+
+warning: `lightcraft-ui-egui` (lib) generated 4 warnings (run `cargo fix --lib -p lightcraft-ui-egui` to apply 1 suggestion)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 16.44s
+$ cargo check --target wasm32-unknown-unknown -p lightcraft-web
+warning: unused imports: `HDR_REFERENCE_WHITE_NITS`, `Samples`, and `pq_encode`
+ --> crates/codecs/src/jxl_encode.rs:6:46
+  |
+6 | use crate::encode::{EncodeImage, EncodeMeta, HDR_REFERENCE_WHITE_NITS, Samples, pq_encode};
+  |                                              ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-codecs` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-codecs` to apply 1 suggestion)
+warning: constant `DROP_WAIT` is never used
+  --> crates/preview/src/pool.rs:43:7
+   |
+43 | const DROP_WAIT: Duration = Duration::from_secs(2);
+   |       ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-preview` (lib) generated 1 warning
+    Checking lightcraft-engine v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/engine)
+warning: variable does not need to be mutable
+  --> crates/engine/src/devices.rs:90:13
+   |
+90 |         let mut s = self.state();
+   |             ----^
+   |             |
+   |             help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lightcraft-engine` (lib) generated 1 warning (run `cargo fix --lib -p lightcraft-engine` to apply 1 suggestion)
+    Checking lightcraft-ui-egui v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/ui-egui)
+warning: unused import: `Cancel`
+  --> crates/ui-egui/src/lightroom_import.rs:11:35
+   |
+11 | use lightcraft_engine::activity::{Cancel, TaskGuard};
+   |                                   ^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variants `Inspect` and `Import` are never constructed
+  --> crates/ui-egui/src/lightroom_import.rs:18:5
+   |
+17 | enum Kind {
+   |      ---- variants in this enum
+18 |     Inspect,
+   |     ^^^^^^^
+19 |     Import,
+   |     ^^^^^^
+   |
+   = note: `Kind` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variants `Inspected`, `Prepared`, and `Finalized` are never constructed
+  --> crates/ui-egui/src/lightroom_import.rs:23:5
+   |
+22 | enum Message {
+   |      ------- variants in this enum
+23 |     Inspected(Result<Value, String>),
+   |     ^^^^^^^^^
+24 |     Prepared(Result<Box<lightcraft_engine::lightroom_job::PreparedLightroom>, String>),
+   |     ^^^^^^^^
+25 |     Finalized(Result<(), String>),
+   |     ^^^^^^^^^
+
+warning: method `cancel` is never used
+   --> crates/ui-egui/src/lightroom_import.rs:114:8
+    |
+ 48 | impl LightroomTask {
+    | ------------------ method in this implementation
+...
+114 |     fn cancel(&mut self) {
+    |        ^^^^^^
+
+warning: `lightcraft-ui-egui` (lib) generated 4 warnings (run `cargo fix --lib -p lightcraft-ui-egui` to apply 1 suggestion)
+    Checking lightcraft-web v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/apps/lightcraft-web)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 6.34s
+
+wasm32-unknown-unknown check:
+  ok     lightcraft-catalog
+  ok     lightcraft-codecs
+  ok     lightcraft-color
+  ok     lightcraft-denoise
+  ok     lightcraft-denoise-core
+  ok     lightcraft-develop
+  ok     lightcraft-engine
+  ok     lightcraft-faces
+  ok     lightcraft-fetch
+  ok     lightcraft-geocode
+  ok     lightcraft-geom
+  ok     lightcraft-gpu
+  ok     lightcraft-heif
+  ok     lightcraft-inpaint
+  ok     lightcraft-lensdb
+  ok     lightcraft-mcp
+  ok     lightcraft-merge
+  ok     lightcraft-meta
+  ok     lightcraft-pipeline
+  ok     lightcraft-preview
+  ok     lightcraft-raster
+  ok     lightcraft-raw
+  ok     lightcraft-scenes
+  ok     lightcraft-segment
+  ok     lightcraft-sysmem
+  ok     lightcraft-tiff
+  ok     lightcraft-ui-egui
+  ok     lightcraft-web

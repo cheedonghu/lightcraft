@@ -1,0 +1,10 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [optimized + debuginfo] target(s) in 8.31s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_ui_egui-e9a7f97cc3954f29)
+
+running 2 tests
+test ai_companion::library_tests::invalid_library_keeps_the_round_and_new_library_archives_it ... ok
+test ai_companion::library_tests::library_switch_drops_an_old_bottom_request_before_restoring_equal_photo_reading ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 970 filtered out; finished in 2.08s
+

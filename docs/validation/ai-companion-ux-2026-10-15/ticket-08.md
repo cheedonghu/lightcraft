@@ -6,7 +6,7 @@ Blocked by: 07
 
 **What to build:** 用户长期积累多照片及单照片长对话后，仍能保存新内容并按需回看，不受原全图库64MiB容器限制。
 
-**Blocked by:** [07：新会话从提交到保存、重开完整可用](07-new-conversation-persistence.md)
+**Blocked by:** [07：新会话从提交到保存、重开完整可用](../../../../photo-companion/.scratch/ai-companion-client-ux/issues/07-new-conversation-persistence.md)
 
 **Triage:** ready-for-agent；仅当阻塞任务全部resolved后可认领。
 
@@ -22,7 +22,7 @@ Blocked by: 07
 
 ## References
 
-[客户端spec](../../photo-companion-v1/client-spec.md)、[设计定稿](../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A10、A14。
+[客户端spec](../../../../photo-companion/.scratch/photo-companion-v1/client-spec.md)、[设计定稿](../../../../../../docs/ai-companion-client-ux-design.md)、[实施方案](../../../../../../docs/ai-companion-client-ux-implementation-plan.md)。验收对照：A10、A14。
 
 原首版阶段对照：12；该对照不是阻塞依赖，不自动修改或关闭原阶段任务。
 

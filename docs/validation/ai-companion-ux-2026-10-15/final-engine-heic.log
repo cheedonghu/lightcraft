@@ -1,0 +1,12 @@
+    Blocking waiting for file lock on build directory
+   Compiling lightcraft-codecs v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/codecs)
+   Compiling lightcraft-engine v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/engine)
+   Compiling lightcraft-merge v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/merge)
+    Finished `test` profile [optimized + debuginfo] target(s) in 5m 27s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_engine-60026a336f030254)
+
+running 1 test
+test tests_import::heic_imports_as_a_normal_photo_or_says_why_not ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 876 filtered out; finished in 0.70s
+

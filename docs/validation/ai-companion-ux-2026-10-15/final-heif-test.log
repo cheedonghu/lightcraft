@@ -1,0 +1,191 @@
+    Blocking waiting for file lock on package cache
+   Compiling lightcraft-geom v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/geom)
+   Compiling lightcraft-color v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/color)
+   Compiling lightcraft-raster v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/raster)
+   Compiling lightcraft-codecs v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/codecs)
+    Finished `test` profile [optimized + debuginfo] target(s) in 33.43s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_codecs-48183a2b0ba8f96d)
+
+running 51 tests
+test exif::tests::garbage_ok ... ok
+test exif::tests::orientation_roundtrip ... ok
+test gainmap::tests::garbage_never_panics ... ok
+test gainmap::tests::iso_common_denominator_and_rejections ... ok
+test gainmap::tests::compute_then_apply_recovers_the_hdr_rendition ... ok
+test gainmap::tests::iso_metadata_round_trips ... ok
+test gainmap::tests::hdrgm_xmp_round_trips_including_per_channel_sequences ... ok
+test display::tests::gamma_display_uses_its_curve ... ok
+test heif::tests::an_image_sequence_is_unsupported ... ok
+test heif::tests::can_decode_follows_the_feature ... ok
+test display::tests::p3_display ... ok
+test heif::tests::heif_is_always_recognised ... ok
+test display::tests::srgb_display_changes_nothing ... ok
+test heif::tests::a_heic_rs_panic_is_a_malformed_error ... ok
+test icc::tests::linear_profile ... ok
+test icc::tests::tags_are_aligned ... ok
+test icc::tests::cms_path_matches_matrix_path ... ok
+test display::tests::ids_identify_profiles ... ok
+test icc::tests::garbage_is_none ... ok
+test icc::tests::write_then_parse_recognises ... ok
+test jpeg::tests::find_ff_matches_a_plain_search ... ok
+test icc::tests::written_profiles_are_deterministic ... ok
+test jpeg::tests::markers_on_garbage ... ok
+test jpeg::tests::scaled_request_covers ... ok
+test jpeg_par::tests::aan_matches_reference_dct ... ok
+test jpeg_par::tests::huffman_tables_are_consistent ... ok
+test gainmap::tests::jpeg_round_trip_and_container_structure ... ok
+test jpeg::tests::unbounded_fit_box_decodes_at_full_size ... ok
+test psd::tests::flat_psd_refuses_what_it_cannot_hold ... ok
+test psd::tests::huge_rle_of_empty_rows_is_rejected_before_allocating ... ok
+test display::tests::lut_profile_goes_through_the_cms ... ok
+test psd::tests::huge_rle_with_truncated_count_table_is_rejected_before_allocating ... ok
+test psd::tests::packbits ... ok
+test jpeg_par::tests::grayscale_and_quality_monotone ... ok
+test psd::tests::packbits_overrun_is_an_error ... ok
+test psd::tests::packbits_round_trips ... ok
+test psd::tests::rle_repeat_run_past_row_width_is_an_error ... ok
+test sniff::tests::dng_detected ... ok
+test psd::tests::rle_gray16_and_extra_channels_decode ... ok
+test sniff::tests::magic_numbers ... ok
+test sniff::tests::sony_linear_ycbcr_subifd_is_raw_but_ordinary_tiff_is_not ... ok
+test space::tests::named_recognition_roundtrip ... ok
+test space::tests::trc_inverse ... ok
+test space::tests::working_matrix_identity_for_rec2020 ... ok
+test jpeg::tests::container_fallback_matches_tagged_jpeg_before_resizing_and_keeps_own_metadata ... ok
+test psd::tests::flat_psd_round_trips_8_and_16_bit ... ok
+test proof::tests::srgb_proof_flags_wide_colours_and_keeps_grey ... ok
+test proof::tests::paper_white_dims_and_tints_white ... ok
+test display::tests::rejects_bad_profiles ... ok
+test jpeg_par::tests::decodes_with_independent_decoders_at_odd_sizes ... ok
+test proof::tests::hostile_profiles_are_errors ... ok
+
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/bench.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/bench-fb7e374aec480b01)
+
+running 1 test
+test bench_24mp_jpeg ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/corpus.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/corpus-3ca36ef76d39da3b)
+
+running 4 tests
+test corpus_pngsuite ... ok
+test corpus_images_decode ... ok
+test corpus_raw_is_routed ... ok
+test system_icc_profiles ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/fuzz.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/fuzz-d6c7ca6e70d9b0db)
+
+running 5 tests
+test thumbnail_rejects_huge_gif_before_allocating_source_pixels ... ok
+test thumbnail_respects_configured_source_pixel_limit ... ok
+test webp_truncated_metadata_cannot_allocate_declared_chunk_size ... ok
+test mutated_valid_files ... ok
+test random_after_magic ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.89s
+
+     Running tests/header.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/header-3ffb87aff18ac978)
+
+running 6 tests
+test png_exif_after_idat ... ok
+test hostile_headers_are_errors ... ok
+test truncation_details ... ok
+test header_matches_decode ... ok
+test truncated_files_agree_with_decode ... ok
+test mutated_files_agree_with_decode ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.69s
+
+     Running tests/heif.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/heif-b2215e121411e24b)
+
+running 4 tests
+test nclx_colour_and_ten_bit ... ok
+test an_iphone_like_heic_decodes_upright_in_display_p3 ... ok
+test a_small_decode_uses_the_embedded_thumbnail ... ok
+test hostile_heic_is_an_error_never_a_panic ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.35s
+
+     Running tests/roundtrip.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/roundtrip-4bd142e68212235a)
+
+running 30 tests
+test jpeg_cmyk_converts ... ok
+test gif_and_bmp_decode ... ok
+test custom_matrix_icc_is_exact ... ok
+test p3_icc_to_working ... ok
+test png_8_and_16_bit_exact ... ok
+test png_metadata_and_gray_alpha ... ok
+test jpeg_roundtrip_with_metadata ... ok
+test pq_png_rejects_short_buffers_and_survives_hostile_samples ... ok
+test jxl_alpha_and_gray ... ok
+test pq_png_is_16_bit_rec2020_pq_with_cicp_and_content_light ... ok
+test raw_routing ... ok
+test print_resolution_is_written ... ok
+test jxl_lossless_exact_with_metadata ... ok
+test psd_composite ... ok
+test jxl_bad_input_is_an_error ... ok
+test avif_encode_native ... ok
+test tiff_cmyk_and_orientation ... ok
+test tiff_white_is_zero_is_inverted_once ... ok
+test unusable_icc_falls_back_to_srgb_with_flag ... ok
+test webp_lossless_exact ... ok
+test tiff_samples_narrower_than_a_byte ... ok
+test working_space_identity_for_srgb_white ... ok
+test jxl_hdr_pq ... ok
+test jpeg_gray_and_scaled_decode ... ok
+test thumbnail_accepts_smaller_preview_when_asked ... ok
+test tiff_depths_and_compressions ... ok
+test thumbnail_prefers_embedded_exif ... ok
+test jxl_lossy_wide_gamut_matches_lossless_icc ... ok
+test thumbnail_from_mpf_preview ... ok
+test jxl_lossy_quality_and_effort ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_heif-5434ccbbd701ab5f)
+
+running 24 tests
+test orient::tests::odd_crops_are_detected_through_rotations ... ok
+test orient::tests::mirrors_follow_libheif ... ok
+test orient::tests::impossible_claps_are_errors ... ok
+test orient::tests::rotations_are_counter_clockwise ... ok
+test orient::tests::clap_corners_round_like_libheif ... ok
+test tests::errors_display_their_kind ... ok
+test tests::image_sequence_is_unsupported_with_a_clear_message ... ok
+test tests::garbage_is_an_error ... ok
+test tests::a_heic_rs_panic_is_a_malformed_error ... ok
+test tests_synthetic::limits_are_checked_before_decoding ... ok
+test vui::tests::absent_fields_take_the_standard_defaults ... ok
+test vui::tests::reads_full_range_and_matrix_from_the_vui ... ok
+test ycc::tests::alpha_and_bad_planes ... ok
+test ycc::tests::bilinear_chroma_is_centred_9_3_3_1 ... ok
+test vui::tests::missing_or_truncated_sps_is_none ... ok
+test ycc::tests::chroma_is_nearest_neighbour ... ok
+test tests_synthetic::ten_bit_samples_keep_their_precision ... ok
+test tests_synthetic::colour_follows_the_matrix_and_range ... ok
+test ycc::tests::neutral_and_primaries_convert_exactly ... ok
+test tests_synthetic::alpha_comes_from_its_auxiliary_image ... ok
+test tests_synthetic::metadata_aux_images_and_thumbnails ... ok
+test tests_synthetic::a_grid_reassembles_exactly ... ok
+test tests_synthetic::container_transforms_are_applied_like_libheif ... ok
+test tests_synthetic::truncated_and_corrupted_files_are_errors_not_panics ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+   Doc-tests lightcraft_codecs
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests lightcraft_heif
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

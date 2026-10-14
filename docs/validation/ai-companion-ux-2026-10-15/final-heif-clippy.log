@@ -1,0 +1,35 @@
+    Blocking waiting for file lock on build directory
+    Checking num-traits v0.2.19
+    Checking equator v0.4.2
+    Checking num-integer v0.1.47
+    Checking zerocopy v0.8.59
+    Checking memchr v2.8.3
+    Checking num-bigint v0.4.8
+    Checking aligned-vec v0.6.4
+    Checking v_frame v0.3.9
+    Checking num-rational v0.4.2
+    Checking bytemuck v1.25.2
+    Checking no_std_io2 v0.9.4
+    Checking nom v8.0.0
+    Checking av-scenechange v0.14.1
+    Checking av1-grain v0.2.5
+    Checking profiling v1.0.18
+    Checking half v2.7.1
+    Checking bitstream-io v4.10.0
+    Checking lightcraft-geom v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/geom)
+    Checking tiff v0.11.3
+    Checking rav1e v0.8.1
+    Checking lightcraft-color v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/color)
+    Checking jxl-render v0.12.4
+    Checking moxcms v0.8.1
+    Checking ppv-lite86 v0.2.21
+    Checking ravif v0.13.0
+    Checking lightcraft-heif v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/heif)
+    Checking image v0.25.10
+    Checking rand_chacha v0.9.0
+    Checking jxl-oxide v0.12.6
+    Checking lightcraft-raster v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/raster)
+    Checking moxcms v0.9.1
+    Checking proptest v1.11.0
+    Checking lightcraft-codecs v0.7.0 (/Users/liujinju/lightcraft-project/_worktrees/ai-companion-ux-22/lightcraft/crates/codecs)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 32.29s

@@ -1,0 +1,9 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [optimized + debuginfo] target(s) in 10.83s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_engine-fe90737921c5c1b1)
+
+running 1 test
+test tests_prefs::migrated_custom_import_white_balance_returns_to_the_logical_default_look ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 876 filtered out; finished in 0.00s
+

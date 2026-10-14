@@ -1,0 +1,14 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.28s
+     Running unittests src/lib.rs (/Users/liujinju/lightcraft-project/lightcraft/target/ux-agent-22/debug/deps/lightcraft_ui_egui-e9a7f97cc3954f29)
+
+running 7 tests
+test ai_companion::lifecycle_tests::host_shutdown_fallback_cancels_ai_even_without_normal_close_preparation ... ok
+test ai_companion::lifecycle_tests::confirmed_unsaved_exit_never_authorizes_another_submission_after_transport_retirement ... ok
+test ai_companion::lifecycle_tests::leaving_library_cancels_new_creation_before_a_previous_photo_save_can_fail ... ok
+test ai_companion::lifecycle_tests::menu_quit_with_hidden_ai_cancels_and_offers_unsaved_retry ... ok
+test ai_companion::lifecycle_tests::malformed_saved_round_identity_never_invents_an_interrupted_task ... ok
+test ai_companion::lifecycle_tests::successful_library_switch_saves_jobless_drafts_and_waits_for_old_transport_retirement ... ok
+test ai_companion::lifecycle_tests::cold_saved_unfinished_round_is_reported_without_resuming_or_granting_old_permission ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 965 filtered out; finished in 5.09s
+
