@@ -91,6 +91,12 @@ impl Attachments {
         }
     }
     pub(super) fn image(&mut self, ui: &mut egui::Ui, message_id: &str, index: usize, image: &Value) {
+        self.show_image(ui, message_id, index, image, None);
+    }
+    pub(super) fn historical_image(&mut self, ui: &mut egui::Ui, message_id: &str, index: usize, image: &Value) {
+        self.show_image(ui, message_id, index, image, Some("image:aiHistoricalPreview"));
+    }
+    fn show_image(&mut self, ui: &mut egui::Ui, message_id: &str, index: usize, image: &Value, alias: Option<&str>) {
         let width = ui.available_width().clamp(32.0, 240.0);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 168.0), egui::Sense::hover());
         if !ui.is_rect_visible(rect) {
@@ -98,7 +104,7 @@ impl Attachments {
         }
         let label = format!("{message_id}:{index}");
         let bytes = serde_json::to_vec(image).unwrap_or_default();
-        let id = format!("{label}-{:032x}", lightcraft_preview::hash_bytes(&bytes).0);
+        let id = format!("{:032x}", lightcraft_preview::hash_bytes(&bytes).0);
         self.visible.insert(id.clone());
         match self.cache.get(&id) {
             Some(Preview::Ready(texture, _retention)) => {
@@ -107,6 +113,9 @@ impl Attachments {
                 let image_rect = egui::Rect::from_center_size(rect.center(), fitted);
                 ui.painter().image(texture.id(), image_rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
                 composer_widget(ui, &format!("image:aiAttachment:{label}"), image_rect);
+                if let Some(alias) = alias {
+                    composer_widget(ui, alias, image_rect);
+                }
             }
             status => {
                 ui.painter().rect_stroke(rect, 4.0, ui.visuals().widgets.noninteractive.bg_stroke, egui::StrokeKind::Inside);
@@ -176,7 +185,7 @@ impl Attachments {
         let source = if request.image["data"].is_string() {
             Some(Source::Inline)
         } else if let Some(header) = request.scope.header.as_ref() {
-            app.session.companion_reader(header).ok().flatten().map(|reader| Source::History(Box::new(reader)))
+            app.session.companion_attachment_history_reader(header).ok().flatten().map(|reader| Source::History(Box::new(reader)))
         } else {
             app.session.companion_attachment_reader(request.scope.photo).ok().flatten().map(Source::Legacy)
         };
@@ -203,7 +212,8 @@ impl Attachments {
                 let bytes = match &mut source {
                     Source::History(reader) => {
                         let prefix = format!("companion/v2/photos/{}/previews/", request.scope.photo.0);
-                        if request.image["attachment"].as_str().is_none_or(|name| !name.starts_with(&prefix)) {
+                        let legacy = format!("companion/preview-{}-", request.scope.photo.0);
+                        if request.image["attachment"].as_str().is_none_or(|name| !name.starts_with(&prefix) && !name.starts_with(&legacy)) {
                             return Err("preview belongs to another photo".into());
                         }
                         reader.preview(&request.image).map_err(|e| e.to_string())?
@@ -224,8 +234,8 @@ impl Attachments {
                 lightcraft_engine::companion::validate_history_image(request.image["mime_type"].as_str().unwrap_or_default(), &bytes)?;
                 let decoded =
                     lightcraft_codecs::decode(&bytes, lightcraft_codecs::DecodeOptions { max_size: Some((640, 640)), max_pixels: 640 * 640 })
-                        .map_err(|e| e.to_string())?
-                        .to_srgb8();
+                        .map_err(|e| e.to_string())?;
+                let decoded = decoded.to_srgb8().into_oriented(lightcraft_geom::Orientation::from_exif(decoded.orientation));
                 let image = egui::ColorImage::from_rgba_unmultiplied([decoded.width, decoded.height], &decoded.as_bytes());
                 let retention = match source {
                     Source::History(reader) => Retention { _history: Some((*reader).into_retention()), ..Default::default() },

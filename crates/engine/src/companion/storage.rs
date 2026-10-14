@@ -51,6 +51,8 @@ pub struct PhotoHeader {
     pub legacy_round_count: u64,
     #[serde(default)]
     pub legacy_record_count: u64,
+    #[serde(default)]
+    pub legacy_message_count: u64,
 }
 impl PhotoHeader {
     pub fn history_complete(&self) -> bool {
@@ -58,6 +60,9 @@ impl PhotoHeader {
     }
     pub fn legacy_plan_count(&self) -> u64 {
         self.legacy_round_count.saturating_add(self.legacy_record_count)
+    }
+    pub fn original_message_count(&self) -> u64 {
+        if self.legacy_message_count == 0 && self.legacy_migrated { self.message_count } else { self.legacy_message_count.min(self.message_count) }
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,6 +483,7 @@ pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, expected_epoch: u64, 
         legacy_history_incomplete: false,
         legacy_round_count: 0,
         legacy_record_count: 0,
+        legacy_message_count: 0,
     };
     write(writer.store, &writer.pending.head.manifest, &manifest)?;
     writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);

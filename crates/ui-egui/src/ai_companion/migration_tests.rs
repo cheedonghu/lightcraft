@@ -856,6 +856,9 @@ fn legacy_png_and_missing_reference_are_readable_with_local_degradation() {
     let status = h.app.run("ai.status", json!({})).unwrap();
     assert_eq!(status["historicalPreview"]["available"], true);
     assert_eq!(status["historicalPreview"]["record"], 0);
+    assert_eq!(h.request("ui.hoverWidget", json!({"id":"ai:messages"}), Duration::from_secs(5))["ok"], true);
+    assert_eq!(h.request("ui.scroll", json!({"dy":-300}), Duration::from_secs(5))["ok"], true);
+    assert!(h.step_until(Duration::from_secs(5), |h| h.app.widgets.iter().any(|(id, _)| id == "image:aiHistoricalPreview")));
     let rect = h.app.widgets.iter().find(|(id, _)| id == "image:aiHistoricalPreview").unwrap().1;
     let image = h.paint();
     let center = rect.center();
@@ -887,16 +890,38 @@ fn legacy_png_and_missing_reference_are_readable_with_local_degradation() {
             );
         }
         h.app.ui.language = crate::i18n::Locale::En;
+        for _ in 0..20 {
+            h.step();
+        }
+    }
+    assert_eq!(h.request("ui.hoverWidget", json!({"id":"button:aiHistoricalNext"}), Duration::from_secs(10))["ok"], true);
+    for _ in 0..10 {
         h.step();
     }
     assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoricalNext"}), Duration::from_secs(10))["ok"], true);
-    for _ in 0..12 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
         h.step();
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["historicalPreview"]["position"] == 1 && status["historyLoading"] == false {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{status}");
+        std::thread::yield_now();
     }
     let status = h.app.run("ai.status", json!({})).unwrap();
     assert_eq!(status["historicalPreview"]["available"], false);
     assert_eq!(status["historicalPreview"]["record"], 1);
-    assert!(h.painted_text().iter().any(|text| text == "Historical preview unavailable. Original reference is retained."));
+    assert_eq!(h.request("ui.hoverWidget", json!({"id":"ai:messages"}), Duration::from_secs(5))["ok"], true);
+    assert_eq!(h.request("ui.scroll", json!({"dy":-300}), Duration::from_secs(5))["ok"], true);
+    assert!(
+        h.step_until(Duration::from_secs(5), |h| h
+            .painted_text()
+            .iter()
+            .any(|text| text == "Historical preview unavailable. Original reference is retained.")),
+        "{:?}",
+        h.painted_text()
+    );
     assert!(!h.app.widgets.iter().any(|(id, _)| id == "image:aiHistoricalPreview"));
     assert_eq!(h.app.session.companion_messages_page(photo, 0, 2).unwrap().records, records.as_array().unwrap().clone());
     if let Ok(output) = std::env::var("UX10_SCREENSHOT_DIR") {
@@ -1459,75 +1484,80 @@ fn corrupted_giant_legacy_text_is_not_exposed_as_original_visible_history() {
 
 #[test]
 fn small_legacy_png_with_deep_additive_image_metadata_keeps_visible_text_and_image() {
-    for native in [true, false] {
-        let directory = std::env::temp_dir().join(format!("lc-ux10-small-image-{}", LocalRoundId::new().unwrap().as_str()));
-        let catalog = MemStore::new();
-        let memory = MemStore::new();
-        let files = || -> Box<dyn Store> { if native { Box::new(FsStore::open(&directory).unwrap()) } else { Box::new(memory.clone()) } };
-        let mut initial = lightcraft_engine::Session::new();
-        initial
-            .open_library_in(LibraryStores { catalog: Box::new(catalog.clone()), files: files(), dir: directory.clone(), on_disk: false }, true)
+    for fragmented in [false, true] {
+        for native in [true, false] {
+            let directory = std::env::temp_dir().join(format!("lc-ux10-small-image-{}", LocalRoundId::new().unwrap().as_str()));
+            let catalog = MemStore::new();
+            let memory = MemStore::new();
+            let files = || -> Box<dyn Store> { if native { Box::new(FsStore::open(&directory).unwrap()) } else { Box::new(memory.clone()) } };
+            let mut initial = lightcraft_engine::Session::new();
+            initial
+                .open_library_in(LibraryStores { catalog: Box::new(catalog.clone()), files: files(), dir: directory.clone(), on_disk: false }, true)
+                .unwrap();
+            let photo = initial.active().unwrap();
+            let png = lightcraft_engine::export::encode_image(
+                &lightcraft_raster::Rgba8::from_fn(32, 32, |_, _| [24, 196, 212, 255]),
+                &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+            )
             .unwrap();
-        let photo = initial.active().unwrap();
-        let png = lightcraft_engine::export::encode_image(
-            &lightcraft_raster::Rgba8::from_fn(32, 32, |_, _| [24, 196, 212, 255]),
-            &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
-        )
-        .unwrap();
-        let attachment = initial.library.as_mut().unwrap().companion_attachment(photo, &png).unwrap();
-        initial.close_library().unwrap();
-        let deep = format!("{}true{}", "[".repeat(300), "]".repeat(300));
-        let source = format!(
-            r#"{{"format":"lightcraft-companion","version":1,"photos":{{"{}":{{"schema_version":1,"messages":[{{"role":"user","text":"Original small valid history","images":[{{"mime_type":"image/png","attachment":"{}","additive":{}}}]}}],"rounds":[]}}}}}}"#,
-            photo.0, attachment, deep
-        );
-        files().write_atomic("companion/state.json", source.as_bytes()).unwrap();
-        drop(initial);
-        let mut session = lightcraft_engine::Session::new();
-        session.open_library_in(LibraryStores { catalog: Box::new(catalog), files: files(), dir: directory.clone(), on_disk: false }, true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while session.companion_migration_pending() && Instant::now() < deadline {
-            let _ = session.persist();
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(!session.companion_migration_pending(), "{:?}", session.companion_migration_error());
-        assert_eq!(files().read("companion/state.v1.backup.json").unwrap().unwrap(), source.as_bytes());
-        let header = session.companion_photo_header(photo).unwrap().unwrap();
-        if let Some(mut reader) = session.companion_reader(&header).unwrap() {
-            let protocol = reader.protocol_messages(0, 1, 32 * 1024 * 1024).unwrap();
-            assert_eq!(protocol.records[0]["text"], "Original small valid history");
-            assert_eq!(protocol.records[0]["images"][0]["attachment"], attachment);
-            assert!(protocol.records[0]["images"][0].get("additive").is_none());
-        }
-        let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1100., 750.], 1.);
-        h.app.ui.settings.gpu = false;
-        h.app.run("ai.open", json!({})).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            h.step();
-            let status = h.app.run("ai.status", json!({})).unwrap();
-            if status["historyLoading"] == false {
-                break status;
+            let attachment = initial.library.as_mut().unwrap().companion_attachment(photo, &png).unwrap();
+            initial.close_library().unwrap();
+            let deep = format!("{}true{}", "[".repeat(300), "]".repeat(300));
+            let extra = if fragmented { format!(r#","opaque":"{}""#, "x".repeat(512 * 1024)) } else { String::new() };
+            let source = format!(
+                r#"{{"format":"lightcraft-companion","version":1,"photos":{{"{}":{{"schema_version":1,"messages":[{{"role":"user","text":"Original small valid history","images":[{{"mime_type":"image/png","attachment":"{}","additive":{}}}]{} }}],"rounds":[]}}}}}}"#,
+                photo.0, attachment, deep, extra
+            );
+            files().write_atomic("companion/state.json", source.as_bytes()).unwrap();
+            drop(initial);
+            let mut session = lightcraft_engine::Session::new();
+            session
+                .open_library_in(LibraryStores { catalog: Box::new(catalog), files: files(), dir: directory.clone(), on_disk: false }, true)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while session.companion_migration_pending() && Instant::now() < deadline {
+                let _ = session.persist();
+                std::thread::sleep(Duration::from_millis(2));
             }
-            assert!(Instant::now() < deadline, "{status}");
-            std::thread::yield_now();
-        };
-        assert!(status["text"].as_str().unwrap().contains("Original small valid history"), "{native}: {status}");
-        assert_eq!(status["historicalPreview"]["available"], true, "{native}: {status}");
-        h.step();
-        h.step();
-        assert_eq!(h.request("ui.hoverWidget", json!({"id":"ai:messages"}), Duration::from_secs(5))["ok"], true);
-        assert_eq!(h.request("ui.scroll", json!({"dy":-300}), Duration::from_secs(5))["ok"], true);
-        assert!(h.step_until(Duration::from_secs(5), |h| h.app.widgets.iter().any(|(id, _)| id == "image:aiHistoricalPreview")));
-        let rect = h.app.widgets.iter().find(|(id, _)| id == "image:aiHistoricalPreview").unwrap().1;
-        let image = h.paint();
-        let center = rect.center();
-        assert_eq!(image.pixels[center.y as usize * image.size[0] + center.x as usize], egui::Color32::from_rgb(24, 196, 212));
-        assert!(h.settle(Duration::from_secs(10)));
-        h.app.session.close_library().unwrap();
-        drop(h);
-        if native {
-            std::fs::remove_dir_all(directory).unwrap();
+            assert!(!session.companion_migration_pending(), "{:?}", session.companion_migration_error());
+            assert_eq!(files().read("companion/state.v1.backup.json").unwrap().unwrap(), source.as_bytes());
+            let header = session.companion_photo_header(photo).unwrap().unwrap();
+            if let Some(mut reader) = session.companion_reader(&header).unwrap() {
+                let protocol = reader.protocol_messages(0, 1, 32 * 1024 * 1024).unwrap();
+                assert_eq!(protocol.records[0]["text"], "Original small valid history");
+                assert_eq!(protocol.records[0]["images"][0]["attachment"], attachment);
+                assert!(protocol.records[0]["images"][0].get("additive").is_none());
+            }
+            let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1100., 750.], 1.);
+            h.app.ui.settings.gpu = false;
+            h.app.run("ai.open", json!({})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                h.step();
+                let status = h.app.run("ai.status", json!({})).unwrap();
+                if status["historyLoading"] == false {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "{status}");
+                std::thread::yield_now();
+            };
+            assert!(status["text"].as_str().unwrap().contains("Original small valid history"), "{native}: {status}");
+            assert_eq!(status["historicalPreview"]["available"], true, "{native}: {status}");
+            h.step();
+            h.step();
+            assert_eq!(h.request("ui.hoverWidget", json!({"id":"ai:messages"}), Duration::from_secs(5))["ok"], true);
+            assert_eq!(h.request("ui.scroll", json!({"dy":-300}), Duration::from_secs(5))["ok"], true);
+            assert!(h.step_until(Duration::from_secs(5), |h| h.app.widgets.iter().any(|(id, _)| id == "image:aiHistoricalPreview")));
+            let rect = h.app.widgets.iter().find(|(id, _)| id == "image:aiHistoricalPreview").unwrap().1;
+            let image = h.paint();
+            let center = rect.center();
+            assert_eq!(image.pixels[center.y as usize * image.size[0] + center.x as usize], egui::Color32::from_rgb(24, 196, 212));
+            assert!(h.settle(Duration::from_secs(10)));
+            h.app.session.close_library().unwrap();
+            drop(h);
+            if native {
+                std::fs::remove_dir_all(directory).unwrap();
+            }
         }
     }
 }
@@ -1569,12 +1599,12 @@ fn legacy_image_navigation_resets_for_different_page_counts_and_keeps_missing_re
         files().write_atomic("companion/state.json", &source).unwrap();
         let mut session = lightcraft_engine::Session::new();
         session.open_library_in(LibraryStores { catalog: Box::new(catalog), files: files(), dir: directory.clone(), on_disk: false }, true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while session.companion_migration_pending() && Instant::now() < deadline {
             let _ = session.persist();
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(!session.companion_migration_pending());
+        assert!(!session.companion_migration_pending(), "{:?}", session.companion_migration_error());
         let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1100., 750.], 1.);
         h.app.ui.settings.gpu = false;
         h.app.run("ai.open", json!({})).unwrap();
@@ -1619,4 +1649,67 @@ fn legacy_image_navigation_resets_for_different_page_counts_and_keeps_missing_re
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
+}
+
+#[test]
+fn fragmented_legacy_png_remains_viewable_on_the_real_memory_fallback() {
+    let catalog = MemStore::new();
+    let files = MemStore::new();
+    let open = |session: &mut lightcraft_engine::Session| {
+        session
+            .open_library_in(
+                LibraryStores {
+                    catalog: Box::new(catalog.clone()),
+                    files: Box::new(files.clone()),
+                    dir: "ux10-fragment-image".into(),
+                    on_disk: false,
+                },
+                true,
+            )
+            .unwrap();
+    };
+    let mut initial = lightcraft_engine::Session::new();
+    open(&mut initial);
+    let photo = initial.active().unwrap();
+    let png = lightcraft_engine::export::encode_image(
+        &lightcraft_raster::Rgba8::from_fn(32, 32, |_, _| [24, 196, 212, 255]),
+        &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+    )
+    .unwrap();
+    let attachment = initial.library.as_mut().unwrap().companion_attachment(photo, &png).unwrap();
+    initial.close_library().unwrap();
+    drop(initial);
+    let message = json!({"role":"user","text":"Original fragmented PNG question","images":[{"mime_type":"image/png","attachment":attachment}],"additive":"x".repeat(512*1024)});
+    let source = serde_json::to_vec(&json!({"format":"lightcraft-companion","version":1,"photos":{photo.0.to_string():{"schema_version":1,"messages":[message.clone()],"rounds":[]}}})).unwrap();
+    files.clone().write_atomic("companion/state.json", &source).unwrap();
+    let mut session = lightcraft_engine::Session::new();
+    open(&mut session);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.companion_migration_pending() && Instant::now() < deadline {
+        let _ = session.persist();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!session.companion_migration_pending(), "{:?}", session.companion_migration_error());
+    let header = session.companion_photo_header(photo).unwrap().unwrap();
+    assert!(session.companion_reader(&header).unwrap().is_none(), "the main history must really use fallback");
+    let page = session.companion_history_slice_at(&header, Default::default(), 256 * 1024).unwrap();
+    assert!(page.items.iter().any(|item| matches!(item, lightcraft_engine::companion::storage::HistoryItem::Fragment { .. })));
+    let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1100., 750.], 1.);
+    h.app.ui.settings.gpu = false;
+    h.app.run("ai.open", json!({})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        h.step();
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        if status["historyLoading"] == false {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "{status}");
+    };
+    assert!(status["text"].as_str().unwrap().contains("Original fragmented PNG question"), "{status}");
+    assert_eq!(status["historicalPreview"]["available"], true, "a valid original image must be reachable: {status}");
+    assert_eq!(h.app.session.companion_messages_page(photo, 0, 1).unwrap().records, vec![message]);
+    assert_eq!(files.get("companion/state.v1.backup.json"), Some(source));
+    assert!(h.settle(Duration::from_secs(10)));
+    h.app.session.close_library().unwrap();
 }

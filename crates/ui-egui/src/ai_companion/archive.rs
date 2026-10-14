@@ -230,10 +230,6 @@ impl State {
             })
             .collect();
         let total = if prefix.record_count > 0 { prefix.record_count } else { prefix.round_count };
-        let position = self.conversations.get(&photo).map(|c| c.preview_cursor).unwrap_or(0);
-        let preview =
-            historical::read(&page, position, |image| app.session.read_companion_historical_preview(photo, image).map_err(|e| e.to_string()));
-        let preview_bytes = preview.as_ref().map_or(0, historical::Preview::bytes);
         let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
         conversation.view = Some(HistoryView {
             captured_header: prefix.clone(),
@@ -254,13 +250,11 @@ impl State {
                     lightcraft_engine::companion::storage::DisplayRecord::LegacyPlan(conversation.legacy_cursor),
                 )
             }),
-            preview,
-            cards_bytes: preview_bytes.saturating_add(
-                presentation
-                    .values()
-                    .map(|v| lightcraft_engine::companion::storage::record_size(v).unwrap_or(usize::MAX))
-                    .fold(0usize, usize::saturating_add),
-            ),
+            preview: None,
+            cards_bytes: presentation
+                .values()
+                .map(|v| lightcraft_engine::companion::storage::record_size(v).unwrap_or(usize::MAX))
+                .fold(0usize, usize::saturating_add),
             card_cursor: (!owners.is_empty() || (total > 0 && !wanted.is_empty())).then_some(0),
             card_pending: wanted,
             card_owners: owners,

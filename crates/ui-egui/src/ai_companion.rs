@@ -1839,6 +1839,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 .ok_or_else(|| tr("Historical preview is unavailable.").to_owned())?;
             conversation.preview_cursor = index;
             let cursor = conversation.view.as_ref().map(|v| v.cursor).unwrap_or_default();
+            state.attachments.cancel();
             state.request_page(app, photo, cursor)?;
             Ok(json!({"requested":true}))
         }),
@@ -2191,8 +2192,8 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
         if let Some(conversation) = app.ai.conversations.get_mut(&photo) {
             app.ai.attachments.sync(app.session.library_generation(), photo, conversation);
             reading::show(ui, conversation, &mut app.ai.attachments);
-            if let Some(preview) = conversation.view.as_mut().and_then(|v| v.preview.as_mut()) {
-                preview_navigation = historical::show(ui, preview);
+            if let Some(preview) = conversation.view.as_ref().and_then(|v| v.preview.as_ref()) {
+                preview_navigation = historical::show(ui, preview, &mut app.ai.attachments);
             }
             if let Some(header) = conversation.prefix.as_ref().filter(|h| h.legacy_plan_count() > 0) {
                 let total = header.legacy_plan_count();

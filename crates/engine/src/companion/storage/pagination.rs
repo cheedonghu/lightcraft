@@ -166,6 +166,8 @@ fn slice(store: &mut dyn Store, h: &PhotoHeader, mut cursor: HistoryCursor, byte
             bytes.truncate(end);
         }
         if old_string_end && quote == Some(0) {
+            result.items.push(HistoryItem::Fragment { record: cursor.record, offset: cursor.offset, index: result.fragments.len() });
+            result.fragments.push(String::new());
             cursor.record += 1;
             cursor.offset = 0;
             continue;
@@ -389,6 +391,7 @@ pub(super) fn tail(
         legacy_history_incomplete: prefix.is_some_and(|h| !h.history_complete()),
         legacy_round_count: prefix.map_or(0, |h| h.legacy_round_count),
         legacy_record_count: prefix.map_or(0, |h| h.legacy_record_count),
+        legacy_message_count: prefix.map_or(0, PhotoHeader::original_message_count),
     };
     write(writer.store, &writer.pending.head.manifest, &manifest)?;
     writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);

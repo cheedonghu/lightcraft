@@ -18,10 +18,16 @@ struct ReadMessage {
     header: lightcraft_engine::companion::storage::PhotoHeader,
     transaction: String,
     cursor: HistoryCursor,
-    result: Result<
-        (HistorySlice, Vec<card::Card>, Option<String>, Option<String>, Option<Value>, Option<historical::Preview>, BTreeMap<u64, Value>),
-        String,
-    >,
+    result: ReadContent,
+}
+enum ReadContent {
+    Page(
+        Result<
+            (Box<HistorySlice>, Vec<card::Card>, Option<String>, Option<String>, Option<Value>, Option<historical::Preview>, BTreeMap<u64, Value>),
+            String,
+        >,
+    ),
+    Preview(Option<historical::Preview>),
 }
 pub(super) struct Paging {
     tx: mpsc::SyncSender<ReadMessage>,
@@ -83,7 +89,7 @@ impl State {
             }
             self.paging.completed = message.request;
             match message.result {
-                Ok((page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages)) => {
+                ReadContent::Page(Ok((page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages))) => {
                     if let Some(notice) = notice {
                         conversation.notice = notice;
                     }
@@ -118,7 +124,17 @@ impl State {
                     });
                     self.accept_page(app, message.scope.photo, message.cursor);
                 }
-                Err(error) => {
+                ReadContent::Preview(preview) => {
+                    if let Some(view) = conversation.view.as_mut()
+                        && view.captured_header == message.header
+                        && view.cursor == message.cursor
+                    {
+                        view.cards_bytes = view.cards_bytes.saturating_sub(view.preview.as_ref().map_or(0, historical::Preview::bytes));
+                        view.cards_bytes = view.cards_bytes.saturating_add(preview.as_ref().map_or(0, historical::Preview::bytes));
+                        view.preview = preview;
+                    }
+                }
+                ReadContent::Page(Err(error)) => {
                     conversation.notice = error;
                     conversation.view = Some(HistoryView {
                         captured_header: message.header,
@@ -394,7 +410,11 @@ impl State {
                         } else {
                             None
                         };
-                        let preview = historical::read_native(&mut reader, &page, request.preview_cursor);
+                        let preview = if request.header.original_message_count() > 0 {
+                            historical::read_native(&mut reader, &page, request.preview_cursor)
+                        } else {
+                            None
+                        };
                         (page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages)
                     });
                     if !cancel.load(Ordering::Relaxed) {
@@ -405,15 +425,55 @@ impl State {
                             header: request.header.clone(),
                             transaction: request.header.transaction_id,
                             cursor: request.cursor,
-                            result,
+                            result: ReadContent::Page(result.map(|(page, cards, notice, diagnostic, legacy_plan, preview, presentation)| {
+                                (Box::new(page), cards, notice, diagnostic, legacy_plan, preview, presentation)
+                            })),
                         });
                     }
                 })
                 .map_err(|e| e.to_string())?;
         } else {
-            let result = self.read_page(app, request.scope.photo, request.cursor);
-            self.paging.completed = request.id;
-            result?;
+            self.read_page(app, request.scope.photo, request.cursor)?;
+            let page = self.conversations.get(&request.scope.photo).and_then(|c| c.view.as_ref()).map(|view| HistorySlice {
+                items: view.items.clone(),
+                records: view.messages.clone(),
+                fragments: view.fragments.clone(),
+                next: view.next,
+                bytes: view.bytes,
+            });
+            if let Some(page) =
+                page.filter(|page| request.header.original_message_count() > 0 && (!page.records.is_empty() || !page.fragments.is_empty()))
+                && let Some(mut reader) = app.session.companion_attachment_history_reader(&request.header).map_err(|e| e.to_string())?
+            {
+                let tx = self.paging.tx.clone();
+                self.paging.cancel = Arc::new(AtomicBool::new(false));
+                let cancel = self.paging.cancel.clone();
+                self.paging.alive.store(true, Ordering::Relaxed);
+                let guard = WorkerAlive(self.paging.alive.clone());
+                std::thread::Builder::new()
+                    .name("companion-history-preview".into())
+                    .spawn(move || {
+                        let _guard = guard;
+                        if cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let preview = historical::read_native(&mut reader, &page, request.preview_cursor);
+                        if !cancel.load(Ordering::Relaxed) {
+                            let _ = tx.try_send(ReadMessage {
+                                retention: reader.into_retention(),
+                                request: request.id,
+                                scope: request.scope,
+                                header: request.header.clone(),
+                                transaction: request.header.transaction_id,
+                                cursor: request.cursor,
+                                result: ReadContent::Preview(preview),
+                            });
+                        }
+                    })
+                    .map_err(|e| e.to_string())?;
+            } else {
+                self.paging.completed = request.id;
+            }
         }
         Ok(())
     }

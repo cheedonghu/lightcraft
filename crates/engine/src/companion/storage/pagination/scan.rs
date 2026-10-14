@@ -120,6 +120,7 @@ struct ValueScan {
     bytes: Vec<u8>,
     started: bool,
     ignored_depth: u64,
+    raw_images: bool,
 }
 impl ValueScan {
     // 0: continue, 1: complete and consumed, 2: complete before delimiter.
@@ -163,7 +164,7 @@ impl ValueScan {
                     if !capture {
                         self.ignored_depth = self.ignored_depth.checked_add(1).ok_or_else(|| error("display nesting overflow"))?;
                     } else {
-                        if self.depth.len() >= 128 {
+                        if self.depth.len() >= 128 && !self.raw_images {
                             return Err(error("display nesting exceeds bound"));
                         }
                         self.depth.push(byte);
@@ -200,7 +201,14 @@ impl Fields {
     fn save(&mut self) -> Result<()> {
         if self.capture {
             self.retained += self.value.bytes.len();
-            let value = serde_json::from_slice(&self.value.bytes).map_err(error)?;
+            let value = if self.value.raw_images {
+                let mut shell = b"{\"images\":".to_vec();
+                shell.extend_from_slice(&self.value.bytes);
+                shell.push(b'}');
+                migration::display_images(&shell)?.unwrap_or(Value::Null)
+            } else {
+                serde_json::from_slice(&self.value.bytes).map_err(error)?
+            };
             if self.in_stage {
                 self.stage.insert(self.name.clone(), value);
             } else {
@@ -318,7 +326,9 @@ impl Fields {
                                     || (!self.display && self.name == "images")
                             };
                         }
-                        self.legacy = matches!(self.name.as_str(), "before_state" | "proposed_state" | "applied_state" | "recent_complete_result");
+                        self.value.raw_images = !self.in_stage && self.name == "images";
+                        self.legacy = matches!(self.name.as_str(), "before_state" | "proposed_state" | "applied_state" | "recent_complete_result")
+                            || self.value.raw_images;
                         // Compatibility settings can contain arbitrary old mask geometry.
                         // Retain a small complete setting only; otherwise keep scanning
                         // without a buffer and use the execution-time display fields.

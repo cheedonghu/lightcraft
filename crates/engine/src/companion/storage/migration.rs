@@ -243,6 +243,7 @@ pub(crate) fn stage(store: &mut dyn Store, photo: PhotoId, source: &mut dyn Sour
         legacy_history_incomplete: history_incomplete || !supported_schema || !messages_valid,
         legacy_round_count: round_count,
         legacy_record_count: record_count,
+        legacy_message_count: message_count,
     };
     write(writer.store, &writer.pending.head.manifest, &manifest)?;
     writer.pending.head.manifest_digest = digest(&serde_json::to_vec(&manifest).map_err(error)?);
