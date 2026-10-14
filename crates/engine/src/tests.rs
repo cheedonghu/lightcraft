@@ -35,6 +35,8 @@ fn changing_one_wb_control_resolves_as_shot_without_stale_tint() {
     use lightcraft_develop::{DevelopSettings, WbMode};
     for format in ["ARW", "NEF", "NRW", "RAF", "CR2", "PEF", "ORF"] {
         let mut s = demo();
+        // These virtual originals exercise WB metadata, not missing-file policy.
+        s.media.availability.set_probe(std::sync::Arc::new(|_| true));
         let id = PhotoId(100);
         let name = format!("synthetic.{format}");
         let mut p = Photo::new(id, Source::File { path: name.clone() }, &name, format, 16, 16, "");
@@ -64,6 +66,8 @@ fn reset_edits_restores_a_raws_import_defaults() {
     use lightcraft_catalog::{Photo, PhotoId, Source};
     use lightcraft_develop::DevelopSettings;
     let mut s = demo();
+    // The catalog-only RAW/JPEG fixtures represent available originals.
+    s.media.availability.set_probe(std::sync::Arc::new(|_| true));
     for (id, format, raw) in [(200u64, "NEF", true), (201, "JPG", false)] {
         let name = format!("p{id}.{format}");
         let mut p = Photo::new(PhotoId(id), Source::File { path: name.clone() }, &name, format, 16, 16, "");
