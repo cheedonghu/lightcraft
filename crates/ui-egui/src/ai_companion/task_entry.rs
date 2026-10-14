@@ -38,6 +38,7 @@ pub(super) fn navigate(state: &mut State, app: &mut LightcraftApp) -> Result<Val
     } else {
         state.sync_editor(app)?;
     }
+    state.leave_task_view();
     let unavailable = app.session.catalog.photo(scope.photo).is_none_or(|p| {
         p.deleted
             || match &p.source {

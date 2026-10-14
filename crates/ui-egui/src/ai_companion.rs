@@ -99,6 +99,7 @@ pub struct State {
     retiring_connection: Option<Arc<AtomicBool>>,
     retiring_migrations: BTreeMap<u64, lightcraft_engine::companion::MigrationRetirement>,
     comparison: Option<comparison::Comparison>,
+    comparison_workers: Vec<Arc<AtomicBool>>,
     #[cfg(test)]
     next_connection: Option<network::Connection>,
     pending_confirmations: Vec<(RoundIdentity, Option<String>)>,
@@ -142,6 +143,7 @@ impl Default for State {
             retiring_connection: None,
             retiring_migrations: BTreeMap::new(),
             comparison: None,
+            comparison_workers: Vec::new(),
             #[cfg(test)]
             next_connection: None,
             pending_confirmations: Vec::new(),
@@ -307,6 +309,7 @@ impl Drop for WorkerAlive {
 
 impl State {
     fn leave_task_view(&mut self) {
+        self.comparison = None;
         if self.readonly_task.take().is_some() {
             self.paging.cancel();
         }
@@ -1956,6 +1959,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 "viewedPhoto": viewed_photo.map(|p| p.0),
                 "task": state.task.as_ref().map(task_entry::Task::status),
                 "comparison": state.comparison.as_ref().map(comparison::Comparison::status),
+                "comparisonWorkerBusy": state.comparison_workers.iter().any(|alive| alive.load(Ordering::Relaxed)),
                 "health": state.health.status(),
                 "transport": state.telemetry.status(state.connection.as_ref().is_some_and(|c| c.alive.load(Ordering::Relaxed) && !c.is_closing())),
                 "busy": photo.is_some_and(|p| state.jobs.contains_key(&p)),
@@ -2186,6 +2190,9 @@ fn clear(state: &mut State, app: &mut LightcraftApp, photo: PhotoId, params: &Va
     if state.task.as_ref().is_some_and(|task| task.identity.scope == scope) {
         state.task = None;
     }
+    if state.comparison.as_ref().is_some_and(|view| view.belongs_to(scope)) {
+        state.comparison = None;
+    }
     if state.readonly_task == Some(scope) {
         state.leave_task_view();
     }
@@ -2243,11 +2250,11 @@ fn append_visible_message(text: &mut String, message: &Value) {
 
 pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     app.ai.open = true;
-    if let Some(task) =
-        app.ai.task.as_mut().filter(|t| {
-            t.identity.scope.library_generation == app.session.library_generation() && Some(t.identity.scope.photo) == app.session.active()
-        })
-    {
+    if let Some(task) = app.ai.task.as_mut().filter(|t| {
+        app.ai.comparison.is_none()
+            && t.identity.scope.library_generation == app.session.library_generation()
+            && Some(t.identity.scope.photo) == app.session.active()
+    }) {
         task.unread = false;
     }
     app.ai.health.first_open(network::service_address(app.services.companion_address.as_deref()));
@@ -2273,6 +2280,14 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             });
         });
         ui.separator();
+        if app.ai.comparison.is_some() {
+            ui.label(tr("Historical preview"));
+            ui.label(tr("Return to the selected photo before starting a new AI task."));
+            // The conversation keeps its original viewport and reading state.
+            // Resizing it to the smaller historical footer would clamp an
+            // intentional upward-reading offset before the user returns.
+            return;
+        }
         if let Some(scope) = app.ai.readonly_task.filter(|scope| scope.library_generation == app.session.library_generation()) {
             if ui.available_height() < 200.0 {
                 let height = ui.available_height().max(0.0);
@@ -2452,6 +2467,7 @@ fn storage_recovery(app: &LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) -> b
 }
 fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, height: f32) {
     let mut locate = false;
+    let mut compare = None;
     let mut revert = None;
     let mut legacy_navigation = None;
     let mut preview_navigation = None;
@@ -2515,6 +2531,7 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
             for card in cards {
                 let card = present_card(app, &app.ai, photo, card);
                 match card::show(ui, &card, app.ai.readonly_task.is_none() && app.session.active() == Some(photo)) {
+                    Some(card::Action::Compare) => compare = Some(card.local_round_id),
                     Some(card::Action::History) => locate = true,
                     Some(card::Action::Undo) => revert = Some(card.local_round_id),
                     None => {}
@@ -2555,6 +2572,11 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
     }
     if locate {
         let _ = app.run("panel.activity", json!({}));
+    }
+    if let Some(round) = compare
+        && let Err(error) = app.run("ai.compare", json!({"local_round_id":round}))
+    {
+        app.ai.conversations.entry(photo).or_default().notice = error;
     }
     if let Some(round) = revert
         && let Err(error) = app.run("ai.undo", json!({"photo":photo.0,"local_round_id":round}))

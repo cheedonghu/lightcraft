@@ -52,8 +52,10 @@ filmstrip is visible.
 
 ## Methods
 
+`ai.compare {local_round_id}` / `button:aiCompare:<localRoundId>` opens the displayed photo's exact recorded before/after JPEG pair. Both full compositions fit independently, including fullscreen; this navigation never changes current settings or ordinary Before/After. Successful corrections supply After; failed corrections retain the initial complete result. Exact completed request/execution message identities determine each side; missing, corrupt or ambiguous attachments show a local unavailable placeholder. Native reads use one owned asynchronous producer, including readers retiring after cancellation; other supported adapters use bounded display scans. `ai.status.comparison` reports captured photo/generation/round, loading and side availability/dimensions; `comparisonWorkerBusy` reports actual native producer lifetime. All submission paths refuse historical mode. `button:aiReturnCurrent` / `ai.returnCurrent` restores the current photo's draft/reading position without restoring old effects. Explicit photo/task navigation leaves the viewer. Missing/deleted originals still permit intact historical previews while editing, submission and round revert remain unavailable.
+
 The native Photo Companion extension registers `ai.open`, `ai.start`, `ai.stop`, `ai.undo`,
-`ai.clear`, `ai.history`, `ai.bottom`, `ai.status`, `ai.health`, `ai.task`, `ai.returnCurrent`, and `ai.retrySave` as UI commands. `ai.start {prompt?, photo?}` requires prior consent
+`ai.clear`, `ai.history`, `ai.bottom`, `ai.status`, `ai.health`, `ai.task`, `ai.compare`, `ai.returnCurrent`, and `ai.retrySave` as UI commands. `ai.start {prompt?, photo?}` requires prior consent
 through `checkbox:aiConsent`; JSON parameters cannot grant consent. Exactly one available,
 non-deleted photo must be selected, and explicit `photo` must match it. Every desktop instance
 permits one task across submitting, queued and processing. The task photo is protected from

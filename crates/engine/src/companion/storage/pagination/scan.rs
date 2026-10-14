@@ -314,6 +314,7 @@ impl Fields {
                                         "local_round_id"
                                             | "role"
                                             | "display_kind"
+                                            | "complete_state"
                                             | "authored_text_bytes"
                                             | "local_message_id"
                                             | "photo_id"

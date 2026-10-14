@@ -113,6 +113,20 @@ impl Session {
     /// Validate the complete final operation before any catalog, file or history effects.
     /// Ordinary rating/flag/metadata operations retain their existing policy.
     pub fn preflight_mutation(&self, op: &Op) -> Result<()> {
+        let mut pending = vec![op];
+        while let Some(op) = pending.pop() {
+            match op {
+                Op::Batch { ops } => pending.extend(ops),
+                Op::SetDevelop { id, .. }
+                    if self.catalog.photo(*id).is_some_and(|photo| {
+                        photo.deleted || matches!(&photo.source, Source::File { path } if self.media.availability.exists(path)==Some(false))
+                    }) =>
+                {
+                    return Err(EngineError::Other("This photo is unavailable for editing.".into()));
+                }
+                _ => {}
+            }
+        }
         let Some(photo) = self.companion_task_photo() else { return Ok(()) };
         let mut pending = vec![op];
         while let Some(op) = pending.pop() {

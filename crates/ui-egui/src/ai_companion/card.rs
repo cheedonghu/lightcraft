@@ -171,6 +171,7 @@ pub(super) fn from_record(record: &Value, current: Option<&DevelopSettings>) -> 
     })
 }
 pub(super) enum Action {
+    Compare,
     History,
     Undo,
 }
@@ -236,6 +237,13 @@ pub(super) fn show(ui: &mut egui::Ui, card: &Card, navigation_available: bool) -
             }
         });
         super::composer_widget(ui, &format!("button:aiParameters:{}", card.local_round_id), details.header_response.rect);
+        if card.binding.is_some() {
+            let compare = ui.button(tr("Historical preview"));
+            super::composer_widget(ui, &format!("button:aiCompare:{}", card.local_round_id), compare.rect);
+            if compare.clicked() {
+                action = Some(Action::Compare);
+            }
+        }
         let locate = ui.add_enabled(navigation_available, egui::Button::new(tr("Open ordinary History")));
         super::composer_widget(ui, &format!("button:aiHistory:{}", card.local_round_id), locate.rect);
         if locate.clicked() {

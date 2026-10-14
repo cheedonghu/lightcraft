@@ -1,6 +1,22 @@
 //! Captured round previews: navigation only, never a render of today's settings.
 use super::*;
-use lightcraft_engine::companion::storage::{DisplayRecord, DisplayScan, PhotoHeader};
+use lightcraft_engine::companion::storage::{DisplayRecord, DisplayScan, HistoryReader, HistoryRetention, PhotoHeader};
+
+struct Loaded {
+    before: Option<egui::ColorImage>,
+    after: Option<egui::ColorImage>,
+    retention: HistoryRetention,
+}
+struct Native {
+    pending: Option<HistoryReader>,
+    receiver: Option<mpsc::Receiver<Loaded>>,
+    cancel: Arc<AtomicBool>,
+}
+impl Drop for Native {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
 
 #[derive(Default)]
 struct Picture {
@@ -28,8 +44,13 @@ pub(super) struct Comparison {
     loading: bool,
     before: Picture,
     after: Picture,
+    native: Option<Native>,
+    _retention: Option<HistoryRetention>,
 }
 impl Comparison {
+    pub(super) fn belongs_to(&self, scope: PhotoScope) -> bool {
+        self.scope == scope
+    }
     pub(super) fn status(&self) -> Value {
         json!({"localRoundId":self.round,"photo":self.scope.photo.0,"libraryGeneration":self.scope.library_generation,
             "loading":self.loading,"before":self.before.status(),"after":self.after.status()})
@@ -43,14 +64,22 @@ pub(super) fn enter(state: &mut State, app: &mut LightcraftApp, params: &Value) 
         return Err(tr("Historical preview unavailable").into());
     }
     state.sync_editor(app)?;
-    state.load(app, photo)?;
-    let conversation = state.conversations.get(&photo).ok_or_else(|| tr("Historical preview unavailable").to_owned())?;
-    if conversation.schema_version != 2 || conversation.history_error.is_some() {
+    // Capture the saved head, including the just-completed round. The normal
+    // conversation prefix is the base of the current tail, not its final head.
+    // Entering a canvas viewer does not start an unrelated sidebar page reader.
+    let header =
+        app.session.companion_photo_header(photo).map_err(|e| e.to_string())?.ok_or_else(|| tr("Historical preview unavailable").to_owned())?;
+    let metadata = app.session.companion_metadata_at(&header).map_err(|e| e.to_string())?;
+    if metadata["schema_version"] != 2 {
         return Err(tr("Historical preview unavailable").into());
     }
-    let header = conversation.prefix.clone().ok_or_else(|| tr("Historical preview unavailable").to_owned())?;
     let count = if header.record_count > 0 { header.record_count } else { header.round_count };
     let index = count.checked_sub(1).ok_or_else(|| tr("Historical preview unavailable").to_owned())?;
+    let native = app.session.companion_owned_history_reader(&header).map_err(|e| e.to_string())?.map(|reader| Native {
+        pending: Some(reader),
+        receiver: None,
+        cancel: Arc::new(AtomicBool::new(false)),
+    });
     state.comparison = Some(Comparison {
         scope: PhotoScope { photo, library_generation: app.session.library_generation() },
         round: round.into(),
@@ -61,6 +90,8 @@ pub(super) fn enter(state: &mut State, app: &mut LightcraftApp, params: &Value) 
         loading: true,
         before: Picture::default(),
         after: Picture::default(),
+        native,
+        _retention: None,
     });
     Ok(json!({"opened":true,"photo":photo.0}))
 }
@@ -72,14 +103,124 @@ fn picture(app: &mut LightcraftApp, ctx: &egui::Context, photo: PhotoId, message
     let image = images.first()?;
     let bytes = app.session.read_companion_historical_preview(photo, image).ok()?;
     lightcraft_engine::companion::validate_history_image("image/jpeg", &bytes).ok()?;
-    let decoded = lightcraft_codecs::decode(&bytes, lightcraft_codecs::DecodeOptions { max_size: Some((640, 640)), max_pixels: 640 * 640 }).ok()?;
-    let decoded = decoded.to_srgb8().into_oriented(lightcraft_geom::Orientation::from_exif(decoded.orientation));
-    let image = egui::ColorImage::from_rgba_unmultiplied([decoded.width, decoded.height], &decoded.as_bytes());
+    let image = decode(&bytes)?;
     Some(ctx.load_texture("ai-round-comparison", image, egui::TextureOptions::LINEAR))
 }
+fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
+    lightcraft_engine::companion::validate_history_image("image/jpeg", bytes).ok()?;
+    let decoded = lightcraft_codecs::decode(bytes, lightcraft_codecs::DecodeOptions { max_size: Some((640, 640)), max_pixels: 640 * 640 }).ok()?;
+    let decoded = decoded.to_srgb8().into_oriented(lightcraft_geom::Orientation::from_exif(decoded.orientation));
+    Some(egui::ColorImage::from_rgba_unmultiplied([decoded.width, decoded.height], &decoded.as_bytes()))
+}
+fn native_picture(reader: &mut HistoryReader, message: &Value, cancel: &AtomicBool) -> Option<egui::ColorImage> {
+    let images = message["images"].as_array()?;
+    if images.len() != 1 || images.first()?["mime_type"] != "image/jpeg" {
+        return None;
+    }
+    let image = images.first()?;
+    if image.get("data").is_none() {
+        let prefix = format!("companion/v2/photos/{}/previews/", reader.header().photo_id.0);
+        if image["attachment"].as_str().is_none_or(|key| !key.starts_with(&prefix)) {
+            return None;
+        }
+    }
+    let bytes = reader.preview(image).ok()?;
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    decode(&bytes)
+}
+fn read_native(reader: &mut HistoryReader, round: &str, cancel: &AtomicBool) -> (Option<egui::ColorImage>, Option<egui::ColorImage>) {
+    let count = if reader.header().record_count > 0 { reader.header().record_count } else { reader.header().round_count };
+    let mut binding = None;
+    for index in (0..count).rev() {
+        if cancel.load(Ordering::Relaxed) {
+            return (None, None);
+        }
+        let Some(record) = reader.rounds_display(index, 1).ok().and_then(|page| page.records.into_iter().next()) else {
+            return (None, None);
+        };
+        if record["local_round_id"] == round && record["photo_id"].as_u64() == Some(reader.header().photo_id.0) {
+            binding = card::from_record(&record, None).and_then(|card| card.binding);
+            break;
+        }
+    }
+    let Some(binding) = binding else { return (None, None) };
+    let (mut before, mut after) = (None, None);
+    let (mut before_matches, mut after_matches) = (0u64, 0u64);
+    for index in 0..reader.header().message_count {
+        if cancel.load(Ordering::Relaxed) {
+            return (None, None);
+        }
+        let Ok(record) = reader.message_display(index) else { return (None, None) };
+        if record["local_round_id"] != round || record["complete_state"] != "complete" || record["role"] != "user" {
+            continue;
+        }
+        if record["local_message_id"] == binding.before_preview_message_id && record["display_kind"] == "request" {
+            before_matches = before_matches.saturating_add(1);
+            before = if before_matches == 1 { native_picture(reader, &record, cancel) } else { None };
+        } else if record["local_message_id"] == binding.after_preview_message_id && record["display_kind"] == "execution_feedback" {
+            after_matches = after_matches.saturating_add(1);
+            after = if after_matches == 1 { native_picture(reader, &record, cancel) } else { None };
+        }
+    }
+    (before, after)
+}
+fn poll_native(state: &mut State, view: &mut Comparison, ctx: &egui::Context) {
+    let Some(native) = view.native.as_mut() else { return };
+    // One actual native producer per App, including cancelled views. A new
+    // descriptor may wait without overwriting the retiring producer's identity.
+    if state.comparison_workers.is_empty()
+        && let Some(reader) = native.pending.take()
+    {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        let guard = WorkerAlive(alive.clone());
+        let cancel = native.cancel.clone();
+        let round = view.round.clone();
+        let worker = std::thread::Builder::new().name("companion-comparison".into()).spawn(move || {
+            let _guard = guard;
+            let mut reader = reader;
+            let (before, after) = read_native(&mut reader, &round, &cancel);
+            if !cancel.load(Ordering::Relaxed) {
+                let _ = tx.try_send(Loaded { before, after, retention: reader.into_retention() });
+            }
+        });
+        if worker.is_ok() {
+            state.comparison_workers.push(alive);
+            native.receiver = Some(rx);
+        } else {
+            view.loading = false;
+        }
+    }
+    if state.comparison_workers.is_empty()
+        && let Some(receiver) = native.receiver.as_ref()
+    {
+        match receiver.try_recv() {
+            Ok(loaded) => {
+                view.before.texture = loaded.before.map(|image| ctx.load_texture("ai-comparison-before", image, egui::TextureOptions::LINEAR));
+                view.after.texture = loaded.after.map(|image| ctx.load_texture("ai-comparison-after", image, egui::TextureOptions::LINEAR));
+                view._retention = Some(loaded.retention);
+                native.receiver = None;
+                view.loading = false;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => view.loading = false,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    if view.loading {
+        ctx.request_repaint_after(Duration::from_millis(20));
+    }
+}
 pub(super) fn poll(state: &mut State, app: &mut LightcraftApp, ctx: &egui::Context) {
+    state.comparison_workers.retain(|alive| alive.load(Ordering::Relaxed));
     let Some(mut view) = state.comparison.take() else { return };
     if view.scope.library_generation != app.session.library_generation() || view.selection != app.session.selection || state.exiting {
+        return;
+    }
+    if view.native.is_some() {
+        poll_native(state, &mut view, ctx);
+        state.comparison = Some(view);
         return;
     }
     if let Some(mut scan) = view.scan.take() {
