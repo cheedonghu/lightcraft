@@ -3,9 +3,11 @@
 LightCraft is a clean-room, open-source, pure-Rust photo library + non-destructive raw developer targeting Adobe Lightroom parity (and beyond). Native on macOS, Windows, Linux; web via WASM. Sibling of `../pdfcraft` (Acrobat), `../photocraft` (Photoshop), `../vectorcraft` (Illustrator) and `../filmcraft` (Premiere), with the same conventions.
 
 ## Start every session here
-本 fork 的两人协作规则见 [`docs/collaboration.md`](docs/collaboration.md)：默认直接在 `dev` 开发，开始前同步一次；大任务或明确要求时使用 worktree。`main` 发布和上游同步由项目负责人手动处理。提交检查按影响范围执行，允许有记录的既有失败例外。
+本 fork 的主工作分支始终是 `dev`，无需用户重复提醒。两人协作规则见 [`docs/collaboration.md`](docs/collaboration.md)：默认直接在 `dev` 开发，开始前同步一次；大任务或明确要求时使用 worktree。用户要求同步 LightCraft 时，先合并远端 `origin/dev`，再将顶级上游 `storytold/lightcraft` 的更新合入 `dev`，验证后推送 `origin/dev`。`main` 仅用于发布，由项目负责人手动处理。提交检查按影响范围执行，允许有记录的既有失败例外。
 
 项目中要求“提交”时，默认执行 commit 并 push 到对应远端分支；只有明确要求不 push 或仅本地提交时才不推送。
+
+**验证范围（维护者决定，2026-10-15）：** 默认不运行创建 1 TB 文件等极限容量、极端资源消耗测试；验证正常使用范围内的编译、功能、数据保存与兼容性。批量运行前排除这类测试，不能为复现既有失败再次运行。专项极限验证仅在用户明确要求时执行。
 
 **纯上游 bug 的处理（维护者决定，2026-10-12）：** 修复前先检查上游最新代码、未合并 PR 和相关 issue，确认是否已有同一问题的修复；已有修复时先不重复处理，记录链接与覆盖范围，等待上游合并后同步。没有现成修复时，修复应与 fork 的 AI 功能和同步改动分开，并附最小复现与回归测试；可尝试从上游基线创建独立 bugfix PR。不得把整个 fork 的 `dev` 或 AI 扩展提交到上游。对已在本 fork 修复的问题，回馈上游前同样先检查重复修复。
 
@@ -131,14 +133,18 @@ of it. Full standard: `../craftrules/standards/never-crash.md`
   with `/usr/bin/time`. Record numbers in `plan/STATUS.md` → Metrics. Budgets: slider update ≤ 16 ms (draft) / loupe
   ≤ 60 ms on ~2.5 MP; export ≤ 1 s per 24 MP JPEG.
 - Never commit media: test images are procedural (`lightcraft-scenes`) or CC0 downloads in the gitignored `corpus/`.
+- A test that can't run here (no GPU, corpus file, craft-fonts face, model) calls `lightcraft_testkit::skip!(Gpu, "why")`
+  before it returns, not a bare `eprintln!`. `cargo xtask ci` then lists the skips and the machine's GPU adapters and
+  data, and writes `target/ci/report.json` and `target/ci/summary.md` (Markdown for a PR).
 
 ## Map of the code
 `geom`, `color`, `raster`, `tiff` (L0) → `raw`, `codecs`, `meta`, `develop` (L1) → `pipeline` → `catalog` → `engine`
 → `ui-egui`, `mcp` (L5) → apps `lightcraft` (desktop), `lightcraft-cli` (render/commands/MCP). `scenes` generates demo
-photos. `xtask` = tooling (`ci`, `layers`, `assets`, `parity`, `wasm`, `corpus`, `stats`). `flake.nix` +
+photos. `xtask` = tooling (`ci`, `layers`, `assets`, `parity`, `wasm`, `corpus`, `stats`); `testkit` = test helpers
+(dev-dependency only). `flake.nix` +
 `nix/package.nix` = the Nix package (`nix build` builds both binaries with the craft-fonts input, installs the
-desktop file/icons/AppStream metadata and runs `cargo test --workspace`; `nix develop` = dev shell). Community-maintained and not
-in CI: it may lag behind the workspace; see README → Quick start.
+desktop file/icons/AppStream metadata and runs `cargo test --workspace`; `nix develop` = dev shell). Community-maintained; CI only
+evaluates it (`.github/workflows/nix.yml`), so the build may lag behind the workspace; see README → Quick start.
 
 ## Contributor credits (About window)
 

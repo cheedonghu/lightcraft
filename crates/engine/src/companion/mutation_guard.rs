@@ -185,7 +185,7 @@ impl Session {
                 Op::AddPhoto { photo } if self.catalog.photo(photo.id).is_some() => {
                     changed.push(photo.id);
                 }
-                Op::SetContent { id, width, height, file_size, content_hash, preview_only }
+                Op::SetContent { id, width, height, file_size, content_hash, preview_only, .. }
                     if self.catalog.photo(*id).is_none_or(|p| {
                         p.width != *width
                             || p.height != *height

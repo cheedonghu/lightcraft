@@ -118,8 +118,10 @@ fn actual_wb(relative: bool) {
         )
         .unwrap();
     let native = if relative {
-        let path =
-            format!("/tmp/lightcraft-ux-execution-20261013/16/rendered-{}.png", lightcraft_engine::companion::LocalRoundId::new().unwrap().as_str());
+        let path = std::env::temp_dir()
+            .join(format!("lc-rendered-wb-{}.png", lightcraft_engine::companion::LocalRoundId::new().unwrap().as_str()))
+            .to_string_lossy()
+            .into_owned();
         let bytes = lightcraft_engine::export::encode_image(
             &lightcraft_raster::Rgba8::filled(32, 24, [96, 128, 160, 255]),
             &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },

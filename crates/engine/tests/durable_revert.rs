@@ -195,6 +195,7 @@ fn actual_source_replacement_is_detected_despite_unchanged_cached_content_key() 
             file_size: bytes.len() as u64,
             content_hash: Some(lightcraft_preview::hash_bytes(&bytes).to_string()),
             preview_only: None,
+            preview_checked: String::new(),
         },
     )
     .unwrap();
@@ -563,6 +564,7 @@ fn detected_source_replacement_cannot_regain_permission_when_bytes_are_restored(
             file_size: bytes.len() as u64,
             content_hash: Some(lightcraft_preview::hash_bytes(&bytes).to_string()),
             preview_only: None,
+            preview_checked: String::new(),
         },
     )
     .unwrap();
@@ -673,6 +675,7 @@ fn source_mismatch_during_anchor_refresh_permanently_relinquishes_permission() {
             file_size: bytes.len() as u64,
             content_hash: Some(lightcraft_preview::hash_bytes(&bytes).to_string()),
             preview_only: None,
+            preview_checked: String::new(),
         },
     )
     .unwrap();
@@ -825,6 +828,8 @@ fn convert_to_dng_refuses_before_creating_any_native_file_when_guard_save_fails(
         linearized: false,
         opcodes: Default::default(),
         metadata: Default::default(),
+        lens_metadata: Default::default(),
+        pixel_aspect: 1.0,
     };
     let bytes = lightcraft_raw::write_dng(&raw, &Default::default()).unwrap();
     let path = root.join("original.nef");

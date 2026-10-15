@@ -563,3 +563,29 @@ impl Store for MemStore {
 #[cfg(test)]
 #[path = "tests_store.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod tests_staging {
+    use super::*;
+
+    /// A link planted at a staging name (`<name>.tmp`) is removed, never followed: the file it points to keeps its
+    /// bytes and the save still lands (issue #1502).
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_staging_name_is_never_written_through() {
+        let dir = std::env::temp_dir().join(format!("lc-staging-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = FsStore::open(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("catalog.snap.tmp")).unwrap();
+        store.write_atomic("catalog.snap", b"{}").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(dir.join("catalog.snap")).unwrap(), b"{}");
+        std::os::unix::fs::symlink(&victim, dir.join("catalog.log.tmp")).unwrap();
+        store.write_atomic_with("catalog.log", &mut |w| w.write_all(b"[1]")).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(dir.join("catalog.log")).unwrap(), b"[1]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
