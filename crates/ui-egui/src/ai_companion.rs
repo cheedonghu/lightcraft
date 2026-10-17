@@ -33,6 +33,7 @@ mod history_tests;
 #[path = "ai_companion/identity_tests.rs"]
 mod identity_tests;
 mod interrupted;
+mod knowledge;
 mod legacy;
 #[cfg(test)]
 #[path = "ai_companion/library_tests.rs"]
@@ -887,6 +888,14 @@ impl State {
             }
             "tool.request" => {
                 self.tool(app, photo, payload)?;
+            }
+            "tool.result" => {
+                let job = self.jobs.get(&photo).ok_or("AI 轮次已结束。")?;
+                let local_round_id = job.identity.local_round_id.clone();
+                let stage = data.get("stage").and_then(Value::as_str).ok_or("AI 工具阶段缺失。")?;
+                let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+                knowledge::append_result(&mut conversation.messages, payload, local_round_id.as_str(), stage)?;
+                self.save(app, photo)?;
             }
             "edit.plan" => {
                 let plan_id = payload.get("plan_id").and_then(Value::as_str).ok_or("AI 方案编号缺失。")?;
