@@ -9,7 +9,10 @@ fn first_ai_open_exposes_explicit_service_retry_without_submitting() {
     for _ in 0..4 {
         h.step();
     }
-    assert!(h.app.widgets.iter().any(|(id, _)| id == "button:aiHealthRetry"), "the real panel exposes service retry");
+    assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiHealthRetry"), "diagnostics stay out of the composer");
+    request(&mut h, "ui.clickWidget", json!({"id":"button:aiSettings"}));
+    frames(&mut h);
+    assert!(h.app.widgets.iter().any(|(id, _)| id == "button:aiHealthRetry"));
     let status = h.app.run("ai.status", json!({})).unwrap();
     assert!(status["health"]["state"].is_string(), "{status}");
     assert!(status["activeRounds"].as_array().unwrap().is_empty(), "health never submits");
@@ -80,7 +83,7 @@ fn global_entry_keeps_original_photo_after_background_completion_and_only_click_
 }
 
 #[test]
-fn failed_round_explains_actual_untouched_photo_and_recovery_and_copies_trace() {
+fn failed_round_explains_actual_untouched_photo_and_keeps_trace_out_of_user_controls() {
     let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
     let (connection, requests, events) = network::test_connection();
     app.ai.connection = Some(connection);
@@ -101,8 +104,8 @@ fn failed_round_explains_actual_untouched_photo_and_recovery_and_copies_trace() 
     assert!(text.contains("does not support") && text.contains("starting settings") && text.contains("new request"), "{text}");
     assert!(!text.contains("capability_unsupported") && !text.contains("traceId="), "technical codes are secondary, not the primary error: {text}");
     assert_eq!(*h.app.session.develop_of(photo).unwrap(), *original);
-    request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
-    assert_eq!(h.view.clipboard, "0123456789ab");
+    assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"));
+    assert_eq!(errors::diagnostic(h.app.ai.conversations.get(&photo).unwrap()), Some("0123456789ab"));
 }
 
 #[test]
@@ -331,6 +334,8 @@ fn native_health_is_async_get_only_and_newer_retry_wins_over_blocked_older_resul
     let status = h.app.run("ai.status", json!({})).unwrap();
     assert_eq!(status["health"]["probe"], 2);
     assert_eq!(status["health"]["state"], "reachable");
+    request(&mut h, "ui.clickWidget", json!({"id":"button:aiSettings"}));
+    frames(&mut h);
     assert!(h.painted_text().iter().any(|text| text.contains("Model availability is checked when you submit")));
 }
 
@@ -609,8 +614,8 @@ fn backend_failure_with_unconfirmed_feedback_keeps_actual_published_edit_and_ori
         frames(&mut h);
         assert_eq!(h.app.session.active(), Some(photo));
         assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.4);
-        request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
-        assert_eq!(h.view.clipboard, "123456789abc");
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"));
+        assert_eq!(errors::diagnostic(h.app.ai.conversations.get(&photo).unwrap()), Some("123456789abc"));
         assert!(requests.try_recv().is_err());
         h.app.session.execute("develop.set", &json!({"ids":[other.0],"values":{"light.exposure":0.7}})).unwrap();
         request(&mut h, "ui.clickWidget", json!({"id":"field:aiPrompt"}));
@@ -626,8 +631,8 @@ fn backend_failure_with_unconfirmed_feedback_keeps_actual_published_edit_and_ori
         h.app.run("ai.task", json!({})).unwrap();
         frames(&mut h);
         assert_eq!(h.app.run("ai.status", json!({})).unwrap()["readonlyPhoto"], photo.0);
-        request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
-        assert_eq!(h.view.clipboard, "123456789abc");
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"));
+        assert_eq!(errors::diagnostic(h.app.ai.conversations.get(&photo).unwrap()), Some("123456789abc"));
         // Catches a read-only A card opening selected B's History; misses native OS input delivery.
         let id = format!("button:aiHistory:{}", status["task"]["localRoundId"].as_str().unwrap());
         request(&mut h, "ui.clickWidget", json!({"id":id}));
@@ -644,9 +649,8 @@ fn backend_failure_with_unconfirmed_feedback_keeps_actual_published_edit_and_ori
         h.app.run("ui.dock", json!({"operation":"float","panel":"tools","rect":[450,100,320,120]})).unwrap();
         h.app.run("ai.task", json!({})).unwrap();
         frames(&mut h);
-        super::panel_tests::reachable(&mut h, "button:aiCopyTrace", -1.0);
-        request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
-        assert_eq!(h.view.clipboard, "123456789abc");
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"));
+        assert_eq!(errors::diagnostic(h.app.ai.conversations.get(&photo).unwrap()), Some("123456789abc"));
         assert_eq!(h.app.session.develop_of(other).unwrap().light.exposure, 0.7);
         assert!(requests.try_recv().is_err());
         let before = serde_json::to_value(&h.app.session.catalog).unwrap();
@@ -939,8 +943,8 @@ fn cold_verified_history_keeps_trace_and_consent_controls_scoped_while_loading()
             h.app.ai.generation = h.app.session.library_generation();
             owned = Some((requests, events));
         }
-        request(&mut h, "ui.clickWidget", json!({"id":"button:aiCopyTrace"}));
-        assert_eq!(h.view.clipboard, "abcdef012345-cold");
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"));
+        assert_eq!(errors::diagnostic(h.app.ai.conversations.get(&photo).unwrap()), Some("abcdef012345-cold"));
         if let Some((requests, _events)) = owned.as_ref() {
             assert_eq!(h.app.run("ai.start", json!({"prompt":"new explicit request"})).unwrap()["started"], true);
             assert_eq!(native_history_tests::outgoing(&mut h, requests, "/v1/rounds").path, "/v1/rounds");
@@ -1111,6 +1115,17 @@ fn omitted_history_navigation_follows_readonly_task_without_changing_selected_ph
         assert_eq!(h.app.session.companion_editor(other).unwrap(), before);
         h.app.run("ai.returnCurrent", json!({})).unwrap();
         frames(&mut h);
+        if h.app.session.companion_editor(other).unwrap() != before {
+            super::redesign_tests::screenshots(&mut h, "debug-return-reading");
+            eprintln!("RETURN VIEW {:?} messages {:?}", h.app.widgets.iter().find(|(id, _)| id == "ai:messages"), h.painted_text());
+            eprintln!(
+                "HISTORY {:?}",
+                h.app.ai.conversations.get(&other).map(|c| (
+                    c.prefix.as_ref().map(|h| h.message_count),
+                    c.view.as_ref().map(|v| (v.items.len(), v.messages.len(), v.cursor, v.card_cursor))
+                ))
+            );
+        }
         assert_eq!(h.app.session.companion_editor(other).unwrap(), before, "Return restores the saved B position");
         assert!(h.painted_text().iter().any(|text| text.contains("B_HISTORY_DRAFT")));
         assert_eq!(h.app.session.selection, selection);

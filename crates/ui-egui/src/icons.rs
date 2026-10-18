@@ -14,6 +14,8 @@ pub enum Icon {
     Share,
     Help,
     Cloud,
+    /// Original four-point glints: the photo assistant, distinct from local/cloud storage.
+    Sparkles,
     Sliders,
     Crop,
     Eraser,
@@ -246,6 +248,13 @@ fn paint_with(p: &Painter, rect: Rect, icon: Icon, color: Color32, turn: Option<
             pen.arc(10.0, 8.0, 2.5, 180.0, 400.0);
             pen.line(&[(10.0, 10.5), (10.0, 11.8)]);
             pen.dot(10.0, 14.2, 0.9);
+        }
+        Sparkles => {
+            pen.closed(&[(8.0, 2.0), (10.0, 7.0), (15.0, 9.0), (10.0, 11.0), (8.0, 16.0), (6.0, 11.0), (1.0, 9.0), (6.0, 7.0)]);
+            pen.line(&[(16.0, 1.0), (16.0, 5.0)]);
+            pen.line(&[(14.0, 3.0), (18.0, 3.0)]);
+            pen.line(&[(16.0, 13.0), (16.0, 19.0)]);
+            pen.line(&[(13.0, 16.0), (19.0, 16.0)]);
         }
         Cloud => {
             pen.arc(7.0, 11.5, 3.5, 90.0, 270.0);

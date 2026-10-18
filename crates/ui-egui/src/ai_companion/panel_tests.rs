@@ -76,20 +76,20 @@ fn multi_selection_explains_empty_state_before_any_composer() {
     assert!(!h.app.widgets.iter().any(|(id, _)| id == "field:aiPrompt"));
 }
 #[test]
-fn long_messages_scroll_without_moving_the_stage_and_composer() {
+fn long_messages_scroll_without_moving_the_composer() {
     let mut h = headless([1000.0, 680.0]);
     h.app.run("ai.open", json!({})).unwrap();
     frames(&mut h);
     let photo = h.app.session.active().unwrap();
     let input = rect(&h, "field:aiPrompt");
-    let stage = rect(&h, "ai:stage");
+    let composer = rect(&h, "ai:composer");
     h.app.ai.conversations.entry(photo).or_default().messages =
         (0..200).map(|i| json!({"role":"assistant","text":format!("Message {i}: a longer explanation of this photograph.")})).collect();
     frames(&mut h);
     assert_eq!(rect(&h, "field:aiPrompt"), input);
-    assert_eq!(rect(&h, "ai:stage"), stage);
+    assert_eq!(rect(&h, "ai:composer"), composer);
     let messages = rect(&h, "ai:messages");
-    assert!(messages.bottom() <= stage.top());
+    assert!(messages.bottom() <= composer.top());
     assert!(rect(&h, "panel:right_panel").contains_rect(input));
     let before_scroll = h.paint();
     h.app.synthetic.push(egui::Event::PointerMoved(messages.center()));
@@ -101,7 +101,7 @@ fn long_messages_scroll_without_moving_the_stage_and_composer() {
     });
     frames(&mut h);
     assert_eq!(rect(&h, "field:aiPrompt"), input);
-    assert_eq!(rect(&h, "ai:stage"), stage);
+    assert_eq!(rect(&h, "ai:composer"), composer);
     let after_scroll = h.paint();
     assert!(
         (messages.top() as usize..messages.bottom() as usize).any(|y| (messages.left() as usize..messages.right() as usize)
@@ -133,6 +133,11 @@ fn real_consent_start_revoke_and_strip_collapse_work_in_both_languages() {
         assert!(h.painted_text().iter().any(|text| text == language.tr("AI Assistant")));
         assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
         assert!(h.app.ai.consent);
+        if h.app.ai.prompt.trim().is_empty() {
+            h.app.ai.prompt = "Review this photo.".into();
+            drafts::capture(&mut h.app);
+            frames(&mut h);
+        }
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
         assert_eq!(requests.try_recv().unwrap().path, "/v1/rounds");
         assert!(requests.try_recv().is_err(), "measurement cannot submit another request");
@@ -164,6 +169,39 @@ fn real_consent_start_revoke_and_strip_collapse_work_in_both_languages() {
 }
 
 #[test]
+fn consent_is_above_input_and_fully_visible_at_normal_and_enlarged_ui_scales() {
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        for scale in [1.0, 1.25, 1.5] {
+            let mut h = headless([1400.0, 1000.0]);
+            h.app.ui.language = language;
+            h.view.ctx.set_zoom_factor(scale);
+            h.app.run("ai.open", json!({})).unwrap();
+            frames(&mut h);
+            let checkbox = rect(&h, "checkbox:aiConsent");
+            let input = rect(&h, "field:aiPrompt");
+            let send = rect(&h, "button:aiStart");
+            let tools = rect(&h, "panel:right_panel");
+            let composer = rect(&h, "ai:composer");
+            assert!(checkbox.bottom() < input.top(), "consent must precede the input");
+            assert!(send.height() >= 30.0, "the full send button must remain visible: {send:?}");
+            assert!(send.bottom() + 12.0 <= composer.bottom(), "keep space below the input: {send:?} in {composer:?}");
+            let label = language.tr("Allow compressed previews to be sent to the cloud model");
+            let text = h
+                .view
+                .painted_shapes()
+                .iter()
+                .find_map(|shape| match shape {
+                    egui::epaint::Shape::Text(text) if text.opacity_factor > 0.0 && text.galley.text() == label => Some(text.visual_bounding_rect()),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(tools.contains_rect(text) && composer.contains_rect(text), "the complete consent label must be visible: {text:?}");
+            short_snapshot(&mut h, &format!("consent-above-input-{}-{scale}", language.code()));
+        }
+    }
+}
+
+#[test]
 fn narrow_shared_panel_keeps_all_composer_controls_inside_tools() {
     for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
         let mut h = headless([880.0, 600.0]);
@@ -179,7 +217,8 @@ fn narrow_shared_panel_keeps_all_composer_controls_inside_tools() {
         h.app.run("ai.open", json!({})).unwrap();
         frames(&mut h);
         let tools = rect(&h, "panel:right_panel");
-        for id in ["ai:stage", "field:aiPrompt", "checkbox:aiConsent", "button:aiStart", "button:aiClear"] {
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "ai:stage"), "idle input needs no status label");
+        for id in ["field:aiPrompt", "checkbox:aiConsent", "button:aiStart"] {
             assert!(tools.contains_rect(rect(&h, id)), "{id} in {language:?}: {:?} within {tools:?}", rect(&h, id));
         }
         assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiUndo"), "Undo belongs to an explicit result card, not the composer");
@@ -257,17 +296,20 @@ fn multiline_draft_scrolls_inside_a_fixed_composer_without_sizing_consuming_inpu
     h.app.run("ai.open", json!({})).unwrap();
     frames(&mut h);
     let input = rect(&h, "field:aiPrompt");
-    let stage = rect(&h, "ai:stage");
+    let composer = rect(&h, "ai:composer");
     let timeout = Duration::from_secs(10);
     assert_eq!(h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout)["ok"], true);
     let draft = "Please improve this photograph naturally.\n".repeat(50);
     assert_eq!(h.request("ui.text", json!({"text":draft}), timeout)["ok"], true);
     assert_eq!(h.app.ai.prompt, draft);
     frames(&mut h);
-    assert_eq!(rect(&h, "field:aiPrompt"), input);
-    assert_eq!(rect(&h, "ai:stage"), stage);
+    let filled_input = rect(&h, "field:aiPrompt");
+    assert_eq!(filled_input.min, input.min);
+    assert_eq!(filled_input.right(), input.right());
+    assert!(filled_input.height() <= 54.0, "the actual text edit stays inside its fixed scroll viewport");
+    assert_eq!(rect(&h, "ai:composer"), composer);
     let tools = rect(&h, "panel:right_panel");
-    for id in ["field:aiPrompt", "checkbox:aiConsent", "button:aiStart", "button:aiClear"] {
+    for id in ["field:aiPrompt", "checkbox:aiConsent", "button:aiStart"] {
         assert_eq!(h.app.widgets.iter().filter(|(key, _)| key == id).count(), 1, "only the visible pass registers {id}");
         assert!(tools.contains_rect(rect(&h, id)));
     }
@@ -309,19 +351,39 @@ pub(super) fn short_tools(h: &mut Headless, stacked: bool, height: f32) {
 }
 
 pub(super) fn reachable(h: &mut Headless, id: &str, direction: f32) -> egui::Rect {
-    for _ in 0..30 {
+    let settings = matches!(id, "button:aiClear" | "button:aiHealthRetry") && h.app.ai.readonly_task.is_none();
+    if settings && !h.app.ai.settings_open {
+        assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiSettings"}), Duration::from_secs(10))["ok"], true);
+        frames(h);
+    }
+    if !settings && h.app.ai.settings_open {
+        h.app.ai.settings_open = false;
+        frames(h);
+    }
+    for attempt in 0..60 {
         if let Some((_, target)) = h.app.widgets.iter().find(|(key, _)| key == id)
             && target.height() >= 12.0
         {
-            assert!(rect(h, "panel:right_panel").contains_rect(*target), "{id} must be visibly inside Tools");
+            if !settings {
+                assert!(rect(h, "panel:right_panel").contains_rect(*target), "{id} must be visibly inside Tools");
+            }
             return *target;
         }
         let composer = rect(h, "ai:composer");
-        h.app.synthetic.push(egui::Event::PointerMoved(egui::pos2(composer.right() - 2.0, composer.center().y)));
+        let message_target = id.starts_with("button:aiParameters:") || id.starts_with("button:aiProcess:") || id.starts_with("button:aiHistory:");
+        let pointer = h
+            .app
+            .widgets
+            .iter()
+            .find(|(key, rect)| key == "ai:messages" && rect.height() >= 24.0)
+            .filter(|(_, rect)| message_target || !composer.contains_rect(*rect))
+            .map(|(_, rect)| rect.center())
+            .unwrap_or_else(|| egui::pos2(composer.right() - 2.0, composer.center().y));
+        h.app.synthetic.push(egui::Event::PointerMoved(pointer));
         h.app.synthetic.push(egui::Event::MouseWheel {
             phase: egui::TouchPhase::Move,
             unit: egui::MouseWheelUnit::Point,
-            delta: egui::vec2(0.0, direction * 35.0),
+            delta: egui::vec2(0.0, direction * if attempt < 30 { 35.0 } else { -35.0 }),
             modifiers: egui::Modifiers::NONE,
         });
         frames(h);
@@ -342,6 +404,11 @@ fn supported_short_floating_and_stacked_tools_keep_active_controls_on_their_own_
             frames(&mut h);
             let timeout = Duration::from_secs(10);
             assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
+            if h.app.ai.prompt.trim().is_empty() {
+                h.app.ai.prompt = "Review this photo.".into();
+                drafts::capture(&mut h.app);
+                frames(&mut h);
+            }
             assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
             assert_eq!(requests.try_recv().unwrap().path, "/v1/rounds");
             let photo = h.app.session.active().unwrap();
@@ -404,6 +471,11 @@ fn supported_short_tools_allow_idle_draft_clear_and_start_through_visible_widget
             reachable(&mut h, "checkbox:aiConsent", 1.0);
             assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
             reachable(&mut h, "button:aiStart", -1.0);
+            if h.app.ai.prompt.trim().is_empty() {
+                h.app.ai.prompt = "Review this photo.".into();
+                drafts::capture(&mut h.app);
+                frames(&mut h);
+            }
             assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
             assert_eq!(requests.try_recv().unwrap().path, "/v1/rounds");
             assert_eq!(h.app.session.companion_task_photo(), Some(photo));
@@ -485,6 +557,11 @@ fn real_reading_offset_is_photo_scoped_and_user_scroll_stops_tail_following() {
     let (connection, requests, events) = network::test_connection();
     h.app.ai.next_connection = Some(connection);
     h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
+    if h.app.ai.prompt.trim().is_empty() {
+        h.app.ai.prompt = "Review this photo.".into();
+        drafts::capture(&mut h.app);
+        frames(&mut h);
+    }
     h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout);
     let creation = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
     events.try_send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"reading-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":a.0,"library_generation":creation.identity.scope.library_generation},"state":"queued"}}) }).unwrap();
@@ -1006,9 +1083,12 @@ fn first_stop_feedback_does_not_read_a_cold_other_photo_editor_or_show_the_task_
     let timeout = Duration::from_secs(10);
     h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
     h.request("ui.text", json!({"text":"A immutable stopped request"}), timeout);
+    assert_eq!(h.app.ai.prompt, "A immutable stopped request");
     h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
     h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout);
     let creation = requests.try_recv().unwrap();
+    assert_eq!(creation.path, "/v1/rounds");
+    assert_eq!(h.app.ai.jobs.get(&a).unwrap().prompt, "A immutable stopped request", "the submitted job must retain the exact typed request");
     events.try_send(network::Event::Server{kind:"round.state".into(),data:json!({"round_id":"feedback-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":a.0,"library_generation":creation.identity.scope.library_generation},"state":"queued"}})}).unwrap();
     frames(&mut h);
     h.app.run("library.select", json!({"ids":[b.0],"active":b.0})).unwrap();

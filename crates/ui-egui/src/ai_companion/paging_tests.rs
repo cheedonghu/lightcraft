@@ -566,6 +566,9 @@ fn public_poll_preserves_initial_correction_feedback_and_stop_before_completed_r
     }
     let timeout = Duration::from_secs(10);
     assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
+    h.app.ai.prompt = "Review this photo.".into();
+    super::drafts::capture(&mut h.app);
+    h.step();
     assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
     let creation = requests.try_recv().unwrap();
     assert_eq!(creation.path, "/v1/rounds");
@@ -687,7 +690,14 @@ fn compact_tools_history_is_visibly_readable_after_scrolling_and_older_newer_nav
                 return true;
             }
             let composer = h.app.widgets.iter().find(|(id, _)| id == "ai:composer").unwrap().1;
-            h.app.synthetic.push(egui::Event::PointerMoved(egui::pos2(composer.right() - 2.0, composer.center().y)));
+            let target = h
+                .app
+                .widgets
+                .iter()
+                .find(|(id, rect)| id == "ai:messages" && rect.height() >= 24.0)
+                .map(|(_, rect)| rect.center())
+                .unwrap_or_else(|| egui::pos2(composer.right() - 2.0, composer.center().y));
+            h.app.synthetic.push(egui::Event::PointerMoved(target));
             h.app.synthetic.push(egui::Event::MouseWheel {
                 phase: egui::TouchPhase::Move,
                 unit: egui::MouseWheelUnit::Point,
@@ -709,7 +719,13 @@ fn compact_tools_history_is_visibly_readable_after_scrolling_and_older_newer_nav
             {
                 let tools = h.app.widgets.iter().find(|(key, _)| key == "panel:right_panel").unwrap().1;
                 assert!(tools.contains_rect(*target));
-                return;
+                // Finish the actual smooth wheel motion before clicking a control.
+                for _ in 0..16 {
+                    h.step();
+                }
+                if h.app.widgets.iter().any(|(key, rect)| key == id && rect.height() >= 12.0) {
+                    return;
+                }
             }
             let composer = h.app.widgets.iter().find(|(key, _)| key == "ai:composer").unwrap().1;
             h.app.synthetic.push(egui::Event::PointerMoved(egui::pos2(composer.right() - 2.0, composer.center().y)));

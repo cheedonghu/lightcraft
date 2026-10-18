@@ -100,6 +100,9 @@ fn public_ai_result_stays_visible_and_unsaved_recovery_only_writes_storage() {
         }
         let timeout = Duration::from_secs(10);
         assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
+        h.app.ai.prompt = "Review this photo.".into();
+        super::drafts::capture(&mut h.app);
+        h.step();
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
         let creation = outgoing(&mut h, &requests, "/v1/rounds");
         let round = "UX09-public-round";

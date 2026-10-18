@@ -273,6 +273,7 @@ impl State {
             fragment_messages: presentation.clone(),
             bytes: page.bytes,
             cards: Vec::new(),
+            process: BTreeMap::new(),
             diagnostic: None,
             legacy_plan: None,
             legacy_scan: (prefix.legacy_plan_count() > 0).then(|| {

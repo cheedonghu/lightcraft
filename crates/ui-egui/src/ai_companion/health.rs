@@ -102,44 +102,69 @@ impl Health {
         }
     }
 }
-/// The status row and optional details viewport have stable geometry while a probe finishes.
-/// Compact Tools keep the status/retry row in the composer and details below history.
-pub(super) fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, compact: bool) {
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let retry = ui.button(tr("Check Again"));
-            super::composer_widget(ui, "button:aiHealthRetry", retry.rect);
-            if !ui.is_sizing_pass() && retry.clicked() {
-                let _ = app.run("ai.health", json!({}));
-            }
-            let short = match app.ai.health.state {
-                "checking" => "Checking service…",
-                "reachable" => "Service reachable (HTTP only)",
-                "unreachable" => "Service unreachable",
-                _ => "Service not checked",
-            };
-            ui.add(egui::Label::new(tr(short)).truncate()).on_hover_text(tr(app.ai.health.label()));
-        });
-    });
-    if !compact {
-        details(app, ui);
+/// Settings flow vertically so translated status text cannot push the action out of place.
+pub(super) fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
+    let short = match app.ai.health.state {
+        "checking" => "Checking connection…",
+        "reachable" => "Connected",
+        "unreachable" => "Disconnected",
+        _ => "Connection not checked",
+    };
+    let status = ui.label(tr(short));
+    super::composer_widget(ui, "ai:healthStatus", status.rect);
+    let details = ui.add(egui::Label::new(egui::RichText::new(tr(app.ai.health.label())).small().weak()).wrap());
+    super::composer_widget(ui, "ai:healthDetails", details.rect);
+    ui.add_space(4.0);
+    let retry = ui.add(egui::Button::new(tr("Check Again")).min_size(egui::vec2(0.0, 30.0)));
+    super::composer_widget(ui, "button:aiHealthRetry", retry.rect);
+    if !ui.is_sizing_pass() && retry.clicked() {
+        let _ = app.run("ai.health", json!({}));
     }
 }
-pub(super) fn details(app: &LightcraftApp, ui: &mut egui::Ui) {
-    let area =
-        egui::ScrollArea::vertical().id_salt("ai-service-details").auto_shrink([false, false]).min_scrolled_height(48.0).max_height(48.0).show(
-            ui,
-            |ui| {
-                ui.label(tr(app.ai.health.label()));
-                if app.ai.health.state == "unreachable" {
-                    let guide = if cfg!(target_os = "windows") {
-                        "In photo-companion, run scripts/start-backend.ps1."
-                    } else {
-                        "In photo-companion, run: go run ./cmd/photo-companion --log-file logs/backend.log"
-                    };
-                    ui.label(tr(guide));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Services, headless::Headless};
+    use lightcraft_engine::Session;
+
+    #[test]
+    fn settings_align_status_description_and_actions_in_both_languages_and_window_sizes() {
+        for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+            for state in ["reachable", "unreachable", "checking"] {
+                for size in [[880.0, 600.0], [1400.0, 1000.0]] {
+                    let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
+                    app.ui.language = locale;
+                    app.ai.generation = app.session.library_generation();
+                    app.ai.health.state = state;
+                    app.ai.health.serial = 1;
+                    app.ai.settings_open = true;
+                    let mut h = Headless::new(app, size, 1.0);
+                    h.app.run("ai.open", json!({})).unwrap();
+                    for _ in 0..6 {
+                        h.step();
+                    }
+                    assert_eq!(h.app.ai.health.status()["state"], state, "the layout fixture must retain the requested connection state");
+                    let rect = |id: &str| h.app.widgets.iter().find(|(key, _)| key == id).unwrap_or_else(|| panic!("missing {id}")).1;
+                    let window = rect("ai:settings");
+                    let status = rect("ai:healthStatus");
+                    let details = rect("ai:healthDetails");
+                    let retry = rect("button:aiHealthRetry");
+                    let clear = rect("button:aiClear");
+                    for content in [status, details, retry, clear] {
+                        assert!(window.contains_rect(content), "settings control clipped: {content:?} in {window:?}");
+                    }
+                    assert!((status.left() - details.left()).abs() <= 1.0);
+                    assert!((status.left() - retry.left()).abs() <= 1.0);
+                    assert!((retry.left() - clear.left()).abs() <= 1.0);
+                    assert!(status.bottom() < details.top() && details.bottom() < retry.top());
+                    assert!(clear.top() > retry.bottom() + 12.0, "conversation actions need their own section");
+                    assert!(window.width() <= size[0] && window.bottom() <= size[1]);
+                    if size[0] == 880.0 {
+                        super::super::redesign_tests::screenshots(&mut h, &format!("settings-{state}-{}", locale.code()));
+                    }
                 }
-            },
-        );
-    super::composer_widget(ui, "ai:healthDetails", area.inner_rect);
+            }
+        }
+    }
 }

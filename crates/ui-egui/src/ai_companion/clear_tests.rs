@@ -146,6 +146,7 @@ fn delete_button_confirms_and_cancel_keeps_context_before_a_new_epoch() {
         h.step();
     }
     let timeout = Duration::from_secs(10);
+    super::panel_tests::reachable(&mut h, "button:aiClear", -1.0);
     assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClear"}), timeout)["ok"], true);
     assert!(
         h.painted_text().iter().any(|text| text.contains("Plans and comparisons in this conversation will also be deleted")),
@@ -154,6 +155,7 @@ fn delete_button_confirms_and_cancel_keeps_context_before_a_new_epoch() {
     assert_eq!(h.app.session.load_companion_conversation(photo).unwrap().unwrap()["messages"][0]["text"], "Retain until confirmed");
     assert_eq!(h.request("ui.clickWidget", json!({"id":"button:dialogCancel"}), timeout)["ok"], true);
     assert_eq!(h.app.session.load_companion_conversation(photo).unwrap().unwrap()["messages"][0]["text"], "Retain until confirmed");
+    super::panel_tests::reachable(&mut h, "button:aiClear", -1.0);
     assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClear"}), timeout)["ok"], true);
     assert_eq!(h.request("ui.clickWidget", json!({"id":"button:dialogOk"}), timeout)["ok"], true);
     assert_eq!(h.app.session.companion_photo_header(photo).unwrap().unwrap().conversation_epoch, 1);
@@ -281,6 +283,7 @@ fn actual_save_retry_acknowledges_failed_clear_without_losing_the_visible_draft(
         let timeout = Duration::from_secs(10);
         assert_eq!(h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout)["ok"], true);
         assert_eq!(h.request("ui.text", json!({"text":"Keep retry draft"}), timeout)["ok"], true);
+        super::panel_tests::reachable(&mut h, "button:aiClear", -1.0);
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClear"}), timeout)["ok"], true);
         fail.store(true, Ordering::Relaxed);
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClearConfirm"}), timeout)["ok"], true);
@@ -365,6 +368,7 @@ fn confirmation_and_failed_deletion_are_localized_and_reachable_in_small_tools()
             }
             super::panel_tests::reachable(&mut h, "button:aiClear", -1.0);
             let timeout = Duration::from_secs(10);
+            super::panel_tests::reachable(&mut h, "button:aiClear", -1.0);
             assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClear"}), timeout)["ok"], true);
             let warning =
                 tr("Plans and comparisons in this conversation will also be deleted. Photo effects, edit history and the unsent draft are kept.");
@@ -465,6 +469,7 @@ fn acknowledged_clear_shows_independent_cleanup_debt_without_unsaved_history() {
             h.step();
         }
         let timeout = Duration::from_secs(10);
+        super::panel_tests::reachable(&mut h, "button:aiClear", -1.0);
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClear"}), timeout)["ok"], true);
         fail.store(true, Ordering::Relaxed);
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClearConfirm"}), timeout)["ok"], true);

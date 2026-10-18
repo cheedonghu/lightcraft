@@ -49,7 +49,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                     }
                 }
                 separator(ui, &t);
-                if icon_button(ui, "ai", Icon::Cloud, sz, app.ui.right == RightPanel::Ai, true, "AI Assistant").clicked() {
+                if icon_button(ui, "ai", Icon::Sparkles, sz, app.ui.right == RightPanel::Ai, true, "AI Assistant").clicked() {
                     let _ = app.run("panel.ai", json!({}));
                 }
                 if icon_button(ui, "versions", Icon::Versions, sz, app.ui.right == RightPanel::Versions, has_photo, "Versions (Shift+V)").clicked() {

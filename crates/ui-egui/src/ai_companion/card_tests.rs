@@ -42,6 +42,108 @@ fn stage(name: &str, before: f64, after: f64) -> Value {
     json!({"stage":name,"plan_id":name,"reason":"Keep the highlights natural.","before_state":a,"proposed_state":b,"applied_state":b,"execution_outcome":"succeeded","locally_published":true,"delivery_state":"confirmed"})
 }
 #[test]
+fn result_cards_follow_their_own_replies_and_page_tail_overlap_is_not_duplicated() {
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        let mut session = Session::new();
+        session
+            .open_library_in(
+                LibraryStores {
+                    catalog: Box::new(MemStore::new()),
+                    files: Box::new(MemStore::new()),
+                    dir: "round-card-order".into(),
+                    on_disk: false,
+                },
+                true,
+            )
+            .unwrap();
+        let photo = session.active().unwrap();
+        let zh = language == crate::i18n::Locale::ZhHans;
+        let requests =
+            if zh { ["先自然优化", "再压暗一点", "只解释一下"] } else { ["Optimize naturally", "Make it darker", "Explain only"] };
+        let replies = if zh {
+            ["已完成自然优化。", "已降低亮度，保留林间氛围。", "这次只作说明，没有调整照片。"]
+        } else {
+            ["Natural optimization complete.", "Brightness reduced to preserve the woodland mood.", "Explanation only; no photo adjustments."]
+        };
+        let mut records = Vec::new();
+        let mut messages = Vec::new();
+        for index in 0..3 {
+            let round = format!("ordered-{index}");
+            let final_id = format!("final-{index}");
+            messages.push(json!({"role":"user","text":requests[index],"local_round_id":round,"local_message_id":format!("user-{index}")}));
+            messages.push(json!({"role":"assistant","text":replies[index],"local_round_id":round,"local_message_id":final_id}));
+            records.push(json!({"local_round_id":round,"stages":if index < 2 { vec![stage("initial",0.0,0.2)] } else { vec![] },"local_terminal":"completed","final_message_id":final_id}));
+        }
+        session.save_companion_tail(photo, None, &messages, &[], &records, &json!({"schema_version":2})).unwrap();
+        let mut app = LightcraftApp::new(session, Services::default());
+        app.ui.language = language;
+        let mut h = Headless::new(app, [1400.0, 1500.0], 1.0);
+        h.app.run("ai.open", json!({})).unwrap();
+        ready(&mut h);
+        for _ in 0..6 {
+            h.step();
+        }
+        let y = |h: &Headless, text: &str| {
+            h.view
+                .painted_shapes()
+                .iter()
+                .find_map(|shape| match shape {
+                    egui::epaint::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect().top()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing visible text: {text}"))
+        };
+        let rect = |h: &Headless, id: &str| h.app.widgets.iter().find(|(key, _)| key == id).unwrap().1;
+        let first = rect(&h, "ai:card:ordered-0");
+        let second = rect(&h, "ai:card:ordered-1");
+        assert!(y(&h, replies[0]) < first.top());
+        assert!(first.bottom() < y(&h, requests[1]), "the old card must precede the next request");
+        assert!(y(&h, replies[1]) < second.top());
+        assert!(second.bottom() < y(&h, requests[2]), "cards must not collect below a later explanation");
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "ai:card:ordered-2"));
+        super::redesign_tests::screenshots(&mut h, &format!("round-card-order-{}", language.code()));
+        // Simulate the same round remaining on a loaded page and in the live tail.
+        let mut current = records[1].clone();
+        current["stages"][0]["reason"] = json!("Updated live result.");
+        h.app.ai.conversations.get_mut(&photo).unwrap().records.push(current);
+        for _ in 0..4 {
+            h.step();
+        }
+        let status = h.app.run("ai.status", json!({})).unwrap();
+        assert_eq!(status["resultCards"].as_array().unwrap().len(), 2);
+        assert_eq!(status["resultCards"][1]["stages"][0]["reason"], "Updated live result.");
+        assert_eq!(h.painted_text().iter().filter(|text| text.as_str() == "Updated live result.").count(), 1);
+        h.app.ai.conversations.get_mut(&photo).unwrap().messages.push(json!({
+            "role":"user", "display_kind":"round_reverted", "local_round_id":"ordered-0",
+            "local_message_id":"old-round-reverted", "text":"This round's edits were reverted. The photo was restored to its round starting state."
+        }));
+        for _ in 0..4 {
+            h.step();
+        }
+        assert!(rect(&h, "ai:card:ordered-0").bottom() < y(&h, requests[1]), "a later revert notice must not move the old card");
+        assert_eq!(h.app.session.companion_messages_page(photo, 0, 6).unwrap().records, messages);
+    }
+}
+
+#[test]
+fn unassociated_legacy_cards_preserve_archive_order_instead_of_sorting_random_ids() {
+    let (mut h, photo) = headless(vec![
+        json!({"local_round_id":"z-old","stages":[stage("initial",0.0,0.2)]}),
+        json!({"local_round_id":"a-new","stages":[stage("initial",0.2,0.3)]}),
+    ]);
+    let conversation = h.app.ai.conversations.get_mut(&photo).unwrap();
+    for message in conversation.messages.iter_mut().chain(conversation.view.iter_mut().flat_map(|view| view.messages.iter_mut())) {
+        message.as_object_mut().unwrap().remove("local_round_id");
+    }
+    for _ in 0..4 {
+        h.step();
+    }
+    let old = h.app.widgets.iter().find(|(id, _)| id == "ai:card:z-old").unwrap().1;
+    let new = h.app.widgets.iter().find(|(id, _)| id == "ai:card:a-new").unwrap().1;
+    assert!(old.bottom() < new.top());
+}
+
+#[test]
 fn archived_round_has_one_result_card_with_absolute_initial_and_correction_values() {
     let (mut h, _) = headless(vec![
         json!({"local_round_id":"round-card","stages":[stage("initial",0.0,0.35),stage("correction",0.35,0.2)],"local_terminal":"completed"}),
@@ -399,23 +501,16 @@ fn result_cards_are_readable_and_clipped_in_normal_narrow_and_short_tools() {
             }
             let zoom = h.app.ui.zoom;
             let id = "button:aiParameters:layout-card";
-            for _ in 0..80 {
-                if h.app.widgets.iter().any(|(name, rect)| name == id && rect.height() >= 12.0) {
-                    break;
-                }
-                let viewport = h.app.widgets.iter().find(|(id, _)| id == "ai:composer").unwrap().1;
-                h.app.synthetic.push(egui::Event::PointerMoved(egui::pos2(viewport.right() - 2.0, viewport.center().y)));
-                h.app.synthetic.push(egui::Event::MouseWheel {
-                    phase: egui::TouchPhase::Move,
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(0.0, -35.0),
-                    modifiers: egui::Modifiers::NONE,
-                });
-                for _ in 0..4 {
-                    h.step();
-                }
+            super::panel_tests::reachable(&mut h, id, -1.0);
+            for _ in 0..12 {
+                h.step();
             }
-            assert_eq!(h.request("ui.clickWidget", json!({"id":id}), t)["ok"], true, "{layout}");
+            let reply = h.request("ui.clickWidget", json!({"id":id}), t);
+            if reply["ok"] != true {
+                super::redesign_tests::screenshots(&mut h, &format!("debug-card-{layout}"));
+                eprintln!("CARD {layout} {reply} WIDGETS {:?}", h.app.widgets);
+            }
+            assert_eq!(reply["ok"], true, "{layout}: {reply}");
             for _ in 0..4 {
                 h.step();
             }

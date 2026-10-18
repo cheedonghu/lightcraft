@@ -29,6 +29,7 @@ mod health_task_tests;
 mod historical;
 #[cfg(test)]
 mod history_tests;
+mod i18n;
 #[cfg(test)]
 #[path = "ai_companion/identity_tests.rs"]
 mod identity_tests;
@@ -53,12 +54,15 @@ mod paging_tests;
 mod panel_tests;
 #[cfg(test)]
 mod persistence_tests;
+mod presentation;
 mod projection;
 mod reading;
 #[cfg(test)]
 mod reading_tests;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod redesign_tests;
 #[cfg(test)]
 #[path = "ai_companion/revert_tests.rs"]
 mod revert_tests;
@@ -69,7 +73,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::i18n::tr;
+use self::i18n::tr;
 use base64ct::{Base64, Encoding};
 use lightcraft_catalog::PhotoId;
 use lightcraft_develop::DevelopSettings;
@@ -81,6 +85,7 @@ use crate::LightcraftApp;
 
 pub struct State {
     open: bool,
+    settings_open: bool,
     health: health::Health,
     telemetry: network::Telemetry,
     task: Option<task_entry::Task>,
@@ -125,6 +130,7 @@ impl Default for State {
         let (tx, rx) = mpsc::sync_channel(8);
         Self {
             open: false,
+            settings_open: false,
             health: health::Health::default(),
             telemetry: network::Telemetry::default(),
             task: None,
@@ -177,6 +183,7 @@ struct HistoryView {
     fragment_messages: BTreeMap<u64, Value>,
     bytes: usize,
     cards: Vec<card::Card>,
+    process: BTreeMap<String, reading::RoundSummary>,
     diagnostic: Option<String>,
     legacy_plan: Option<Value>,
     legacy_scan: Option<lightcraft_engine::companion::storage::DisplayScan>,
@@ -738,7 +745,23 @@ impl State {
             if !job.plans.is_empty() {
                 conversation.checkpoint = Some(job.checkpoint.clone());
             }
+            let final_message = completed
+                .then(|| {
+                    conversation
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| message["local_round_id"] == job.identity.local_round_id.as_str() && message["role"] == "assistant")
+                        .filter(|message| {
+                            message["tool_calls"].as_array().is_none_or(Vec::is_empty)
+                                && message["text"].as_str().is_some_and(|text| !text.trim().is_empty())
+                        })
+                        .and_then(|message| message["local_message_id"].as_str())
+                        .map(str::to_owned)
+                })
+                .flatten();
             if let Some(record) = conversation.records.iter_mut().find(|r| r["local_round_id"] == job.identity.local_round_id.as_str()) {
+                record["final_message_id"] = json!(final_message);
                 if record.get("local_terminal").is_none() {
                     record["local_terminal"] = json!(if job.stopped { "cancelled" } else { "failed" });
                 }
@@ -761,6 +784,8 @@ impl State {
                 let terminal_notice =
                     record.pointer("/local_failure/message").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| notice.into());
                 record["terminal_notice"] = json!(terminal_notice);
+                log::info!(target: "lightcraft_ui_egui::ai_companion", "round ended: local_round={} terminal={} diagnostic_id={}",
+                    job.identity.local_round_id.as_str(), record["local_terminal"].as_str().unwrap_or("unknown"), errors::trace(record).unwrap_or("unavailable"));
                 record["backend_round_id"] = if job.round.is_empty() { Value::Null } else { json!(job.round) };
             }
             conversation.pending.clear();
@@ -1991,7 +2016,7 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
                 "round": photo.and_then(|p| state.jobs.get(&p)).map(|j| j.round.clone()),
                 "text": if root_protected { tr(ROOT_RECOVERY_GUIDANCE).to_owned() } else { conversation.map(display_text).unwrap_or_else(|| state.text.clone()) },
                 "historyError": history_error,
-                "resultCards": conversation.map(|c| c.view.iter().flat_map(|v| v.cards.iter()).cloned().chain(c.records.iter().filter_map(|r|card::from_record(r,None))).map(|card| present_card(app,&state,viewed_photo.unwrap_or(PhotoId(0)),card)).collect::<Vec<_>>()).unwrap_or_default(),
+                "resultCards": conversation.map(|c| result_cards(c).into_iter().map(|card| present_card(app,&state,viewed_photo.unwrap_or(PhotoId(0)),card)).collect::<Vec<_>>()).unwrap_or_default(),
                 "historyLoading": state.paging.busy() || viewed_photo.is_some_and(|photo| state.paging.awaiting_page(photo)) || conversation.and_then(|c| c.view.as_ref()).is_some_and(|v|v.card_cursor.is_some()),
                 "migrationPending": app.session.companion_migration_pending(),
                 "migrationBusy":app.session.companion_migration_busy(),
@@ -2097,6 +2122,21 @@ pub fn command(app: &mut LightcraftApp, id: &str, params: &Value) -> Option<Resu
     app.ai = state;
     Some(result)
 }
+fn result_cards(conversation: &Conversation) -> Vec<card::Card> {
+    let mut cards: Vec<card::Card> = Vec::new();
+    for card in
+        conversation.view.iter().flat_map(|v| v.cards.iter()).cloned().chain(conversation.records.iter().filter_map(|r| card::from_record(r, None)))
+    {
+        if let Some(existing) = cards.iter_mut().find(|existing| existing.local_round_id == card.local_round_id) {
+            // A live record supersedes its older history-page projection.
+            *existing = card;
+        } else {
+            cards.push(card);
+        }
+    }
+    cards
+}
+
 fn present_card(app: &LightcraftApp, state: &State, photo: PhotoId, card: card::Card) -> card::Card {
     use lightcraft_engine::companion::RoundRevertState;
     let local: Option<LocalRoundId> = serde_json::from_value(json!(card.local_round_id)).ok();
@@ -2279,20 +2319,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     }
     app.ai = state;
     egui::Frame::NONE.inner_margin(egui::Margin::same(12)).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            let heading = ui.heading(tr("AI Assistant"));
-            if let Some(photo) = app.ai.displayed_photo(app).and_then(|id| app.session.catalog.photo(id)) {
-                heading.on_hover_text(photo.file_name.as_str());
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let close = ui.button(tr("Collapse"));
-                crate::widgets::register(ui.ctx(), "button:aiCollapse", close.rect);
-                if close.clicked() {
-                    let _ = app.run("panel.ai", json!({}));
-                }
-            });
-        });
-        ui.separator();
+        presentation::header(app, ui);
         if app.ai.comparison.is_some() {
             ui.label(tr("Historical preview"));
             ui.label(tr("Return to the selected photo before starting a new AI task."));
@@ -2318,23 +2345,15 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         }
         let selection = &app.session.selection;
         let Some(photo) = app.session.active().filter(|_| selection.ids.len() == 1) else {
-            health::show(app, ui, ui.available_height() < 200.0);
             let notice = ui.label(tr("Select exactly one photo to start an AI task."));
             crate::widgets::register(ui.ctx(), "ai:selectionNotice", notice.rect);
             return;
         };
-        if ui.available_height() >= 200.0
-            && let Some(p) = app.session.catalog.photo(photo)
-        {
-            ui.label(p.file_name.as_str());
-        }
-        if ui.available_height() >= 500.0 {
-            ui.label(tr("Understand and naturally optimize your photo. Originals stay on this computer."));
-        }
         let body = ui.available_rect_before_wrap();
         // Measure with a disabled, invisible UI and independent widget IDs. This pass
         // cannot dispatch actions, touch a draft or register control targets.
         let mut measure = ui.new_child(egui::UiBuilder::new().id_salt("ai-composer-measure").max_rect(body).sizing_pass().invisible());
+        measure.set_width(body.width());
         composer(app, &mut measure, photo, false);
         let compact = measure.min_rect().height() + 96.0 > body.height();
         let height = if compact { body.height().max(0.0) } else { measure.min_rect().height() };
@@ -2343,17 +2362,19 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         footer.set_clip_rect(footer_rect.intersect(ui.clip_rect()));
         if compact {
             // Supported short/floating/stacked Tools panes scroll their compact body.
-            // Stop and consent precede the draft; full-size panes retain a fixed footer.
+            // Full-size panes retain a fixed footer; compact panes scroll all controls.
             egui::ScrollArea::vertical()
                 .id_salt(("ai-compact-composer", app.session.library_generation(), photo.0, app.ai.jobs.contains_key(&photo)))
                 .auto_shrink([false, false])
                 .min_scrolled_height(0.0)
                 .max_height(height)
                 .show(&mut footer, |ui| {
-                    composer(app, ui, photo, true);
-                    ui.separator();
-                    message_area(app, ui, photo, 160.0);
-                    health::details(app, ui);
+                    // Keep an outer scroll gutter separate from the nested history.
+                    egui::Frame::NONE.inner_margin(egui::Margin { right: 12, ..Default::default() }).show(ui, |ui| {
+                        composer(app, ui, photo, true);
+                        ui.separator();
+                        message_area(app, ui, photo, height.max(160.0));
+                    });
                 });
         } else {
             composer(app, &mut footer, photo, false);
@@ -2389,13 +2410,6 @@ fn readonly_task_body(app: &mut LightcraftApp, ui: &mut egui::Ui, scope: PhotoSc
     composer_widget(ui, "button:aiSelectedConversation", back.rect);
     if back.clicked() {
         let _ = app.run("ai.returnCurrent", json!({}));
-    }
-    if let Some(trace) = app.ai.conversations.get(&scope.photo).and_then(errors::diagnostic).map(str::to_owned) {
-        let copy = ui.button(tr("Copy Diagnostic ID"));
-        composer_widget(ui, "button:aiCopyTrace", copy.rect);
-        if copy.clicked() {
-            ui.ctx().copy_text(trace);
-        }
     }
     let clear =
         ui.add_enabled(!app.ai.jobs.contains_key(&scope.photo) && !app.ai.worker_busy(scope.photo), egui::Button::new(tr("Delete Conversation")));
@@ -2507,7 +2521,8 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
         });
     let editor = app.ai.editors.get_mut(&photo);
     let tail = editor.as_ref().is_none_or(|e| e.data.follow_tail);
-    let restore = editor.and_then(|e| (ready && std::mem::replace(&mut e.restore_scroll, false)).then_some(e.data.scroll_offset));
+    let restore =
+        editor.and_then(|e| (!ui.is_sizing_pass() && ready && std::mem::replace(&mut e.restore_scroll, false)).then_some(e.data.scroll_offset));
     let mut area = egui::ScrollArea::vertical()
         .id_salt(("ai-messages", app.session.library_generation(), photo.0))
         .auto_shrink([false, false])
@@ -2521,9 +2536,26 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
     }
     let scroll = area.show(ui, |ui| {
         let protected = storage_recovery(app, ui, photo);
-        if let Some(conversation) = app.ai.conversations.get_mut(&photo) {
+        if !protected && presentation::empty(app.ai.conversations.get(&photo)) {
+            presentation::welcome(app, ui, photo);
+        }
+        let mut cards: Vec<_> =
+            app.ai.conversations.get(&photo).into_iter().flat_map(result_cards).map(|card| present_card(app, &app.ai, photo, card)).collect();
+        let navigation_available = app.ai.readonly_task.is_none() && app.session.active() == Some(photo);
+        let mut show_card = |ui: &mut egui::Ui, card: card::Card| match card::show(ui, &card, navigation_available) {
+            Some(card::Action::Compare) => compare = Some(card.local_round_id),
+            Some(card::Action::History) => locate = true,
+            Some(card::Action::Undo) => revert = Some(card.local_round_id),
+            None => {}
+        };
+        if let Some(conversation) = app.ai.conversations.get(&photo) {
             app.ai.attachments.sync(app.session.library_generation(), photo, conversation);
-            reading::show(ui, conversation, &mut app.ai.attachments);
+            let active = app.ai.jobs.get(&photo).map(|job| job.identity.local_round_id.as_str());
+            reading::show(ui, conversation, &mut app.ai.attachments, active, |ui, round| {
+                if let Some(index) = cards.iter().position(|card| card.local_round_id == round) {
+                    show_card(ui, cards.remove(index));
+                }
+            });
             if let Some(preview) = conversation.view.as_ref().and_then(|v| v.preview.as_ref()) {
                 preview_navigation = historical::show(ui, preview, &mut app.ai.attachments);
             }
@@ -2534,21 +2566,9 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
                         legacy::show(ui, conversation.view.as_ref().and_then(|v| v.legacy_plan.as_ref()), conversation.legacy_cursor, total);
                 }
             }
-            let cards: Vec<_> = conversation
-                .view
-                .iter()
-                .flat_map(|v| v.cards.iter())
-                .cloned()
-                .chain(conversation.records.iter().filter_map(|record| card::from_record(record, None)))
-                .collect();
+            // Legacy records without visible message associations remain accessible.
             for card in cards {
-                let card = present_card(app, &app.ai, photo, card);
-                match card::show(ui, &card, app.ai.readonly_task.is_none() && app.session.active() == Some(photo)) {
-                    Some(card::Action::Compare) => compare = Some(card.local_round_id),
-                    Some(card::Action::History) => locate = true,
-                    Some(card::Action::Undo) => revert = Some(card.local_round_id),
-                    None => {}
-                }
+                show_card(ui, card);
             }
         } else if !protected && !app.ai.text.is_empty() {
             ui.label(&app.ai.text);
@@ -2575,7 +2595,21 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
                 || input.smooth_scroll_delta.y > 0.0
                 || (input.pointer.any_down() && app.ai.editors.get(&photo).is_some_and(|e| scroll.state.offset.y + 0.5 < e.data.scroll_offset))
         });
-    if upward_intent {
+    if ui.is_sizing_pass() {
+        return;
+    }
+    if !upward_intent
+        && !tail
+        && let Some(offset) = restore
+        && (scroll.state.offset.y - offset.min((scroll.content_size.y - scroll.inner_rect.height()).max(0.0))).abs() > 0.5
+    {
+        // Egui can clamp against the previous empty viewport on the first layout
+        // after returning to a photo. Retry once its real content size is known.
+        if let Some(editor) = app.ai.editors.get_mut(&photo) {
+            editor.restore_scroll = true;
+        }
+        ui.ctx().request_repaint();
+    } else if upward_intent {
         if app.ai.bottom_reading.remove(&photo) {
             app.ai.paging.cancel();
         }
@@ -2656,116 +2690,79 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
             if app.ai.telemetry.recent_heartbeat() && app.ai.connection.as_ref().is_some_and(|c| c.alive.load(Ordering::Relaxed) && !c.is_closing()) {
                 phase_label.on_hover_text(tr("Connection active; heartbeat acknowledged. Model output is separate."));
             }
-            let stop = ui.button(tr("Stop Generating"));
-            composer_widget(ui, "button:aiStop", stop.rect);
-            if !sizing && stop.clicked() {
-                if let Err(error) = app.run("ai.stop", json!({})) {
-                    app.ai.text = error;
-                }
-                app.ai.defer_local_saves_for_feedback(ui.ctx());
-                app.session.defer_companion_retry(true);
-            }
         } else if worker {
             ui.label(tr("Finishing processing for this photo…"));
         } else if !editor_ready {
             ui.label(tr("Loading draft…"));
-        } else {
-            ui.label(tr("Ready for your request"));
         }
     });
     composer_widget(ui, "ai:stage", stage.response.rect);
     save_recovery(app, ui, photo);
-    if compact {
-        consent_control(app, ui, photo);
-    }
-    if app.session.companion_task_photo() == Some(photo) {
-        ui.label(tr("Manual editing is paused while AI processes this photo; stop it or wait for completion."));
-    }
-    // The draft viewport is fixed, so measuring needs no copy of user text.
-    let mut measured_prompt = String::new();
-    let prompt = if sizing { &mut measured_prompt } else { &mut app.ai.prompt };
-    let input = egui::ScrollArea::vertical()
-        .id_salt(("ai-prompt-scroll", app.session.library_generation(), photo.0))
-        .min_scrolled_height(48.0)
-        .max_height(48.0)
-        .auto_shrink([false, false])
+    consent_control(app, ui, photo);
+    ui.add_space(6.0);
+    let _ = compact;
+    egui::Frame::new()
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+        .corner_radius(14)
+        .inner_margin(12)
         .show(ui, |ui| {
-            ui.add_enabled(
-                !busy && editor_ready,
-                egui::TextEdit::multiline(prompt)
-                    .id_salt(("ai-draft", app.session.library_generation(), photo.0))
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(2)
-                    .hint_text(tr("For example: review this photo, then naturally optimize it")),
-            )
-        });
-    composer_widget(ui, "field:aiPrompt", input.inner_rect);
-    if !sizing && input.inner.changed() {
-        drafts::capture(app);
-    }
-    if !compact {
-        consent_control(app, ui, photo);
-    }
-    health::show(app, ui, compact);
-    // Reserve the optional diagnostic control before a cold history read completes,
-    // so its arrival cannot invalidate a held consent/submit gesture.
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let galley = ui.painter().layout_no_wrap(tr("Copy Diagnostic ID").into(), font, ui.visuals().text_color());
-    let size = egui::vec2(
-        (galley.size().x + 2.0 * ui.spacing().button_padding.x).min(ui.available_width()),
-        ui.spacing().interact_size.y.max(galley.size().y + 2.0 * ui.spacing().button_padding.y),
-    );
-    let (slot, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    // Allocate the child in both states so later buttons retain their egui identities.
-    let mut diagnostic_row = ui.new_child(
-        egui::UiBuilder::new()
-            .id_salt(("ai-diagnostic", app.session.library_generation(), photo.0))
-            .max_rect(slot)
-            .layout(egui::Layout::centered_and_justified(egui::Direction::TopDown)),
-    );
-    if let Some(trace) = app.ai.conversations.get(&photo).and_then(errors::diagnostic).map(str::to_owned) {
-        let copy = diagnostic_row.add(egui::Button::new(tr("Copy Diagnostic ID")));
-        composer_widget(ui, "button:aiCopyTrace", copy.rect);
-        if !sizing && copy.clicked() {
-            ui.ctx().copy_text(trace);
-        }
-    }
-    if !busy {
-        let admission = app.ai.admission(app, None);
-        if let Err(message) = &admission {
-            ui.label(message);
-        }
-        let start = ui.add_enabled(editor_ready && admission.is_ok(), egui::Button::new(tr("Analyze and Optimize")));
-        composer_widget(ui, "button:aiStart", start.rect);
-        if !sizing
-            && start.clicked()
-            && let Err(error) = app.run("ai.start", json!({}))
-        {
-            app.ai.text = error.clone();
-            app.ai.conversations.entry(photo).or_default().notice = error;
-        }
-        ui.horizontal_wrapped(|ui| {
-            let button = ui.add_enabled(
-                !worker
-                    && !app.session.companion_migration_pending()
-                    && app.session.companion_archive_protected_reason().is_none()
-                    && !app
-                        .ai
-                        .conversations
-                        .get(&photo)
-                        .and_then(|conversation| conversation.history_error.as_ref())
-                        .is_some_and(HistoryError::ownership_unknown),
-                egui::Button::new(tr("Delete Conversation")),
-            );
-            composer_widget(ui, "button:aiClear", button.rect);
-            if !sizing
-                && button.clicked()
-                && let Err(error) = app.run("ai.clear", json!({}))
-            {
-                app.ai.conversations.entry(photo).or_default().notice = error;
+            let mut measured_prompt = String::new();
+            let prompt = if sizing { &mut measured_prompt } else { &mut app.ai.prompt };
+            let input = egui::ScrollArea::vertical()
+                .id_salt(("ai-prompt-scroll", app.session.library_generation(), photo.0))
+                .min_scrolled_height(54.0)
+                .max_height(54.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_enabled(
+                        !busy && editor_ready,
+                        egui::TextEdit::multiline(prompt)
+                            .id_salt(("ai-draft", app.session.library_generation(), photo.0))
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(2)
+                            .frame(egui::Frame::NONE.inner_margin(3))
+                            .hint_text(tr("What would you like to change?")),
+                    )
+                });
+            composer_widget(ui, "field:aiPrompt", input.inner.rect.intersect(input.inner_rect));
+            if !sizing && input.inner.changed() {
+                drafts::capture(app);
             }
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if busy {
+                        let stop = presentation::icon(ui, presentation::Icon::Stop, true, tr("Stop Generating"));
+                        composer_widget(ui, "button:aiStop", stop.rect);
+                        if !sizing && stop.clicked() {
+                            if let Err(error) = app.run("ai.stop", json!({})) {
+                                app.ai.text = error;
+                            }
+                            app.ai.defer_local_saves_for_feedback(ui.ctx());
+                            app.session.defer_companion_retry(true);
+                        }
+                    } else {
+                        let admission = app.ai.admission(app, None);
+                        let has_prompt = !app.ai.prompt.trim().is_empty();
+                        let tooltip = if !has_prompt {
+                            tr("Write a request to send")
+                        } else {
+                            admission.as_ref().err().map(String::as_str).unwrap_or(tr("Send request"))
+                        };
+                        let start = presentation::icon(ui, presentation::Icon::Send, editor_ready && has_prompt && admission.is_ok(), tooltip);
+                        composer_widget(ui, "button:aiStart", start.rect);
+                        if !sizing
+                            && start.clicked()
+                            && let Err(error) = app.run("ai.start", json!({}))
+                        {
+                            app.ai.text = error.clone();
+                            app.ai.conversations.entry(photo).or_default().notice = error;
+                        }
+                    }
+                });
+            });
         });
-    }
+    ui.add_space(8.0);
 }
 
 fn consent_control(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {

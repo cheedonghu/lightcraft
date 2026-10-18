@@ -98,6 +98,9 @@ fn real_checkbox_submission_and_other_photo_editing_headless() {
         let clicked = h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
         assert_eq!(clicked["ok"], true, "{clicked}");
         assert!(h.app.ai.consent);
+        h.app.ai.prompt = "Review this photo.".into();
+        super::drafts::capture(&mut h.app);
+        h.step();
         let clicked = h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout);
         assert_eq!(clicked["ok"], true, "{clicked}");
         let request = requests.try_recv().unwrap();

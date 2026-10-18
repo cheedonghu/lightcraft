@@ -76,6 +76,13 @@ pub(super) fn return_current(state: &mut State, app: &mut LightcraftApp) -> Resu
     } else {
         state.sync_editor(app)?;
     }
+    // The selected editor remains active while another task is read-only.
+    // Reapply its saved viewport when that different conversation is dismissed.
+    if let Some(photo) = app.session.active()
+        && let Some(editor) = state.editors.get_mut(&photo)
+    {
+        editor.restore_scroll = true;
+    }
     app.ui.right = crate::state::RightPanel::Ai;
     app.ui.tool.clear();
     state.open = true;

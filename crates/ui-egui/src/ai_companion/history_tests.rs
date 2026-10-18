@@ -197,6 +197,9 @@ fn invalid_history_rejection_is_visible_and_localized_from_real_start_widget() {
         h.step();
         h.step();
         assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
+        h.app.ai.prompt = "Review this photo.".into();
+        super::drafts::capture(&mut h.app);
+        h.step();
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
         h.step();
         assert!(requests.try_recv().is_err());

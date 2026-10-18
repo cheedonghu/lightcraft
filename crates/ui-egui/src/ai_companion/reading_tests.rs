@@ -29,8 +29,192 @@ fn history(messages: &[Value]) -> Headless {
     }
     h
 }
+
 #[test]
-fn saved_history_displays_roles_markdown_and_folds_tool_payload_without_changing_records() {
+fn assistant_markdown_renders_saved_and_streaming_text_without_rewriting_history() {
+    let source = "### Light and shadow\n\nKeep **detail** and *natural colors*.\n\n> Preserve the mood.\n\n---\n\n1. Inspect the highlights\n2. Adjust gently\n\n| Area | Advice |\n| --- | --- |\n| Sky | Preserve texture |\n\n![Preview](https://example.com/preview.jpg)";
+    let messages = vec![
+        json!({"role":"user","text":"### My literal request","local_message_id":"markdown-user"}),
+        json!({"role":"system","text":"### Literal status","local_message_id":"markdown-system"}),
+        json!({"role":"assistant","text":source,"local_message_id":"markdown-assistant"}),
+    ];
+    let mut h = history(&messages);
+    let painted = h.painted_text().join(" ");
+    for expected in [
+        "### My literal request",
+        "### Literal status",
+        "Light and shadow",
+        "detail",
+        "natural colors",
+        "Preserve the mood.",
+        "Area",
+        "Advice",
+        "Preserve texture",
+        "Preview",
+    ] {
+        assert!(painted.contains(expected), "missing {expected}: {painted}");
+    }
+    assert!(!painted.contains("### Light") && !painted.contains("![Preview]"));
+    let photo = h.app.session.active().unwrap();
+    assert_eq!(h.app.session.companion_messages_page(photo, 0, 3).unwrap().records, messages);
+    h.app.ai.conversations.get_mut(&photo).unwrap().pending.insert("stream-markdown".into(), "### Arriving\n\n**still typing".into());
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(h.painted_text().join(" ").contains("Arriving"));
+    h.app.ai.conversations.get_mut(&photo).unwrap().pending.insert("stream-markdown".into(), "### Arriving\n\n**complete**".into());
+    for _ in 0..3 {
+        h.step();
+    }
+    let painted = h.painted_text().join(" ");
+    assert!(painted.contains("complete") && !painted.contains("### Arriving") && !painted.contains("**complete**"));
+    assert_eq!(h.app.session.companion_messages_page(photo, 0, 3).unwrap().records, messages);
+}
+
+#[test]
+fn assistant_markdown_bilingual_panel_fixture() {
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        let text = if language == crate::i18n::Locale::ZhHans {
+            "### 上下两处亮点的视觉拉扯\n\n画面最抓人的是那棵嫩叶与地面被照亮的花丛。可以让其中一方成为**主角**，另一方作为氛围衬托。\n\n### 高光质感与暗部通透度\n\n适度保留亮部纹理，同时让树林中的层次更清晰。\n\n---\n\n### 可以尝试的后期与复拍思路\n\n1. **压住高光**：稍微降低高光与白色色阶。\n2. **理顺视觉引导**：适度提亮局部树干。\n\n> 下次取景时，可以尝试更低的机位。\n\n| 区域 | 调整方向 |\n| --- | --- |\n| 花丛 | 保留高光纹理 |\n| 树林 | 提升暗部层次 |"
+        } else {
+            "### Competing highlights\n\nThe young leaves and illuminated flowers both attract attention. Choose one as the **main subject**, and let the other support the atmosphere.\n\n### Highlight texture and shadow detail\n\nPreserve bright texture while making the woodland layers easier to read.\n\n---\n\n### Editing and shooting ideas\n\n1. **Control highlights**: gently lower highlights and whites.\n2. **Guide attention**: slightly lift a few tree trunks.\n\n> Next time, try a lower camera position.\n\n| Area | Direction |\n| --- | --- |\n| Flowers | Preserve highlight texture |\n| Woodland | Lift shadow detail |"
+        };
+        let mut h = history(&[
+            json!({"role":"user","text":if language == crate::i18n::Locale::ZhHans { "请点评这张照片，给我一些构图和后期调整建议。" } else { "Please review this photo and suggest composition and editing improvements." },"local_message_id":"request-fixture"}),
+            json!({"role":"assistant","text":text,"local_message_id":"markdown-fixture"}),
+        ]);
+        h.app.ui.language = language;
+        for _ in 0..4 {
+            h.step();
+        }
+        if let Ok(dir) = std::env::var("UX24_SCREENSHOT_DIR") {
+            h.app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
+            h.app.services.png = Some(Box::new(|image| {
+                lightcraft_engine::export::encode_image(
+                    image,
+                    &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
+                )
+                .unwrap()
+            }));
+            let reply =
+                h.request("ui.screenshot", json!({"path":format!("{dir}/markdown-{}.png",language.code()),"headless":true}), Duration::from_secs(10));
+            assert_eq!(reply["ok"], true, "{reply}");
+        }
+        assert!(!h.painted_text().join(" ").contains("###"));
+    }
+}
+
+#[test]
+fn chat_requests_align_right_and_replies_left_without_role_labels() {
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        let request = if language == crate::i18n::Locale::ZhHans { "请点评这张照片。" } else { "Review this photo." };
+        let reply = if language == crate::i18n::Locale::ZhHans { "光线自然，保留层次。" } else { "Keep the natural light." };
+        let messages = vec![
+            json!({"role":"user","text":request,"local_message_id":"aligned-user"}),
+            json!({"role":"assistant","text":reply,"local_message_id":"aligned-assistant"}),
+        ];
+        let mut h = history(&messages);
+        h.app.ui.language = language;
+        for width in [1000.0, 1400.0] {
+            h.size.x = width;
+            for _ in 0..5 {
+                h.step();
+            }
+            let painted = h.painted_text();
+            for removed in ["You", "Assistant", "你", "助手", "Ready for your request", "可以输入要求"] {
+                assert!(!painted.iter().any(|text| text == removed), "unexpected label: {removed}");
+            }
+            let rect = |literal: &str| {
+                h.view
+                    .painted_shapes()
+                    .iter()
+                    .find_map(|shape| match shape {
+                        egui::epaint::Shape::Text(text) if text.galley.text() == literal => Some(text.visual_bounding_rect()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("missing chat text: {literal}"))
+            };
+            let user = rect(request);
+            let assistant = rect(reply);
+            let pane = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").unwrap().1;
+            assert!(user.left() > assistant.left() + pane.width() * 0.1, "user={user:?}, assistant={assistant:?}, pane={pane:?}");
+            let bubble = h
+                .view
+                .painted_shapes()
+                .iter()
+                .find_map(|shape| match shape {
+                    egui::epaint::Shape::Rect(rect) if rect.corner_radius == egui::CornerRadius::same(12) && rect.rect.contains_rect(user) => {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let right_anchor = h
+                .view
+                .painted_shapes()
+                .iter()
+                .find_map(|shape| match shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == request => {
+                        assert_eq!(text.galley.job.halign, egui::Align::Max);
+                        Some(text.pos.x)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            // Use the layout anchor: Chinese full stops have blank space after their ink.
+            assert!((bubble.right() - 10.0 - right_anchor).abs() <= 1.0, "request anchor {right_anchor} in {bubble:?}");
+            assert!(user.right() <= pane.right() && assistant.right() <= pane.right());
+            assert!(user.bottom() < assistant.top(), "message order must remain chronological");
+            assert!(h.app.ai.prompt.is_empty(), "opening history must not prefill a request");
+        }
+        let photo = h.app.session.active().unwrap();
+        assert_eq!(h.app.session.companion_messages_page(photo, 0, 2).unwrap().records, messages);
+    }
+}
+
+#[test]
+fn chat_preview_appears_above_right_aligned_text_for_portrait_and_landscape_photos() {
+    for (width, height) in [(80, 120), (160, 80)] {
+        let rgba = lightcraft_raster::Rgba8 { width, height, data: vec![[70, 120, 90, 255]; (width * height) as usize] };
+        let jpeg = lightcraft_engine::export::encode_image(
+            &rgba,
+            &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Jpeg, ..Default::default() },
+        )
+        .unwrap();
+        let request = "Please review my photo.\nAnd its composition.";
+        let message = json!({"role":"user","text":request,"local_message_id":"aligned-preview","images":[{"mime_type":"image/jpeg","data":Base64::encode_string(&jpeg)}]});
+        let mut h = history(&[message]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let image = loop {
+            h.step();
+            if let Some((_, rect)) = h.app.widgets.iter().find(|(id, _)| id == "image:aiAttachment:aligned-preview:0") {
+                break *rect;
+            }
+            assert!(Instant::now() < deadline, "chat preview did not load");
+            std::thread::yield_now();
+        };
+        let text = h
+            .view
+            .painted_shapes()
+            .iter()
+            .find_map(|shape| match shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == request => {
+                    assert_eq!(text.galley.job.halign, egui::Align::Max, "all lines must align right");
+                    Some(text.visual_bounding_rect())
+                }
+                _ => None,
+            })
+            .unwrap();
+        // Glyph bearings can inset visible ink by one pixel from the label's layout edge.
+        assert!((image.right() - text.right()).abs() <= 1.5, "text={text:?}, image={image:?}");
+        assert!(image.bottom() <= text.top(), "the photo must appear before the request: image={image:?}, text={text:?}");
+        assert!((image.width() / image.height() - width as f32 / height as f32).abs() < 0.01);
+        super::redesign_tests::screenshots(&mut h, &format!("photo-before-text-{width}x{height}"));
+    }
+}
+
+#[test]
+fn saved_history_displays_markdown_and_folds_tool_payload_without_changing_records() {
     let messages = vec![
         json!({"role":"user","text":"My request","local_message_id":"u"}),
         json!({"role":"assistant","text":"**Exposure**\n- Preserve sky\n1. Keep detail","local_message_id":"a","tool_calls":[{"id":"t","name":"get_current_state","arguments":"{\"private_payload\":12345}"}]}),
@@ -40,26 +224,59 @@ fn saved_history_displays_roles_markdown_and_folds_tool_payload_without_changing
     ];
     let mut h = history(&messages);
     let text = h.painted_text().join("\n");
-    for expected in [
-        "You",
-        "Assistant",
-        "System",
-        "Execution feedback",
-        "Exposure",
-        "• Preserve sky",
-        "1. Keep detail",
-        "A saved system notice",
-        "Edits applied.",
-    ] {
+    for expected in ["System", "Execution feedback", "Exposure", "Preserve sky", "Keep detail", "A saved system notice", "Edits applied."] {
         assert!(text.contains(expected), "missing {expected}: {text}");
     }
     assert!(!text.contains("**Exposure**"));
+    assert!(text.contains("1."));
     assert!(!text.contains("private_payload") && !text.contains("secret_result") && !text.contains("private_settings"));
     assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiTool:a"}), Duration::from_secs(10))["ok"], true);
     h.step();
-    assert!(h.painted_text().join("\n").contains("get_current_state"));
+    let expanded = h.painted_text().join("\n");
+    assert!(expanded.contains("Read photo settings"));
+    assert!(!expanded.contains("private_payload") && !expanded.contains("get_current_state"));
     let photo = h.app.session.active().unwrap();
     assert_eq!(h.app.session.companion_messages_page(photo, 0, 5).unwrap().records, messages);
+}
+
+#[test]
+fn expanded_tool_activity_never_paints_prompts_arguments_or_raw_results_in_either_language() {
+    let messages = vec![
+        json!({"role":"assistant","text":"Checking the photo.","local_message_id":"tool-summary-call","tool_calls":[
+            {"id":"skill-call","name":"skill","arguments":"{\"skill\":\"private_argument_marker\"}"},
+            {"id":"unknown-call","function":{"name":"private_tool_name_marker","arguments":{"prompt":"private_object_argument_marker"}}}
+        ]}),
+        json!({"role":"tool","local_message_id":"tool-summary-result","tool_call_id":"skill-call","text":"{\"content\":\"private_prompt_marker: internal photography guidance\"}"}),
+        json!({"role":"tool","local_message_id":"tool-summary-unknown","tool_call_id":"unknown-call","text":"private_result_marker: arbitrary tool output"}),
+        json!({"role":"assistant","local_message_id":"public-answer","text":"Keep the natural colors."}),
+    ];
+    for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        let mut h = history(&messages);
+        h.app.ui.language = locale;
+        for _ in 0..4 {
+            h.step();
+        }
+        for id in ["tool-summary-call", "tool-summary-result", "tool-summary-unknown"] {
+            let reply = h.request("ui.clickWidget", json!({"id":format!("button:aiTool:{id}")}), Duration::from_secs(10));
+            assert_eq!(reply["ok"], true, "{reply}");
+            for _ in 0..4 {
+                h.step();
+            }
+            assert!(!h.painted_text().join("\n").contains("private_"), "expanded tool details must remain a user-facing summary");
+        }
+        let text = h.painted_text().join("\n");
+        for label in if locale == crate::i18n::Locale::ZhHans {
+            ["读取摄影指导", "调用照片工具", "工具返回内容已记录。"]
+        } else {
+            ["Read photography guidance", "Use a photo tool", "Tool response recorded."]
+        } {
+            assert!(text.contains(label), "missing {label}: {text}");
+        }
+        assert!(text.contains("Keep the natural colors."));
+        super::redesign_tests::screenshots(&mut h, &format!("tool-summaries-{}", locale.code()));
+        let photo = h.app.session.active().unwrap();
+        assert_eq!(h.app.session.companion_messages_page(photo, 0, 4).unwrap().records, messages, "model context must retain original tool data");
+    }
 }
 
 #[test]
@@ -299,6 +516,13 @@ fn oversized_tool_fragments_stay_folded_and_forward_page_preserves_assistant_rol
         h.app.widgets.iter().find(|(id, _)| id == "button:aiTool:giant-tool").expect("the giant fragment has an explicit folded tool heading").1;
     let viewport = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").unwrap().1;
     assert!(viewport.contains(button.center()));
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiTool:giant-tool"}), Duration::from_secs(10))["ok"], true);
+    for _ in 0..4 {
+        h.step();
+    }
+    let expanded = h.painted_text().join("\n");
+    assert!(expanded.contains("Tool response recorded."));
+    assert!(!expanded.contains("private-tool-json-value"), "paged tool details must not print raw results even when expanded");
     assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryNewer"}), Duration::from_secs(10))["ok"], true);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -310,7 +534,7 @@ fn oversized_tool_fragments_stay_folded_and_forward_page_preserves_assistant_rol
         std::thread::yield_now();
     }
     let text = h.painted_text().join("\n");
-    assert!(text.contains("Assistant") && text.contains("After the tool") && text.contains("• Keep the full history"), "{text}");
+    assert!(text.contains("After the tool") && text.contains("Keep the full history"), "{text}");
     assert!(!text.contains("private-tool-json-value"));
     let photo = h.app.session.active().unwrap();
     assert_eq!(h.app.session.companion_messages_page(photo, 0, 4).unwrap().records, messages);
@@ -440,7 +664,7 @@ fn typed_requests_keep_user_authored_feedback_and_state_markers_visible() {
     let messages = vec![json!({"role":"user","display_kind":"request","local_message_id":"typed-request","text":text})];
     let mut h = history(&messages);
     let paint = h.painted_text().join("\n");
-    assert!(paint.contains("You") && paint.contains("Keep this user sentence."), "typed request text must stay readable: {paint}");
+    assert!(paint.contains("Keep this user sentence."), "typed request text must stay readable: {paint}");
     assert!(!paint.contains("Edits applied.") && !paint.contains("Execution feedback"));
     let status = h.app.run("ai.status", json!({})).unwrap();
     assert!(status["text"].as_str().unwrap().contains(text));
@@ -506,6 +730,10 @@ fn reading_controls_and_input_are_accessible_in_bilingual_tools_layouts() {
             assert!(h.view.painted_shapes().iter().any(|shape|matches!(shape,egui::epaint::Shape::Text(t) if t.opacity_factor>0.0 && t.galley.text()==literal && rect.contains_rect(t.visual_bounding_rect()))),"{layout}/{} return label must fit",locale.code());
             reading_screen(&mut h, &format!("return-{layout}-{}", locale.code()));
             assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiBackToBottom"}), timeout)["ok"], true);
+            super::panel_tests::reachable(&mut h, "field:aiPrompt", 1.0);
+            // The compact pane can still be moving after the return action and
+            // wheel input. Click the settled field rather than its stale rect.
+            assert!(h.settle(timeout));
             super::panel_tests::reachable(&mut h, "field:aiPrompt", 1.0);
             assert_eq!(h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout)["ok"], true);
             assert_eq!(h.request("ui.text", json!({"text":"继续保留自然颜色"}), timeout)["ok"], true);

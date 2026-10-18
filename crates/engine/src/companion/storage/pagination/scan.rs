@@ -319,6 +319,8 @@ impl Fields {
                                             | "local_message_id"
                                             | "photo_id"
                                             | "local_terminal"
+                                            | "final_message_id"
+                                            | "terminal_notice"
                                             | "phase"
                                             | "request_text"
                                             | "submission_seq"
@@ -360,7 +362,10 @@ impl Fields {
                         }
                         // Diagnostics are optional and small. Continue validating the complete
                         // record/digest while ignoring an oversized diagnostic value.
-                        if !self.in_stage && self.name == "trace_id" && self.value.bytes.len() >= 4096 {
+                        if !self.in_stage
+                            && matches!(self.name.as_str(), "trace_id" | "final_message_id" | "terminal_notice")
+                            && self.value.bytes.len() >= 4096
+                        {
                             self.capture = false;
                             self.value.bytes.clear();
                         }

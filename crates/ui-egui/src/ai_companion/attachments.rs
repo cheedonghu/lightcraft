@@ -110,7 +110,9 @@ impl Attachments {
             Some(Preview::Ready(texture, _pixels, _retention)) => {
                 let size = texture.size_vec2();
                 let fitted = size * (rect.width() / size.x).min(rect.height() / size.y);
-                let image_rect = egui::Rect::from_center_size(rect.center(), fitted);
+                let alignment =
+                    if alias.is_some() { egui::Align2::CENTER_CENTER } else { egui::Align2([ui.layout().horizontal_placement(), egui::Align::Min]) };
+                let image_rect = alignment.align_size_within_rect(fitted, rect);
                 ui.painter().image(texture.id(), image_rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
                 composer_widget(ui, &format!("image:aiAttachment:{label}"), image_rect);
                 if let Some(alias) = alias {

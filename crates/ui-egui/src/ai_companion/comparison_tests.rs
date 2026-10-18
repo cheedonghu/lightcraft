@@ -117,6 +117,11 @@ fn actual_crop_case(missing: bool) {
         );
         h.app.run("ai.returnCurrent", json!({})).unwrap();
         h.app.run("ai.bottom", json!({})).unwrap();
+        for _ in 0..5 {
+            h.step();
+        }
+        super::panel_tests::reachable(&mut h, &format!("button:aiProcess:{}", creation.identity.local_round_id.as_str()), 1.0);
+        h.request("ui.clickWidget", json!({"id":format!("button:aiProcess:{}", creation.identity.local_round_id.as_str())}), Duration::from_secs(5));
         let preview = format!("image:aiAttachment:{}-correction:0", creation.identity.local_round_id.as_str());
         let deadline = Instant::now() + Duration::from_secs(5);
         while !h.app.widgets.iter().any(|(id, _)| id == &preview) {
@@ -690,6 +695,12 @@ fn archived_comparison(bounded: bool) {
     assert_eq!(h.app.session.companion_editor(photo).unwrap().draft, "Keep the current unsent draft");
     assert_eq!(h.app.session.develop_of(photo).unwrap(), current);
 
+    if h.app.widgets.iter().any(|(id, _)| id == &format!("button:aiProcess:{}", round.as_str())) {
+        h.request("ui.clickWidget", json!({"id":format!("button:aiProcess:{}",round.as_str())}), Duration::from_secs(5));
+        for _ in 0..5 {
+            h.step();
+        }
+    }
     // A second caller path is the visible card, with a real upward-reading
     // gesture and freshly typed multiline draft rather than default metadata.
     let timeout = Duration::from_secs(5);

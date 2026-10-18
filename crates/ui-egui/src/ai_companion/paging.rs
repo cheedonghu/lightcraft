@@ -25,7 +25,16 @@ struct ReadMessage {
 enum ReadContent {
     Page(
         Result<
-            (Box<HistorySlice>, Vec<card::Card>, Option<String>, Option<String>, Option<Value>, Option<historical::Preview>, BTreeMap<u64, Value>),
+            (
+                Box<HistorySlice>,
+                Vec<card::Card>,
+                Option<String>,
+                Option<String>,
+                Option<Value>,
+                Option<historical::Preview>,
+                BTreeMap<u64, Value>,
+                BTreeMap<String, reading::RoundSummary>,
+            ),
             String,
         >,
     ),
@@ -93,7 +102,7 @@ impl State {
             let recovery_header = message.header.clone();
             self.paging.completed = message.request;
             match message.result {
-                ReadContent::Page(Ok((page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages))) => {
+                ReadContent::Page(Ok((page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages, process))) => {
                     if !page.errors.is_empty() {
                         conversation.history_error = Some(HistoryError::Data(page.errors.join("\n")));
                     }
@@ -109,16 +118,26 @@ impl State {
                         messages: page.records,
                         fragments: page.fragments,
                         bytes: page.bytes,
-                        cards_bytes: fragment_messages
-                            .values()
-                            .map(|v| lightcraft_engine::companion::storage::record_size(v).unwrap_or(usize::MAX))
+                        cards_bytes: process
+                            .iter()
+                            .map(|(id, summary)| id.capacity().saturating_add(summary.bytes()))
                             .fold(0usize, usize::saturating_add)
                             .saturating_add(
-                                cards.iter().map(|c| serde_json::to_vec(c).map_or(usize::MAX, |bytes| bytes.len())).fold(0, usize::saturating_add),
-                            )
-                            .saturating_add(legacy_plan.as_ref().and_then(|p| serde_json::to_vec(p).ok()).map_or(0, |p| p.len()))
-                            .saturating_add(preview.as_ref().map_or(0, historical::Preview::bytes)),
+                                fragment_messages
+                                    .values()
+                                    .map(|v| lightcraft_engine::companion::storage::record_size(v).unwrap_or(usize::MAX))
+                                    .fold(0usize, usize::saturating_add)
+                                    .saturating_add(
+                                        cards
+                                            .iter()
+                                            .map(|c| serde_json::to_vec(c).map_or(usize::MAX, |bytes| bytes.len()))
+                                            .fold(0, usize::saturating_add),
+                                    )
+                                    .saturating_add(legacy_plan.as_ref().and_then(|p| serde_json::to_vec(p).ok()).map_or(0, |p| p.len()))
+                                    .saturating_add(preview.as_ref().map_or(0, historical::Preview::bytes)),
+                            ),
                         cards,
+                        process,
                         fragment_messages,
                         diagnostic,
                         legacy_plan,
@@ -129,6 +148,9 @@ impl State {
                         card_owners: VecDeque::new(),
                         card_scan: None,
                     });
+                    if let Some(trace) = errors::diagnostic(conversation) {
+                        log::info!(target: "lightcraft_ui_egui::ai_companion", "history diagnostic: photo={} diagnostic_id={}", message.scope.photo.0, trace);
+                    }
                     self.accept_page(app, message.scope.photo, message.cursor);
                 }
                 ReadContent::Preview(preview) => {
@@ -155,6 +177,7 @@ impl State {
                         fragment_messages: BTreeMap::new(),
                         bytes: 0,
                         cards: Vec::new(),
+                        process: BTreeMap::new(),
                         diagnostic: None,
                         legacy_plan: None,
                         legacy_scan: None,
@@ -234,6 +257,11 @@ impl State {
                                 let total = if header.record_count > 0 { header.record_count } else { header.round_count };
                                 view.card_cursor = (index + 1 < total).then_some(index + 1);
                                 if record["local_round_id"].as_str().is_some_and(|id| view.card_pending.remove(id)) {
+                                    if let Some(id) = record["local_round_id"].as_str() {
+                                        let summary = reading::RoundSummary::from_record(&record);
+                                        view.cards_bytes = view.cards_bytes.saturating_add(id.len()).saturating_add(summary.bytes());
+                                        view.process.insert(id.to_owned(), summary);
+                                    }
                                     if let Some(trace) = errors::trace(&record) {
                                         view.diagnostic = Some(trace.to_owned());
                                     }
@@ -361,6 +389,7 @@ impl State {
                     let result = reader.slice(request.cursor, 256 * 1024).map_err(|e| e.to_string()).map(|page| {
                         let mut cursor = 0;
                         let mut cards = Vec::new();
+                        let mut process = BTreeMap::new();
                         let mut notice = None;
                         let mut diagnostic = None;
                         let mut fragment_messages = BTreeMap::new();
@@ -397,6 +426,9 @@ impl State {
                             };
                             for record in rounds.records {
                                 if record["local_round_id"].as_str().is_some_and(|id| wanted.remove(id)) {
+                                    if let Some(id) = record["local_round_id"].as_str() {
+                                        process.insert(id.to_owned(), reading::RoundSummary::from_record(&record));
+                                    }
                                     if let Some(trace) = errors::trace(&record) {
                                         diagnostic = Some(trace.to_owned());
                                     }
@@ -427,7 +459,7 @@ impl State {
                         } else {
                             None
                         };
-                        (page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages)
+                        (page, cards, notice, diagnostic, legacy_plan, preview, fragment_messages, process)
                     });
                     if !cancel.load(Ordering::Relaxed) {
                         let recovered = request.recover.then(|| interrupted::read(&mut reader, request.scope)).flatten();
@@ -439,9 +471,11 @@ impl State {
                             header: request.header.clone(),
                             transaction: request.header.transaction_id,
                             cursor: request.cursor,
-                            result: ReadContent::Page(result.map(|(page, cards, notice, diagnostic, legacy_plan, preview, presentation)| {
-                                (Box::new(page), cards, notice, diagnostic, legacy_plan, preview, presentation)
-                            })),
+                            result: ReadContent::Page(result.map(
+                                |(page, cards, notice, diagnostic, legacy_plan, preview, presentation, process)| {
+                                    (Box::new(page), cards, notice, diagnostic, legacy_plan, preview, presentation, process)
+                                },
+                            )),
                         });
                     }
                 })
