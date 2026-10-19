@@ -62,7 +62,7 @@ fn photo_read_progress_replaces_paired_records_and_waits_truthfully_for_model() 
         h.step();
     }
     let painted = h.painted_text().join(" ");
-    assert!(painted.contains("Viewed 1 type of photo information; continuing analysis"), "{painted}");
+    assert!(painted.contains("Viewed 1 info type · ") && painted.contains("; analyzing"), "{painted}");
     assert!(!painted.contains("Viewing photo state") && !painted.contains("Tool response recorded."));
     let progress_widgets: Vec<_> = h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:aiToolSegment:")).collect();
     assert_eq!(progress_widgets.len(), 1, "request and result share one line");
@@ -104,7 +104,11 @@ fn six_read_categories_deduplicate_and_new_body_preserves_separate_guidance_acti
     for _ in 0..4 {
         h.step();
     }
-    assert!(h.painted_text().join(" ").contains("Viewed 6 types of photo information; continuing analysis"), "{:?}", h.painted_text());
+    assert!(
+        h.painted_text().join(" ").contains("Viewed 6 info types · ") && h.painted_text().join(" ").contains("; analyzing"),
+        "{:?}",
+        h.painted_text()
+    );
     events
         .send(network::Event::Server {
             kind: "text.delta".into(),
@@ -118,7 +122,7 @@ fn six_read_categories_deduplicate_and_new_body_preserves_separate_guidance_acti
     }
     let painted = h.painted_text().join(" ");
     assert!(painted.contains("Photography guidance response recorded; continuing analysis"), "{painted}");
-    assert!(painted.contains("Viewed 6 types of photo information") && !painted.contains("Viewed 7"));
+    assert!(painted.contains("Viewed 6 info types · ") && !painted.contains("Viewed 7"));
     assert_eq!(h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:aiToolSegment:")).count(), 2);
     assert!(!painted.contains("private_"));
     events
@@ -149,7 +153,7 @@ fn six_read_categories_deduplicate_and_new_body_preserves_separate_guidance_acti
     for _ in 0..4 {
         h.step();
     }
-    assert!(h.painted_text().join(" ").contains("Viewed 6 types of photo information"));
+    assert!(h.painted_text().join(" ").contains("Viewed 6 info types · "));
 }
 
 #[test]
@@ -190,15 +194,11 @@ fn photo_tool_single_line_stays_within_bilingual_narrow_panel() {
             let segment = h.app.widgets.iter().find(|(id, _)| id.starts_with("button:aiToolSegment:")).unwrap().1;
             assert!(segment.right() <= pane.right() + 1.0, "single-line tool summary must fit: {segment:?} in {pane:?}");
             assert!(segment.height() < 30.0, "one line must stay one line");
-            let expected = if language == crate::i18n::Locale::ZhHans {
-                "已查看 1 项照片信息，正在继续分析"
-            } else {
-                "Viewed 1 type of photo information; continuing analysis"
-            };
+            let expected = if language == crate::i18n::Locale::ZhHans { "查看了 1 项照片信息 · " } else { "Viewed 1 info type · " };
             assert!(h.painted_text().join(" ").contains(expected));
             for shape in h.view.painted_shapes() {
                 if let egui::epaint::Shape::Text(text) = shape
-                    && text.galley.text() == expected
+                    && text.galley.text().starts_with(expected)
                 {
                     assert!(
                         text.visual_bounding_rect().right() <= pane.right() + 1.0,

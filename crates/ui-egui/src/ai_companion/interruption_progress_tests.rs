@@ -17,6 +17,7 @@ fn attempted_read_failure_expands_inline_without_inventing_success_or_fallback()
     let records = h.app.session.companion_messages_page(photo, 0, 20).unwrap().records;
     let result = records.iter().find(|message| message["tool_call_id"] == "sample").unwrap();
     assert_eq!(result["display_outcome"], "failed");
+    assert!(result["display_elapsed_us"].is_u64());
     let feedback: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
     assert_eq!(feedback["executed"], true);
     native_history_tests::outgoing(&mut h, &requests, "/stop");
@@ -197,7 +198,7 @@ fn partial_read_failure_retains_information_and_reason_outside_manually_folded_p
         h.step();
     }
     for (language, count, reason) in [
-        (crate::i18n::Locale::En, "Viewed 1 type of photo information", "Color sampling failed"),
+        (crate::i18n::Locale::En, "Viewed 1 info type", "Color sampling failed"),
         (crate::i18n::Locale::ZhHans, "查看了 1 项照片信息", "颜色取样失败"),
     ] {
         h.app.ui.language = language;
@@ -227,27 +228,29 @@ fn partial_read_failure_retains_information_and_reason_outside_manually_folded_p
 
 #[test]
 fn rejected_read_guard_is_not_an_attempted_tool_failure() {
-    let (mut h, _requests, events, round) = reading_tests::progress_live();
-    let photo = h.app.session.active().unwrap();
-    events.send(network::Event::Server {kind:"message.completed".into(),data:json!({"round_id":"progress-round","stage":"initial","payload":{"message_id":"stale","model_call_id":1,"tool_calls":[{"id":"hist","name":"get_photo_histogram","arguments":{}}]}})}).unwrap();
-    events.send(network::Event::Server {kind:"tool.request".into(),data:json!({"round_id":"progress-round","payload":{"tool_call_id":"hist","tool_request_id":"stale-request","tool_name":"get_photo_histogram","args":{},"expected_revision":h.app.session.photo_revision(photo).saturating_add(1)}})}).unwrap();
-    for _ in 0..6 {
-        h.step();
+    for (name, stale) in [("get_photo_histogram", true), ("unavailable_photo_tool", false)] {
+        let (mut h, _requests, events, round) = reading_tests::progress_live();
+        let photo = h.app.session.active().unwrap();
+        events.send(network::Event::Server {kind:"message.completed".into(),data:json!({"round_id":"progress-round","stage":"initial","payload":{"message_id":"stale","model_call_id":1,"tool_calls":[{"id":"hist","name":name,"arguments":{}}]}})}).unwrap();
+        events.send(network::Event::Server {kind:"tool.request".into(),data:json!({"round_id":"progress-round","payload":{"tool_call_id":"hist","tool_request_id":"stale-request","tool_name":name,"args":{},"expected_revision":h.app.session.photo_revision(photo).saturating_add(u64::from(stale))}})}).unwrap();
+        for _ in 0..6 {
+            h.step();
+        }
+        assert!(
+            !h.app.widgets.iter().any(|(id, _)| id.starts_with("button:aiToolSegment:")),
+            "pre-execution rejection does not claim an actual tool failure"
+        );
+        assert_eq!(h.request("ui.clickWidget", json!({"id":format!("button:aiProcess:{round}")}), Duration::from_secs(10))["ok"], true);
+        for _ in 0..4 {
+            h.step();
+        }
+        let paint = h.painted_text().join(" ");
+        assert!(paint.contains(if stale { "Photo information reading incomplete" } else { "Tool activity" }), "{paint}");
+        assert!(!paint.contains("Reading histogram failed") && !paint.contains("Preparing to") && !paint.contains("Viewed 1"), "{paint}");
+        let messages = h.app.session.companion_messages_page(photo, 0, 20).unwrap().records;
+        let result = messages.iter().find(|message| message["tool_call_id"] == "hist").unwrap();
+        assert!(result.get("display_outcome").is_none() && result.get("display_elapsed_us").is_none());
+        let text: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text["executed"], false);
     }
-    assert!(
-        !h.app.widgets.iter().any(|(id, _)| id.starts_with("button:aiToolSegment:")),
-        "pre-execution rejection does not claim an actual tool failure"
-    );
-    assert_eq!(h.request("ui.clickWidget", json!({"id":format!("button:aiProcess:{round}")}), Duration::from_secs(10))["ok"], true);
-    for _ in 0..4 {
-        h.step();
-    }
-    let paint = h.painted_text().join(" ");
-    assert!(paint.contains("Photo information reading incomplete"), "{paint}");
-    assert!(!paint.contains("Reading histogram failed") && !paint.contains("Preparing to") && !paint.contains("Viewed 1"), "{paint}");
-    let messages = h.app.session.companion_messages_page(photo, 0, 20).unwrap().records;
-    let result = messages.iter().find(|message| message["tool_call_id"] == "hist").unwrap();
-    assert!(result.get("display_outcome").is_none() && result.get("display_elapsed_us").is_none());
-    let text: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
-    assert_eq!(text["executed"], false);
 }

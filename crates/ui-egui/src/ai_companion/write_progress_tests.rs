@@ -61,6 +61,91 @@ fn proposed_adjustments_do_not_claim_local_execution_in_either_language() {
     h.app.run("ai.stop", json!({})).unwrap();
 }
 
+#[test]
+fn continuous_read_and_write_progress_keeps_success_count_during_prepare_apply_and_publish() {
+    fn mixed_caption(h: &mut Headless, name: &str, en: &str, zh: &str) {
+        for (command, locale, state, count) in
+            [("app.language.english", "en", en, "2 types"), ("app.language.simplifiedChinese", "zh-hans", zh, "2 项信息")]
+        {
+            h.app.run(command, json!({})).unwrap();
+            for width in [1000.0, 1400.0] {
+                h.size.x = width;
+                for _ in 0..4 {
+                    h.step();
+                }
+                let pane = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").unwrap().1;
+                let mut found = false;
+                for shape in h.view.painted_shapes() {
+                    if let egui::epaint::Shape::Text(text) = shape
+                        && text.galley.text().contains(state)
+                        && text.galley.text().contains(count)
+                    {
+                        let visible: String = text.galley.rows.iter().flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr)).collect();
+                        assert!(visible.contains(state) && visible.contains(count), "mixed caption must show both facts: {visible}");
+                        assert!(text.visual_bounding_rect().right() <= pane.right() + 1.0);
+                        assert!(
+                            !text
+                                .galley
+                                .text()
+                                .split_whitespace()
+                                .any(|word| word.strip_suffix('s').is_some_and(|number| number.parse::<f64>().is_ok())),
+                            "untimed write cannot produce a complete segment total"
+                        );
+                        found = true;
+                    }
+                }
+                assert!(found, "visible mixed progress {locale}: {:?}", h.painted_text());
+                super::redesign_tests::screenshots(h, &format!("tool-mixed-{name}-{locale}-{width}"));
+            }
+        }
+        h.app.run("app.language.english", json!({})).unwrap();
+        for _ in 0..4 {
+            h.step();
+        }
+    }
+    let (_file, session) = PhotoFile::open();
+    let (mut h, requests, events, create) = live_in(session);
+    let photo = h.app.session.active().unwrap();
+    events
+        .send(network::Event::Server {
+            kind: "round.state".into(),
+            data: json!({"round_id":"write-progress-round","payload":{"state":"analyzing_initial","submission_seq":create.identity.submission_seq,"photo_ref":create.body["photo_ref"]}}),
+        })
+        .unwrap();
+    for (n, name) in ["get_photo_state", "get_photo_histogram"].iter().enumerate() {
+        events.send(network::Event::Server {kind:"message.completed".into(),data:json!({"round_id":"write-progress-round","stage":"initial","payload":{"message_id":format!("read-{n}"),"model_call_id":n+1,"tool_calls":[{"id":format!("read-{n}"),"name":name,"arguments":{}}]}})}).unwrap();
+        events.send(network::Event::Server {kind:"tool.request".into(),data:json!({"round_id":"write-progress-round","payload":{"tool_call_id":format!("read-{n}"),"tool_request_id":format!("request-{n}"),"tool_name":name,"expected_revision":h.app.session.photo_revision(photo)}})}).unwrap();
+        native_history_tests::outgoing(&mut h, &requests, "/tool-results");
+    }
+    proposal(&events, &create, "initial", "mixed-edit", 0.4);
+    for _ in 0..4 {
+        h.step();
+    }
+    let captions: Vec<_> = h.painted_text().into_iter().filter(|text| text.contains("Preparing edits")).collect();
+    assert!(captions.iter().any(|text| text.contains("2 types")), "pending write cannot erase completed reads: {captions:?}");
+    mixed_caption(&mut h, "preparing", "Preparing edits", "准备调整");
+    let (gate, entered) = ReadGate::install(&mut h);
+    plan(&h, &events, "initial", "mixed-edit", 0.4);
+    h.step();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let captions: Vec<_> = h.painted_text().into_iter().filter(|text| text.contains("Applying edits")).collect();
+    assert!(captions.iter().any(|text| text.contains("2 types")), "applying write cannot erase completed reads: {captions:?}");
+    mixed_caption(&mut h, "applying", "Applying edits", "正在应用调整");
+    assert_eq!(h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:aiToolSegment:")).count(), 1, "empty prose keeps one continuous segment");
+    assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.0);
+    gate.release();
+    native_history_tests::outgoing(&mut h, &requests, "/execution");
+    for _ in 0..4 {
+        h.step();
+    }
+    let captions: Vec<_> = h.painted_text().into_iter().filter(|text| text.contains("Applied; confirming")).collect();
+    assert!(captions.iter().any(|text| text.contains("2 types")), "publication cannot erase completed reads: {captions:?}");
+    mixed_caption(&mut h, "published", "Applied; confirming", "已应用，待确认");
+    assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.4);
+    assert!(!h.painted_text().join(" ").contains("Viewed 3"), "writes are not another information category");
+    h.app.run("ai.stop", json!({})).unwrap();
+}
+
 struct PhotoFile(std::path::PathBuf);
 impl PhotoFile {
     fn open() -> (Self, lightcraft_engine::Session) {
@@ -246,7 +331,13 @@ fn uncorrelated_feedback_failure_cannot_claim_every_initial_and_correction_recei
 
 fn open_process(h: &mut Headless, round: &str) {
     if !h.app.widgets.iter().any(|(id, _)| id.starts_with("button:aiToolSegment:")) {
-        assert_eq!(h.request("ui.clickWidget", json!({"id":format!("button:aiProcess:{round}")}), Duration::from_secs(10))["ok"], true);
+        let id = format!("button:aiProcess:{round}");
+        // Automatic failure expansion adds readable content without changing the
+        // reader's scroll intent. Scroll to the actual process before toggling.
+        super::panel_tests::reachable(h, &id, 1.0);
+        if !h.app.widgets.iter().any(|(id, _)| id.starts_with("button:aiToolSegment:")) {
+            assert_eq!(h.request("ui.clickWidget", json!({"id":id}), Duration::from_secs(10))["ok"], true);
+        }
     }
     for _ in 0..4 {
         h.step();

@@ -1070,7 +1070,41 @@ impl State {
     }
     fn tool(&mut self, app: &mut LightcraftApp, photo: PhotoId, payload: &Value) -> Result<(), String> {
         let job = self.jobs.get(&photo).ok_or("AI 轮次已结束。")?;
-        let request = payload.get("tool_request_id").and_then(Value::as_str).ok_or("AI 工具编号缺失。")?;
+        let request = payload.get("tool_request_id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or("AI 工具编号缺失。")?;
+        let id = payload.get("tool_call_id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or("AI 工具关联缺失。")?;
+        let name = payload.get("tool_name").and_then(Value::as_str).ok_or("AI 工具名称缺失。")?;
+        if let Some(conversation) = self.conversations.get(&photo)
+            && let Some(cached) = conversation.messages.iter().find(|message| {
+                message["role"] == "tool"
+                    && message["local_round_id"] == job.identity.local_round_id.as_str()
+                    && message["tool_request_id"] == request
+            })
+        {
+            let original = conversation
+                .records
+                .iter()
+                .find(|record| record["local_round_id"] == job.identity.local_round_id.as_str())
+                .and_then(|record| record["tool_requests"].as_array())
+                .and_then(|requests| requests.iter().find(|fact| fact["tool_request_id"] == request))
+                .ok_or("AI 工具原始记录缺失。")?;
+            let original_revision = original["expected_revision"].as_u64().ok_or("AI 工具原始版本缺失。")?;
+            if cached["tool_call_id"] != id
+                || cached["tool_name"] != name
+                || cached["display_outcome"] != "succeeded"
+                || original["tool_call_id"] != id
+                || original["tool_name"] != name
+                || original["args"] != payload["args"]
+                || payload["expected_revision"].as_u64() != Some(original_revision)
+            {
+                return Err("AI 工具重放身份不匹配。".into());
+            }
+            return self.send(
+                format!("/v1/rounds/{}/tool-results", job.round),
+                json!({"tool_request_id":request,"photo_revision":original_revision,"outcome":"succeeded","result":{"text":cached["text"],"images":cached["images"]}}),
+                0,
+                job.round.clone(),
+            );
+        }
         if let Some(record) = self
             .conversations
             .get_mut(&photo)
@@ -1087,8 +1121,15 @@ impl State {
             return Err("AI 读取版本不匹配。".into());
         }
         let snapshot = job.snapshot.as_ref().ok_or("实际照片预览尚未就绪。")?;
-        let name = payload.get("tool_name").and_then(Value::as_str).ok_or("AI 工具名称缺失。")?;
+        if !matches!(
+            name,
+            "get_photo_state" | "list_edit_controls" | "get_current_preview" | "get_photo_histogram" | "list_manual_masks" | "sample_photo_color"
+        ) {
+            return Err("AI 请求了未开放的工具。".into());
+        }
         let mut images = json!([]);
+        // Time only actual tool dispatch, including an attempted failure.
+        let started = Instant::now();
         let text = (|| -> Result<Value, String> {
             Ok(match name {
                 "get_photo_state" => json!({"photo_revision":job.checkpoint.revision,"settings":job.checkpoint.expected}),
@@ -1114,6 +1155,7 @@ impl State {
                 _ => return Err("AI 请求了未开放的工具。".into()),
             })
         })();
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).ok();
         let result = match &text {
             Ok(text) => json!({"text":text.to_string(),"images":images}),
             Err(error) => {
@@ -1128,20 +1170,20 @@ impl State {
             .get(&photo)
             .and_then(|c| {
                 c.messages.iter().rev().find(|m| {
-                    m.get("tool_calls")
-                        .and_then(Value::as_array)
-                        .is_some_and(|calls| calls.iter().any(|call| call.get("id") == payload.get("tool_call_id")))
+                    m["local_round_id"] == local_round_id.as_str()
+                        && m.get("tool_calls")
+                            .and_then(Value::as_array)
+                            .is_some_and(|calls| calls.iter().any(|call| call.get("id") == payload.get("tool_call_id")))
                 })
             })
             .cloned();
         let stage = association.as_ref().and_then(|m| m.get("stage")).cloned();
         let model_call = association.as_ref().and_then(|m| m.get("model_call_id")).cloned();
-        let id = payload.get("tool_call_id").and_then(Value::as_str).ok_or("AI 工具关联缺失。")?;
         self.conversations
             .get_mut(&photo)
             .ok_or("AI 会话不存在。")?
             .messages
-            .push(json!({"role":"tool","text":result["text"],"images":result["images"],"tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":request,"stage":stage,"model_call_id":model_call,"display_outcome":if text.is_ok(){"succeeded"}else{"failed"},"tool_name":name,"complete_state":"complete","local_message_id":format!("{}-tool-{request}",local_round_id.as_str())}));
+            .push(json!({"role":"tool","text":result["text"],"images":result["images"],"tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":request,"stage":stage,"model_call_id":model_call,"display_outcome":if text.is_ok(){"succeeded"}else{"failed"},"display_elapsed_us":elapsed_us,"tool_name":name,"complete_state":"complete","local_message_id":format!("{}-tool-{request}",local_round_id.as_str())}));
         if let Some(record) =
             self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == local_round_id.as_str()))
             && let Some(fact) = record
