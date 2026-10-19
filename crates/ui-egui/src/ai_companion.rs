@@ -67,6 +67,8 @@ mod redesign_tests;
 #[path = "ai_companion/revert_tests.rs"]
 mod revert_tests;
 mod task_entry;
+#[cfg(test)]
+mod write_progress_tests;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -293,6 +295,21 @@ struct Job {
     plans: BTreeMap<String, Value>,
     stopped: bool,
     inflight_plan: Option<String>,
+}
+impl Job {
+    fn phase_text(&self) -> &'static str {
+        if self.stopped {
+            "Cancelling…"
+        } else if self.inflight_plan.is_some() {
+            "Applying adjustments"
+        } else if (self.state == "awaiting_initial_execution" && !self.plans.is_empty())
+            || (self.state == "awaiting_correction_execution" && self.plans.len() >= 2)
+        {
+            "Waiting for the AI response…"
+        } else {
+            phase_text(&self.state)
+        }
+    }
 }
 impl Drop for Job {
     fn drop(&mut self) {
@@ -742,6 +759,11 @@ impl State {
             c.records.iter().any(|r| r["local_round_id"] == job.identity.local_round_id.as_str() && r["local_terminal"] == "completed")
         });
         if let Some(conversation) = self.conversations.get_mut(&photo) {
+            for message in &mut conversation.messages {
+                if message["local_round_id"] == job.identity.local_round_id.as_str() && message["display_write_state"] == "applying" {
+                    message["display_write_state"] = json!("not_published");
+                }
+            }
             if !job.plans.is_empty() {
                 conversation.checkpoint = Some(job.checkpoint.clone());
             }
@@ -867,7 +889,7 @@ impl State {
                     task.phase = state.clone();
                 }
                 if let Some(conversation) = self.conversations.get_mut(&photo) {
-                    conversation.notice = phase_text(&state).into();
+                    conversation.notice = job.phase_text().into();
                 }
 
                 if let Some(record) = self
@@ -949,18 +971,21 @@ impl State {
                 let before = job.checkpoint.expected.clone();
                 let (display_before, display_target) =
                     card::capture_pair(&before, candidate.as_ref().unwrap_or(before.as_ref()), &snapshot.context.info);
-                let model_call = self
+                let owner = self
                     .conversations
                     .get(&photo)
                     .and_then(|c| {
                         c.messages.iter().rev().find(|m| {
-                            m.get("tool_calls")
-                                .and_then(Value::as_array)
-                                .is_some_and(|calls| calls.iter().any(|call| call.get("id") == payload.get("tool_call_id")))
+                            m["local_round_id"] == local_round_id.as_str()
+                                && data.get("stage").or_else(|| payload.get("stage")).is_none_or(|stage| m.get("stage") == Some(stage))
+                                && m.get("tool_calls")
+                                    .and_then(Value::as_array)
+                                    .is_some_and(|calls| calls.iter().any(|call| call.get("id") == payload.get("tool_call_id")))
                         })
                     })
-                    .and_then(|m| m.get("model_call_id"))
                     .cloned();
+                let model_call = owner.as_ref().and_then(|m| m.get("model_call_id")).cloned();
+                let owner_stage = owner.as_ref().and_then(|m| m.get("stage")).or_else(|| data.get("stage")).or_else(|| payload.get("stage"));
                 if let Some(record) =
                     self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == local_round_id.as_str()))
                     && let Some(stages) = record.get_mut("stages").and_then(Value::as_array_mut)
@@ -972,7 +997,7 @@ impl State {
                         .get_mut(&photo)
                         .ok_or("AI 会话不存在。")?
                         .messages
-                        .push(json!({"role":"tool","text":"plan_proposed; await actual client execution feedback","tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":payload.get("tool_request_id"),"stage":payload.get("stage"),"model_call_id":payload.get("model_call_id"),"complete_state":"complete"}));
+                        .push(json!({"role":"tool","text":"plan_proposed; await actual client execution feedback","tool_call_id":id,"local_round_id":local_round_id,"local_message_id":format!("{}-plan-{plan_id}",local_round_id.as_str()),"tool_request_id":payload.get("tool_request_id"),"stage":owner_stage,"model_call_id":model_call,"complete_state":"complete","display_plan_id":plan_id,"display_write_state":if candidate.is_ok(){"not_executed"}else{"validation_failed"}}));
                 }
                 let candidate = match candidate {
                     Ok(candidate) => candidate,
@@ -983,6 +1008,12 @@ impl State {
                 };
                 self.jobs.get_mut(&photo).ok_or("AI 轮次已结束。")?.inflight_plan = Some(plan_id.into());
                 self.spawn(app, photo, Some(payload.clone()), Arc::new(candidate))?;
+                if let Some(conversation) = self.conversations.get_mut(&photo) {
+                    if let Some(message) = write_progress_mut(conversation, local_round_id.as_str(), plan_id) {
+                        message["display_write_state"] = json!("applying");
+                    }
+                    conversation.notice = "Applying adjustments".into();
+                }
             }
             "round.ended" => {
                 let state = payload.get("terminal_state").and_then(Value::as_str).unwrap_or("failed");
@@ -993,12 +1024,29 @@ impl State {
                     .and_then(|c| c.records.iter().find(|r| r["backend_round_id"] == round))
                     .is_some_and(errors::published);
                 let notice = if state == "completed" { "This round is complete.".to_owned() } else { errors::notice(reason, published) };
+                if let Some(plan_id) = payload.get("last_confirmed_plan_id").and_then(Value::as_str)
+                    && let Some(conversation) = self.conversations.get_mut(&photo)
+                    && let Some(local_round) = self.jobs.get(&photo).map(|job| job.identity.local_round_id.as_str())
+                    && let Some(message) = write_progress_mut(conversation, local_round, plan_id)
+                {
+                    message["display_delivery_state"] = json!("confirmed");
+                }
                 if let Some(record) = self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["backend_round_id"] == round)) {
                     record["local_terminal"] = json!(state);
                     record["backend_terminal"] = json!(payload);
                     record["trace_id"] = data.get("trace_id").cloned().unwrap_or(Value::Null);
                     if let Some(confirmed) = payload.get("last_confirmed_plan_id").and_then(Value::as_str) {
                         record["backend_reported_last_confirmed_plan_id"] = json!(confirmed);
+                        if let Some(step) = record
+                            .get_mut("stages")
+                            .and_then(Value::as_array_mut)
+                            .and_then(|stages| stages.iter_mut().find(|step| step["plan_id"] == confirmed))
+                        {
+                            step["delivery_state"] = json!("confirmed");
+                            if step["execution_outcome"] == "succeeded" {
+                                record["backend_confirmed_plan"] = json!(confirmed);
+                            }
+                        }
                     }
                 }
                 self.finish(photo, &notice);
@@ -1152,6 +1200,11 @@ impl State {
                     let revision = job.checkpoint.revision;
                     let actual = job.checkpoint.expected.clone();
                     let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
+                    if let Some(message) =
+                        plan["plan_id"].as_str().and_then(|plan| write_progress_mut(conversation, identity.local_round_id.as_str(), plan))
+                    {
+                        message["display_write_state"] = json!("render_failed");
+                    }
                     if let Some(step) = conversation
                         .records
                         .iter_mut()
@@ -1216,6 +1269,11 @@ impl State {
             let checkpoint = job.checkpoint.clone();
             let conversation = self.conversations.get_mut(&photo).ok_or("AI 会话不存在。")?;
             conversation.checkpoint = Some(checkpoint.clone());
+            if let Some(message) = write_progress_mut(conversation, identity.local_round_id.as_str(), &plan_id) {
+                message["display_write_state"] = json!("published");
+                message["display_delivery_state"] = json!("pending");
+            }
+            conversation.notice = "Adjustments applied; awaiting confirmation".into();
             if let Some(record) = conversation.records.iter_mut().find(|r| r["local_round_id"] == identity.local_round_id.as_str()) {
                 record["recent_complete_result"] = json!(settings);
                 record["recent_complete_hash"] = json!(settings.hash64());
@@ -1391,6 +1449,14 @@ impl State {
                         && response.get("accepted").and_then(Value::as_bool) == Some(true)
                         && let Some(plan_id) = response.get("_client_execution_plan_id").and_then(Value::as_str)
                     {
+                        if let Some(conversation) = self.conversations.get_mut(&identity.scope.photo)
+                            && let Some(message) = write_progress_mut(conversation, identity.local_round_id.as_str(), plan_id)
+                        {
+                            message["display_delivery_state"] = json!("confirmed");
+                            if conversation.notice == "Adjustments applied; awaiting confirmation" {
+                                conversation.notice = "Adjustments applied".into();
+                            }
+                        }
                         if let Some(record) = self.conversations.get_mut(&identity.scope.photo).and_then(|c| {
                             c.records.iter_mut().find(|r| {
                                 r["local_round_id"] == identity.local_round_id.as_str()
@@ -1448,6 +1514,15 @@ impl State {
                         continue;
                     }
                     if let Err(error) = result {
+                        if path.ends_with("/execution")
+                            && let Some(plan) = error.execution_plan_id.as_deref()
+                            && let Some(conversation) = self.conversations.get_mut(&identity.scope.photo)
+                            && let Some(message) = write_progress_mut(conversation, identity.local_round_id.as_str(), plan)
+                            && message["display_write_state"] == "published"
+                            && message["display_delivery_state"] == "pending"
+                        {
+                            message["display_delivery_state"] = json!("failed");
+                        }
                         if submission != 0 && error.cancelled_before_send {
                             self.finish(identity.scope.photo, "Stopped generating. Keeping the latest complete result.");
                             let _ = self.save(app, identity.scope.photo);
@@ -2632,15 +2707,22 @@ fn message_area(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, heig
     }
 }
 
+fn write_progress_mut<'a>(conversation: &'a mut Conversation, round: &str, plan: &str) -> Option<&'a mut Value> {
+    conversation
+        .messages
+        .iter_mut()
+        .find(|message| message["role"] == "tool" && message["local_round_id"] == round && message["display_plan_id"] == plan)
+}
+
 fn phase_text(phase: &str) -> &'static str {
     match phase {
         "submitting" => "Submitting…",
         "queued" => "Waiting in the queue…",
         "awaiting_input" => "Uploading photo context…",
         "analyzing_initial" => "AI is analyzing the photo…",
-        "awaiting_initial_execution" => "Applying the edit plan…",
+        "awaiting_initial_execution" => "Preparing adjustments",
         "analyzing_review" => "AI is reviewing the result…",
-        "awaiting_correction_execution" => "Applying the correction…",
+        "awaiting_correction_execution" => "Preparing adjustments",
         _ => "Processing this photo…",
     }
 }
@@ -2680,12 +2762,7 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
             }
         } else if busy {
             ui.spinner();
-            let phase = app
-                .ai
-                .jobs
-                .get(&photo)
-                .map(|job| if job.stopped { "Cancelling…" } else { phase_text(&job.state) })
-                .unwrap_or("Processing this photo…");
+            let phase = app.ai.jobs.get(&photo).map(Job::phase_text).unwrap_or("Processing this photo…");
             let phase_label = ui.label(tr(phase));
             if app.ai.telemetry.recent_heartbeat() && app.ai.connection.as_ref().is_some_and(|c| c.alive.load(Ordering::Relaxed) && !c.is_closing()) {
                 phase_label.on_hover_text(tr("Connection active; heartbeat acknowledged. Model output is separate."));
