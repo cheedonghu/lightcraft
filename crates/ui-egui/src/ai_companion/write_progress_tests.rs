@@ -143,7 +143,57 @@ fn continuous_read_and_write_progress_keeps_success_count_during_prepare_apply_a
     mixed_caption(&mut h, "published", "Applied; confirming", "已应用，待确认");
     assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.4);
     assert!(!h.painted_text().join(" ").contains("Viewed 3"), "writes are not another information category");
-    h.app.run("ai.stop", json!({})).unwrap();
+    // The published feedback closes that segment; review prose and its genuine
+    // read must appear afterwards, without inheriting the initial count.
+    events.send(network::Event::Server {kind:"round.state".into(),data:json!({"round_id":"write-progress-round","payload":{"state":"analyzing_review","submission_seq":create.identity.submission_seq,"photo_ref":create.body["photo_ref"]}})}).unwrap();
+    events
+        .send(network::Event::Server {
+            kind: "text.delta".into(),
+            data: json!({"round_id":"write-progress-round","payload":{"message_id":"review-read","delta":"I will inspect the published result."}}),
+        })
+        .unwrap();
+    events.send(network::Event::Server {kind:"message.completed".into(),data:json!({"round_id":"write-progress-round","stage":"review","payload":{"message_id":"review-read","model_call_id":4,"tool_calls":[{"id":"review-preview","name":"get_current_preview","arguments":{}}]}})}).unwrap();
+    events.send(network::Event::Server {kind:"tool.request".into(),data:json!({"round_id":"write-progress-round","payload":{"tool_call_id":"review-preview","tool_request_id":"request-review-preview","tool_name":"get_current_preview","expected_revision":h.app.session.photo_revision(photo)}})}).unwrap();
+    let review = native_history_tests::outgoing(&mut h, &requests, "/tool-results");
+    assert_eq!(review.body["outcome"], "succeeded");
+    for _ in 0..5 {
+        h.step();
+    }
+    let paint = h.painted_text().join(" ");
+    assert!(paint.contains("2 types") && paint.contains("Viewed 1 info type · "), "review has its own successful category: {paint}");
+    assert_eq!(h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:aiToolSegment:")).count(), 2);
+    events
+        .send(network::Event::Server {
+            kind: "text.delta".into(),
+            data: json!({"round_id":"write-progress-round","payload":{"message_id":"final-answer","delta":"The natural exposure is preserved."}}),
+        })
+        .unwrap();
+    events.send(network::Event::Server {kind:"message.completed".into(),data:json!({"round_id":"write-progress-round","stage":"review","payload":{"message_id":"final-answer","model_call_id":5,"tool_calls":[]}})}).unwrap();
+    events
+        .send(network::Event::Server {
+            kind: "round.ended".into(),
+            data: json!({"round_id":"write-progress-round","payload":{"terminal_state":"completed","last_confirmed_plan_id":"plan-mixed-edit"}}),
+        })
+        .unwrap();
+    for _ in 0..5 {
+        h.step();
+    }
+    assert!(!h.app.widgets.iter().any(|(id, _)| id.starts_with("button:aiToolSegment:")), "normal completion folds both segments");
+    assert!(h.painted_text().join(" ").contains("The natural exposure is preserved."));
+    assert_eq!(h.app.run("ai.status", json!({})).unwrap()["resultCards"].as_array().unwrap().len(), 1);
+    for (command, locale) in [("app.language.english", "en"), ("app.language.simplifiedChinese", "zh-hans")] {
+        h.app.run(command, json!({})).unwrap();
+        for width in [1000.0, 1400.0] {
+            h.size.x = width;
+            for _ in 0..4 {
+                h.step();
+            }
+            assert!(h.painted_text().join(" ").contains("The natural exposure is preserved."));
+            super::redesign_tests::screenshots(&mut h, &format!("journey-completed-{locale}-{width}"));
+            let inspect = h.request("ui.inspect", json!({}), Duration::from_secs(10));
+            eprintln!("journey completed {locale} {width}: {}", inspect["result"]["perf"]);
+        }
+    }
 }
 
 struct PhotoFile(std::path::PathBuf);

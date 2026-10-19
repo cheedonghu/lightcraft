@@ -245,7 +245,7 @@ pub(super) fn show(
 fn process(ui: &mut egui::Ui, round: &str, running: bool, has_tools: bool, failures: usize, body: impl FnOnce(&mut egui::Ui)) {
     // Changing the terminal part of the ID resets even a manually opened active
     // group exactly once at completion; subsequent manual expansion is retained.
-    let title = if has_tools { tr("Processing history · contains tool activity") } else { tr("Processing history") };
+    let title = if has_tools { tr("Processing · tool activity") } else { tr("Processing history") };
     let open = progress::open_for_failure(ui, egui::Id::new(("ai-process-failure-open", round, failures)), failures > 0);
     let header = egui::CollapsingHeader::new(progress::single_line(ui, egui::RichText::new(title).weak()))
         .id_salt(("ai-process", round, running))
