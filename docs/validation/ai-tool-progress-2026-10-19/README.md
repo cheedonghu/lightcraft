@@ -186,5 +186,12 @@ range **0.389–0.621 ms**, with the same non-benchmark limitation above.
 
 The unchanged engine pagination source reuses its two passing checks above;
 no whole-workspace, unrelated upstream or extreme-capacity suite was added.
-Parent final recheck of the four dispositions remains pending; the initial
-review findings are not represented as independently rechecked yet.
+Final independent rechecks at source commit `d590386a` confirmed all four
+dispositions. Standards: 0 hard violations and all 3 P3 suggestions resolved.
+Spec: the P2 unexecuted-detail gap resolved with no new deviation. Both axes
+have **0 unresolved findings**. The [full two-axis report](review.md) retains
+the initial reports and independent final source rechecks.
+
+The merger separately reran the new native unexecuted regression (1 passed,
+13.01 s) and interruption family (5 passed, 2.75 s) on the same source tree;
+format and diff checks passed. Other unchanged-tree evidence above is reused.
