@@ -219,8 +219,9 @@ fn invalid_history_rejection_is_visible_and_localized_from_real_start_widget() {
 }
 #[test]
 fn base64_request_budget_stops_before_loading_all_historical_images() {
-    let image = lightcraft_raster::Rgba8::from_fn(170, 170, |x, y| {
-        let mut n = (x + y * 170) as u64 + 0x9e3779b97f4a7c15;
+    // Opaque PNG exports use RGB; keep the fixture above 100 KiB without relying on an alpha channel.
+    let image = lightcraft_raster::Rgba8::from_fn(192, 192, |x, y| {
+        let mut n = (x + y * 192) as u64 + 0x9e3779b97f4a7c15;
         n = (n ^ (n >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
         n = (n ^ (n >> 27)).wrapping_mul(0x94d049bb133111eb);
         n ^= n >> 31;

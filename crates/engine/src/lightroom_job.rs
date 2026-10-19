@@ -329,7 +329,7 @@ fn original_paths(data: &CatalogImport, cancel: &AtomicBool) -> crate::Result<(V
         if !seen.insert(key.clone()) {
             continue;
         }
-        if Path::new(&photo.path).is_file() {
+        if photo.original_is_file() {
             paths.push(photo.path.clone());
         } else {
             missing.insert(key);
@@ -393,6 +393,7 @@ mod tests {
                     keywords: Vec::new(),
                     history: Vec::new(),
                     snapshots: Vec::new(),
+                    original: lightroom_catalog::Original::Local,
                 }],
                 collections: Vec::new(),
                 members: Vec::new(),
@@ -533,6 +534,7 @@ mod tests {
                         serde_json::json!(format!("history-{source_id}-{}", "x".repeat(8 * 1024))),
                     )])],
                     snapshots: Vec::new(),
+                    original: lightroom_catalog::Original::Local,
                 }
             })
             .collect();

@@ -157,13 +157,20 @@ fn token_matches(p: &Photo, tok: &str) -> bool {
             Some((_, v)) => (x - v).abs() < 1e-9,
             None => false,
         };
+        // Fields stored as `f32` compare at f32 precision: 2.8f32 widened to f64 is not 2.8.
+        let cmp32 = |x: f32, s: &str| match num(s) {
+            Some(('>', v)) => x > v as f32,
+            Some(('<', v)) => x < v as f32,
+            Some((_, v)) => x == v as f32,
+            None => false,
+        };
         return match field {
             "rating" | "stars" => cmp(p.rating as f64, val),
             "flag" => Flag::parse(val) == Some(p.flag),
             "label" | "color" => p.label.is_some_and(|l| format!("{l:?}").eq_ignore_ascii_case(val)),
             "iso" => p.meta.iso.is_some_and(|i| cmp(i as f64, val)),
-            "f" | "aperture" => p.meta.aperture.is_some_and(|a| cmp(a as f64, val)),
-            "focal" => p.meta.focal_mm.is_some_and(|a| cmp(a as f64, val)),
+            "f" | "aperture" => p.meta.aperture.is_some_and(|a| cmp32(a, val)),
+            "focal" => p.meta.focal_mm.is_some_and(|a| cmp32(a, val)),
             "camera" => p.meta.camera.to_lowercase().contains(val),
             "lens" => p.meta.lens.to_lowercase().contains(val),
             "keyword" | "kw" => p.meta.keywords.iter().any(|k| crate::keywords::is_under(k, val)),
@@ -173,11 +180,18 @@ fn token_matches(p: &Photo, tok: &str) -> bool {
             "date" => p.captured.as_deref().is_some_and(|c| c.starts_with(val)),
             "copy" | "virtual" => (val == "true" || val == "yes") == p.copy_of.is_some(),
             "name" | "file" => p.file_name.to_lowercase().contains(val),
-            _ => false,
+            // Not a known field: the colon is part of a plain word ("10:30", "Re:").
+            _ => text_matches(p, &t),
         };
     }
+    text_matches(p, &t)
+}
+
+/// Whether the lower-cased word `t` is in the file name, title, caption, camera, lens, location,
+/// format or a keyword of `p`.
+fn text_matches(p: &Photo, t: &str) -> bool {
     let hay = [&p.file_name, &p.meta.title, &p.meta.caption, &p.meta.camera, &p.meta.lens, &p.meta.location, &p.format];
-    hay.iter().any(|h| h.to_lowercase().contains(&t)) || p.meta.keywords.iter().any(|k| k.to_lowercase().contains(&t))
+    hay.iter().any(|h| h.to_lowercase().contains(t)) || p.meta.keywords.iter().any(|k| k.to_lowercase().contains(t))
 }
 
 /// Whether `p` has a named face region called `name` (case-insensitive).

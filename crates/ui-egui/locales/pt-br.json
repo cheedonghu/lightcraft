@@ -2231,5 +2231,11 @@
   "a ResNet-100 model": "a ResNet-100 model",
   "its own repository": "its own repository",
   "or drop a .onnx file on the window": "or drop a .onnx file on the window",
-  "the detector": "the detector"
+  "the detector": "the detector",
+  "Include selected photos": "Incluir fotos selecionadas",
+  "Color Overlay": "Sobreposição de cor",
+  "Color Overlay on B&W": "Sobreposição de cor em P&B",
+  "Image on Black": "Imagem sobre preto",
+  "Image on White": "Imagem sobre branco",
+  "White on Black": "Branco sobre preto"
 }
