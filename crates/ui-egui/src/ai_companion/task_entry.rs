@@ -93,6 +93,11 @@ pub(super) fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let Some(task) = app.ai.task.as_ref().filter(|t| t.identity.scope.library_generation == app.session.library_generation()) else {
         return;
     };
+    // The open assistant already names the photo and carries the only task status. The global
+    // strip remains for the closed panel and for another photo, where it is the only entry.
+    if app.ui.right == crate::state::RightPanel::Ai && app.session.active() == Some(task.identity.scope.photo) {
+        return;
+    }
     let name = task.name.clone();
     let stopped = app.ai.jobs.get(&task.identity.scope.photo).is_some_and(|j| j.stopped);
     let stage = tr(if task.terminal.is_some() {

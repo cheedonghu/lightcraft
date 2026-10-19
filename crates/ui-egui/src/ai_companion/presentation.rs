@@ -52,7 +52,9 @@ pub(super) fn icon(ui: &mut egui::Ui, icon: Icon, enabled: bool, label: &str) ->
 
 pub(super) fn header(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        ui.heading(tr("AI Assistant"));
+        let icon_reserve = 2.0 * 26.0 + 3.0 * ui.spacing().item_spacing.x;
+        let name_width = (ui.available_width() - icon_reserve - 40.0).clamp(56.0, 88.0);
+        ui.add_sized([name_width, 22.0], egui::Label::new(egui::RichText::new(tr("AI Assistant")).heading()).truncate());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let close = icon(ui, Icon::Collapse, true, tr("Collapse"));
             composer_widget(ui, "button:aiCollapse", close.rect);
@@ -87,7 +89,11 @@ fn settings(app: &mut LightcraftApp, ctx: &egui::Context) {
         .default_pos(egui::pos2((ctx.content_rect().right() - 416.0).max(12.0), 80.0))
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
-            settings_section(ui, "AI service", |ui| health::show(app, ui));
+            settings_section(ui, "AI service", |ui| {
+                health::show(app, ui);
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(egui::RichText::new(tr("AI analysis sends a compressed preview to the cloud model.")).small().weak()).wrap());
+            });
             if app.ai.readonly_task.is_none()
                 && let Some(photo) = app.session.active().filter(|_| app.session.selection.ids.len() == 1)
             {

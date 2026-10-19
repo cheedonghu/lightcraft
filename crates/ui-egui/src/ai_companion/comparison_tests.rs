@@ -70,7 +70,6 @@ fn actual_crop_case(missing: bool) {
             std::thread::yield_now();
         }
     }
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(5))["ok"], true);
     h.app.run("ai.start", json!({"prompt":"Crop and mirror naturally."})).unwrap();
     let creation = request(&mut h, &requests, "/v1/rounds");
     let phase = |name: &str| {
@@ -572,7 +571,7 @@ fn archived_comparison(bounded: bool) {
         .save_companion_conversation(
             photo,
             json!({"schema_version":2,"messages":[
-                {"role":"user","text":"Saved request","local_round_id":round,"local_message_id":before_id,"display_kind":"request","complete_state":"complete","images":[image(640,320,[210,40,40,255])]},
+                {"role":"user","text":format!("Saved request\n{}", "A long saved reading line.\n".repeat(120)),"local_round_id":round,"local_message_id":before_id,"display_kind":"request","complete_state":"complete","images":[image(640,320,[210,40,40,255])]},
                 {"role":"user","text":"Saved complete execution","local_round_id":round,"local_message_id":after_id,"display_kind":"execution_feedback","complete_state":"complete","images":[image(320,640,[40,40,210,255])]}
             ],"rounds":[],"round_records":[{"local_round_id":round,"photo_id":photo.0,"before_preview_message_id":before_id,"original":original,"recent_complete_result":actual,"recent_complete_hash":actual.hash64(),"local_terminal":"completed","stages":[{"stage":"initial","plan_id":"saved-initial","reason":"Natural exposure","before_state":original,"applied_state":actual,"locally_published":true,"execution_outcome":"succeeded","preview_message_id":after_id}]}]}),
         )

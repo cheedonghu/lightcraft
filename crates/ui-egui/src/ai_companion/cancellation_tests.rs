@@ -1,49 +1,6 @@
 use super::*;
 
 #[test]
-fn revoke_then_reconsent_never_revives_the_old_submission_or_content() {
-    let (mut app, mut state, photo, requests, events) = super::identity_tests::started();
-    let identity = state.jobs.get(&photo).unwrap().identity.clone();
-    let gate = state.jobs.get(&photo).unwrap().cancel.clone();
-    state.conversations.get_mut(&photo).unwrap().pending.insert("partial".into(), "unconfirmed".into());
-    let start = std::time::Instant::now();
-    state.set_consent(false).unwrap();
-    assert!(start.elapsed() < Duration::from_secs(1));
-    assert!(!state.consent);
-    assert!(gate.load(Ordering::Relaxed));
-    assert!(state.conversations.get(&photo).unwrap().pending.is_empty());
-    state.set_consent(true).unwrap();
-    assert!(gate.load(Ordering::Relaxed));
-    assert!(state.start(&mut app).is_err(), "unknown submission still owns its identity");
-    assert!(state.send("/v1/rounds/unknown/input".into(), json!({"preview":"must not upload"}), identity.submission_seq, String::new()).is_err());
-    let mut cancelled: network::RequestFailure = "cancelled before any delivery".into();
-    cancelled.cancelled_before_send = true;
-    events
-        .try_send(network::Event::Response {
-            submission: identity.submission_seq,
-            round: String::new(),
-            path: "/v1/rounds".into(),
-            identity: identity.clone(),
-            result: Err(cancelled),
-        })
-        .unwrap();
-    super::identity_tests::poll_after_feedback(&mut state, &mut app);
-    assert!(!state.jobs.contains_key(&photo));
-    assert!(app.session.companion_task_photo().is_none());
-    let notice = state.conversations.get(&photo).unwrap().notice.clone();
-    events
-        .try_send(network::Event::Server { kind: "round.ended".into(), data: json!({"round_id":"old","payload":{"terminal_state":"completed"}}) })
-        .unwrap();
-    state.poll_inner(&mut app, &egui::Context::default());
-    assert_eq!(state.conversations.get(&photo).unwrap().notice, notice, "closed only once");
-    state.start(&mut app).unwrap();
-    let next = requests.try_recv().unwrap();
-    assert_ne!(next.identity.local_round_id, identity.local_round_id);
-    assert!(!next.cancel.load(Ordering::Relaxed));
-    assert!(gate.load(Ordering::Relaxed));
-}
-
-#[test]
 fn uncertain_creation_blocks_new_tasks_until_the_old_connection_workers_close() {
     let (mut app, mut state, photo, requests, events) = super::identity_tests::started();
     let identity = state.jobs.get(&photo).unwrap().identity.clone();
@@ -67,120 +24,6 @@ fn uncertain_creation_blocks_new_tasks_until_the_old_connection_workers_close() 
     state.poll_inner(&mut app, &egui::Context::default());
     assert!(state.jobs.is_empty());
     assert!(app.session.companion_task_photo().is_none());
-}
-
-#[test]
-fn actual_checkbox_can_revoke_during_a_queued_task_in_both_locales() {
-    for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
-        let (mut app, state, photo, requests, events) = super::identity_tests::started();
-        app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
-        app.services.png = Some(Box::new(|img| {
-            lightcraft_engine::export::encode_image(
-                img,
-                &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
-            )
-            .unwrap()
-        }));
-        app.ai = state;
-        app.run("ai.open", json!({})).unwrap();
-        app.ui.settings.gpu = false;
-        app.ui.language = locale;
-        let identity = app.ai.jobs.get(&photo).unwrap().identity.clone();
-        let gate = app.ai.jobs.get(&photo).unwrap().cancel.clone();
-        events.try_send(network::Event::Server { kind: "round.state".into(), data: json!({"round_id":"round","payload":{"submission_seq":identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":identity.scope.library_generation},"state":"queued"}}) }).unwrap();
-        let mut h = crate::headless::Headless::new(app, [1600.0, 1000.0], 1.0);
-        h.step();
-        h.step();
-        let timeout = Duration::from_secs(10);
-        let before = h.app.session.develop_of(photo).unwrap();
-        if let Ok(dir) = std::env::var("UX04_SCREENSHOT_DIR") {
-            let shot = h.request("ui.screenshot", json!({"path":format!("{dir}/queued-{}.png",locale.code()),"headless":true}), timeout);
-            assert_eq!(shot["ok"], true, "{shot}");
-        }
-        let clicked = h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
-        assert_eq!(clicked["ok"], true, "{clicked}");
-        assert!(!h.app.ai.consent);
-        assert!(gate.load(Ordering::Relaxed));
-        let stop = requests.try_recv().unwrap();
-        assert!(stop.path.ends_with("/stop"));
-        assert_eq!(h.app.session.develop_of(photo).unwrap(), before);
-        assert!(!h.app.ai.jobs.contains_key(&photo));
-        h.step();
-        h.step();
-        let saved = h.app.session.photo_companion(photo).unwrap().unwrap();
-        assert_eq!(saved["round_records"][0]["local_terminal"], "cancelled", "checkbox cancellation must save its truthful terminal record");
-        if let Ok(dir) = std::env::var("UX04_SCREENSHOT_DIR") {
-            h.step();
-            h.step();
-            let shot = h.request("ui.screenshot", json!({"path":format!("{dir}/revoked-{}.png",locale.code()),"headless":true}), timeout);
-            assert_eq!(shot["ok"], true, "{shot}");
-            let inspect = h.request("ui.inspect", json!({}), timeout);
-            assert_eq!(inspect["ok"], true);
-            std::fs::write(format!("{dir}/revoked-{}.json", locale.code()), serde_json::to_vec_pretty(&inspect).unwrap()).unwrap();
-        }
-    }
-}
-
-#[test]
-fn candidate_publish_before_or_after_revocation_obeys_local_order_and_keeps_real_success() {
-    for correction in [false, true] {
-        for publish_first in [false, true] {
-            let (mut app, mut state, photo, requests, _) = super::identity_tests::started();
-            let identity = state.jobs.get(&photo).unwrap().identity.clone();
-            let original = app.session.develop_of(photo).unwrap();
-            let ctx = egui::Context::default();
-            let event = |phase: &str| json!({"round_id":"round","payload":{"submission_seq":identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":identity.scope.library_generation},"state":phase}});
-            state.server(&mut app, &ctx, "round.state", &event("awaiting_input")).unwrap();
-            let initial = state.rx.recv_timeout(Duration::from_secs(30)).unwrap();
-            state.prepared(&mut app, &ctx, initial).unwrap();
-            requests.try_recv().unwrap();
-            if correction {
-                state.server(&mut app, &ctx, "round.state", &event("awaiting_initial_execution")).unwrap();
-                let revision = app.session.photo_revision(photo);
-                state.server(&mut app, &ctx, "edit.plan", &json!({"round_id":"round","payload":{"plan_id":"before-correction","capability_version":"lightcraft-v2","expected_revision":revision,"operations":[{"type":"set_controls","values":{"light.exposure":0.4}}]}})).unwrap();
-                let first = state.rx.recv_timeout(Duration::from_secs(30)).unwrap();
-                state.prepared(&mut app, &ctx, first).unwrap();
-                requests.try_recv().unwrap();
-            }
-            let original = if correction { app.session.develop_of(photo).unwrap() } else { original };
-            let exposure = if correction { 0.2 } else { 0.4 };
-            state
-                .server(
-                    &mut app,
-                    &ctx,
-                    "round.state",
-                    &event(if correction { "awaiting_correction_execution" } else { "awaiting_initial_execution" }),
-                )
-                .unwrap();
-            let revision = app.session.photo_revision(photo);
-            state.server(&mut app, &ctx, "edit.plan", &json!({"round_id":"round","payload":{"plan_id":"initial","capability_version":"lightcraft-v2","expected_revision":revision,"operations":[{"type":"set_controls","values":{"light.exposure":exposure}}]}})).unwrap();
-            let candidate = state.rx.recv_timeout(Duration::from_secs(30)).unwrap();
-            let gate = state.jobs.get(&photo).unwrap().cancel.clone();
-            if publish_first {
-                state.prepared(&mut app, &ctx, candidate).unwrap();
-                assert_eq!(app.session.develop_of(photo).unwrap().light.exposure, exposure);
-                let feedback = requests.try_recv().unwrap();
-                assert!(feedback.path.ends_with("/execution"));
-                state.set_consent(false).unwrap();
-                assert!(feedback.cancel.load(Ordering::Relaxed), "unsent actual feedback also stops uploading without reverting success");
-            } else {
-                state.set_consent(false).unwrap();
-                state.prepared(&mut app, &ctx, candidate).unwrap();
-                assert_eq!(app.session.develop_of(photo).unwrap(), original);
-            }
-            assert!(gate.load(Ordering::Relaxed));
-            assert!(!state.jobs.contains_key(&photo));
-            assert!(requests.try_recv().unwrap().path.ends_with("/stop"));
-            let kept = app.session.develop_of(photo).unwrap();
-            let notice = state.conversations.get(&photo).unwrap().notice.clone();
-            state.server(&mut app, &ctx, "edit.plan", &json!({"round_id":"round","payload":{"plan_id":"late"}})).unwrap();
-            state.server(&mut app, &ctx, "round.ended", &json!({"round_id":"round","payload":{"terminal_state":"completed"}})).unwrap();
-            assert_eq!(app.session.develop_of(photo).unwrap(), kept);
-            assert_eq!(state.conversations.get(&photo).unwrap().notice, notice);
-            assert!(requests.try_recv().is_err());
-            state.save(&mut app, photo).unwrap();
-        }
-    }
 }
 
 #[test]
@@ -214,48 +57,6 @@ fn backend_photo_busy_has_only_an_explicit_fresh_manual_retry() {
     assert_ne!(fresh.identity.local_round_id, previous.local_round_id);
     assert_ne!(fresh.identity.submission_seq, previous.submission_seq);
     assert!(fresh.body.get("plan_id").is_none());
-}
-
-#[test]
-fn actual_checkbox_shows_cancelling_until_an_unadmitted_submission_is_safe() {
-    for locale in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
-        let (mut app, state, photo, _, _) = super::identity_tests::started();
-        app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
-        app.services.png = Some(Box::new(|img| {
-            lightcraft_engine::export::encode_image(
-                img,
-                &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
-            )
-            .unwrap()
-        }));
-        app.ai = state;
-        app.run("ai.open", json!({})).unwrap();
-        app.ui.settings.gpu = false;
-        app.ui.language = locale;
-        let gate = app.ai.jobs.get(&photo).unwrap().cancel.clone();
-        let mut h = crate::headless::Headless::new(app, [1600.0, 1000.0], 1.0);
-        let timeout = Duration::from_secs(10);
-        h.step();
-        h.step();
-        let clicked = h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
-        assert_eq!(clicked["ok"], true, "{clicked}");
-        assert!(!h.app.ai.consent);
-        assert!(gate.load(Ordering::Relaxed));
-        assert!(h.app.ai.jobs.get(&photo).unwrap().stopped);
-        assert_eq!(h.app.session.companion_task_photo(), Some(photo));
-        h.step();
-        h.step();
-        assert!(h.painted_text().iter().any(|text| text.contains(locale.tr("Cancelling…"))));
-        if let Ok(dir) = std::env::var("UX04_SCREENSHOT_DIR") {
-            let shot = h.request("ui.screenshot", json!({"path":format!("{dir}/cancelling-{}.png",locale.code()),"headless":true}), timeout);
-            assert_eq!(shot["ok"], true, "{shot}");
-        }
-        let clicked = h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
-        assert_eq!(clicked["ok"], true, "{clicked}");
-        assert!(h.app.ai.consent);
-        assert!(gate.load(Ordering::Relaxed));
-        assert!(h.app.run("ai.start", json!({})).is_err());
-    }
 }
 
 fn full_production_feedback_barrier(route: &str, prior_dirty: bool) {
@@ -309,7 +110,6 @@ fn full_production_feedback_barrier(route: &str, prior_dirty: bool) {
             "UI feedback storage barrier".into()
         }
     }
-    let revoke = route == "consent";
     {
         let catalog = MemStore::new();
         let files = MemStore::new();
@@ -342,8 +142,7 @@ fn full_production_feedback_barrier(route: &str, prior_dirty: bool) {
         let mut app = LightcraftApp::new(session, crate::Services::default());
         let photo = app.session.active().unwrap();
         let (connection, requests, _) = network::test_connection();
-        app.ai =
-            State { open: true, consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+        app.ai = State { open: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
         let mut state = std::mem::take(&mut app.ai);
         state.start(&mut app).unwrap();
         requests.try_recv().unwrap();
@@ -364,7 +163,7 @@ fn full_production_feedback_barrier(route: &str, prior_dirty: bool) {
                 app.ui(ui);
             });
         }
-        let widget = if revoke { "checkbox:aiConsent" } else { "button:aiStop" };
+        let widget = "button:aiStop";
         let pos = app.widgets.iter().find(|(id, _)| id == widget).unwrap().1.center();
         view.run(raw(vec![egui::Event::PointerMoved(pos)]), |ui| {
             app.logic(ui.ctx());
@@ -418,7 +217,6 @@ fn full_production_feedback_barrier(route: &str, prior_dirty: bool) {
         assert!(began.elapsed() < Duration::from_secs(1), "stop feedback must not wait for disk");
         assert!(gate.load(Ordering::Relaxed));
         assert!(app.ai.jobs.is_empty());
-        assert_eq!(app.ai.consent, !revoke);
         let painted_text = view.painted_text();
         assert!(painted_text.iter().any(|t| t.contains("Keeping the latest complete result")), "route={route}; painted={painted_text:?}");
         assert!(entered_rx.try_recv().is_err(), "no storage started in the feedback frame");
@@ -477,9 +275,8 @@ fn full_production_feedback_barrier(route: &str, prior_dirty: bool) {
 }
 
 #[test]
-fn full_app_dirty_retry_cannot_block_stop_or_revoke_feedback_on_discard() {
+fn full_app_dirty_retry_cannot_block_stop_feedback_on_discard() {
     full_production_feedback_barrier("stop", true);
-    full_production_feedback_barrier("consent", true);
 }
 #[test]
 fn full_app_control_stop_defers_storage_until_its_feedback_frame_completes() {
@@ -491,7 +288,8 @@ fn cancelled_job_removed_from_active_map_still_flushes_before_library_change() {
     let (mut app, mut state, photo, _, _) = super::identity_tests::started();
     let identity = state.jobs.get(&photo).unwrap().identity.clone();
     state.server(&mut app, &egui::Context::default(), "round.state", &json!({"round_id":"round","payload":{"submission_seq":identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":identity.scope.library_generation},"state":"queued"}})).unwrap();
-    state.set_consent(false).unwrap();
+    state.pending_local_saves.insert(photo);
+    state.stop(photo).unwrap();
     assert!(state.jobs.is_empty());
     assert!(state.pending_local_saves.contains(&photo));
     app.ai = state;

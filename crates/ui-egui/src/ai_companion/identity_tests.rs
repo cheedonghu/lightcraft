@@ -5,7 +5,7 @@ pub(super) fn started() -> (LightcraftApp, State, PhotoId, mpsc::Receiver<networ
     let mut app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), crate::Services::default());
     let photo = app.session.active().unwrap();
     let (connection, requests, events) = network::test_connection();
-    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    let mut state = State { generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
     let response = state.start(&mut app).unwrap();
     let request = requests.try_recv().unwrap();
     assert_eq!(request.path, "/v1/rounds");

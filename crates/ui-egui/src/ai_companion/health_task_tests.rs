@@ -37,10 +37,23 @@ fn global_entry_keeps_original_photo_after_background_completion_and_only_click_
     let mut h = Headless::new(app, [1000.0, 680.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     frames(&mut h);
-    request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
     let photo = h.app.session.active().unwrap();
     let name = h.app.session.catalog.photo(photo).unwrap().file_name.clone();
     h.app.run("ai.start", json!({"prompt":"Explain my original photo"})).unwrap();
+    frames(&mut h);
+    assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"), "open Tools header owns the only task strip");
+    request(&mut h, "ui.clickWidget", json!({"id":"button:aiCollapse"}));
+    frames(&mut h);
+    assert!(h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"), "collapsed Tools restores the global task strip");
+    request(&mut h, "ui.clickWidget", json!({"id":"icon:ai"}));
+    frames(&mut h);
+    assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"), "reopened Tools owns the task strip again");
+    h.app.ui.right = crate::state::RightPanel::Edit;
+    frames(&mut h);
+    assert!(h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"), "another right panel restores the task strip");
+    h.app.ui.right = crate::state::RightPanel::Ai;
+    frames(&mut h);
+    assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"));
     let create = requests.recv_timeout(Duration::from_secs(1)).unwrap();
     let other = h.app.session.catalog.photos().find(|p| p.id != photo).unwrap().id;
     h.app.run("panel.close", json!({})).unwrap();
@@ -91,7 +104,6 @@ fn failed_round_explains_actual_untouched_photo_and_keeps_trace_out_of_user_cont
     let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     frames(&mut h);
-    request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
     let photo = h.app.session.active().unwrap();
     let original = h.app.session.develop_of(photo).unwrap();
     h.app.run("ai.start", json!({"prompt":"Improve my photo"})).unwrap();
@@ -117,7 +129,6 @@ fn explicit_disconnect_ends_global_progress_and_explains_manual_recovery() {
     let mut h = Headless::new(app, [1000.0, 680.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     frames(&mut h);
-    request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
     let photo = h.app.session.active().unwrap();
     let original = h.app.session.develop_of(photo).unwrap();
     h.app.run("ai.start", json!({"prompt":"Explain this photo"})).unwrap();
@@ -144,7 +155,6 @@ fn deleted_task_photo_opens_its_readonly_conversation_without_selecting_another_
     let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     frames(&mut h);
-    request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
     let photo = h.app.session.active().unwrap();
     let other = h.app.session.catalog.photos().find(|p| p.id != photo).unwrap().id;
     h.app.run("ai.start", json!({"prompt":"Original task photo request"})).unwrap();
@@ -444,7 +454,6 @@ fn native_acknowledged_heartbeats_keep_silent_model_analysis_alive_after_thirty_
     let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     frames(&mut h);
-    request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
     h.app.run("ai.start", json!({"prompt":"silent analysis of the current photo"})).unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -501,61 +510,6 @@ fn native_acknowledged_heartbeats_keep_silent_model_analysis_alive_after_thirty_
     assert_eq!(server.requests.lock().unwrap().iter().filter(|p| p.starts_with("POST /v1/rounds ")).count(), 1, "no automatic resume");
 }
 
-#[test]
-fn async_health_failure_between_consent_down_and_up_keeps_the_real_checkbox_click_valid() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    let (seen_tx, seen_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let (mut reader, path, _) = read_http(listener.accept().unwrap().0);
-        assert!(path.starts_with("GET /health "));
-        seen_tx.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        reply_http(&mut reader, 503, json!({}));
-    });
-    let mut app = LightcraftApp::new(Session::with_demo(), Services { companion_address: Some(address), ..Default::default() });
-    let (connection, requests, _events) = network::test_connection();
-    app.ai.connection = Some(connection);
-    app.ai.generation = app.session.library_generation();
-    let mut h = Headless::new(app, [1000.0, 680.0], 1.0);
-    h.app.run("ai.open", json!({})).unwrap();
-    frames(&mut h);
-    seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let before = h.app.widgets.iter().find(|(id, _)| id == "checkbox:aiConsent").unwrap().1;
-    let point = before.center();
-    h.app.synthetic.extend([
-        egui::Event::PointerMoved(point),
-        egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-    ]);
-    h.step();
-    release_tx.send(()).unwrap();
-    server.join().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        h.step();
-        if h.app.run("ai.status", json!({})).unwrap()["health"]["state"] == "unreachable" {
-            break;
-        }
-        assert!(Instant::now() < deadline);
-        std::thread::yield_now();
-    }
-    assert_eq!(
-        h.app.widgets.iter().find(|(id, _)| id == "checkbox:aiConsent").unwrap().1,
-        before,
-        "async health must preserve the existing control rectangle before release"
-    );
-    h.app.synthetic.push(egui::Event::PointerButton {
-        pos: point,
-        button: egui::PointerButton::Primary,
-        pressed: false,
-        modifiers: egui::Modifiers::NONE,
-    });
-    frames(&mut h);
-    assert_eq!(h.app.run("ai.start", json!({"prompt":"one real consent click"})).unwrap()["started"], true);
-    assert_eq!(requests.recv_timeout(Duration::from_secs(1)).unwrap().path, "/v1/rounds");
-}
-
 fn outgoing(h: &mut Headless, requests: &mpsc::Receiver<network::Request>, suffix: &str) -> network::Request {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -579,7 +533,6 @@ fn backend_failure_with_unconfirmed_feedback_keeps_actual_published_edit_and_ori
         let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
         h.app.run("ai.open", json!({})).unwrap();
         frames(&mut h);
-        request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
         let photo = h.app.session.active().unwrap();
         h.app.run("ai.start", json!({"prompt":"Improve this photo"})).unwrap();
         let create = outgoing(&mut h, &requests, "/v1/rounds");
@@ -633,10 +586,9 @@ fn backend_failure_with_unconfirmed_feedback_keeps_actual_published_edit_and_ori
         assert_eq!(h.app.run("ai.status", json!({})).unwrap()["readonlyPhoto"], photo.0);
         assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"));
         assert_eq!(errors::diagnostic(h.app.ai.conversations.get(&photo).unwrap()), Some("123456789abc"));
-        // Catches a read-only A card opening selected B's History; misses native OS input delivery.
+        // A read-only A card cannot navigate selected B's History; the action is absent, not disabled.
         let id = format!("button:aiHistory:{}", status["task"]["localRoundId"].as_str().unwrap());
-        request(&mut h, "ui.clickWidget", json!({"id":id}));
-        frames(&mut h);
+        assert!(!h.app.widgets.iter().any(|(name, _)| name == &id), "read-only card hides navigation");
         assert_eq!(request(&mut h, "ui.inspect", json!({}))["result"]["ui"]["right"], "ai");
         // Confirming deletion targets the displayed owned A, never the selected B.
         let confirmation = h.app.run("ai.clear", json!({})).unwrap();
@@ -685,7 +637,6 @@ fn health_and_global_entry_are_readable_in_bilingual_normal_narrow_and_short_too
             h.app.ai.generation = h.app.session.library_generation();
             h.app.run("ai.open", json!({})).unwrap();
             frames(&mut h);
-            request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
             let photo = h.app.session.active().unwrap();
             h.app.run("ai.start", json!({"prompt":"Explain this photograph"})).unwrap();
             let create = requests.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -700,11 +651,11 @@ fn health_and_global_entry_are_readable_in_bilingual_normal_narrow_and_short_too
                 assert!(Instant::now() < deadline);
                 std::thread::yield_now();
             }
-            let task = h.app.widgets.iter().find(|(id, _)| id == "button:aiTaskEntry").unwrap().1;
+            assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"), "open Tools header replaces the global task strip");
             let tools = h.app.widgets.iter().find(|(id, _)| id == "panel:right_panel").unwrap().1;
-            assert!(!task.intersects(tools));
-            for literal in [crate::i18n::tr("AI Task"), crate::i18n::tr("AI is analyzing the photo…")] {
-                assert!(h.view.painted_shapes().iter().any(|shape|matches!(shape,egui::epaint::Shape::Text(t) if t.opacity_factor>0.0 && t.galley.text()==literal && task.contains_rect(t.visual_bounding_rect()))),"{layout}/{} task literal {literal}",language.code());
+            let filename = format!("· {}", h.app.session.catalog.photo(photo).unwrap().file_name);
+            for literal in [crate::i18n::tr("AI Assistant"), filename.as_str()] {
+                assert!(h.view.painted_shapes().iter().any(|shape|matches!(shape,egui::epaint::Shape::Text(t) if t.opacity_factor>0.0 && t.galley.text()==literal && tools.contains_rect(t.visual_bounding_rect()))),"{layout}/{} header literal {literal}",language.code());
             }
             let retry = super::panel_tests::reachable(&mut h, "button:aiHealthRetry", -1.0);
             let literal = crate::i18n::tr("Check Again");
@@ -816,7 +767,6 @@ fn unavailable_active_original_task_still_has_scoped_stop_after_real_input() {
     let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     frames(&mut h);
-    request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.app.session.media.availability.exists(&path) != Some(true) {
         h.step();
@@ -861,115 +811,6 @@ fn unavailable_active_original_task_still_has_scoped_stop_after_real_input() {
     assert!(requests.try_recv().is_err(), "stopping A sends no new photo input or round");
 }
 
-// Catches losing persisted trace IDs on real cold scoped history reads, including pure answers;
-// misses physical OS clipboard integration and model/provider diagnostics quality.
-#[test]
-fn cold_verified_history_keeps_trace_and_consent_controls_scoped_while_loading() {
-    use lightcraft_catalog::MemStore;
-    use lightcraft_engine::library::LibraryStores;
-    for background in [false, true] {
-        let catalog = MemStore::new();
-        let mut files = MemStore::new();
-        files.background = background;
-        let open = |catalog: MemStore, files: MemStore| {
-            let mut session = Session::new();
-            session
-                .open_library_in(LibraryStores { catalog: Box::new(catalog), files: Box::new(files), dir: "cold-trace".into(), on_disk: false }, true)
-                .unwrap();
-            session
-        };
-        let mut session = open(catalog.clone(), files.clone());
-        let photo = session.active().unwrap();
-        let other = session.catalog.photos().find(|p| p.id != photo).unwrap().id;
-        session.save_companion_conversation(photo,json!({"schema_version":2,"messages":[{"role":"assistant","text":"Saved failure remains readable.","local_round_id":"cold-trace-round"}],"round_records":[{"photo_id":photo.0,"local_round_id":"cold-trace-round","local_terminal":"failed","trace_id":"abcdef012345-cold","stages":[],"request":"ignored large source context".repeat(120_000)}],"rounds":[]})).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while session.companion_history_unsaved(photo) {
-            session.persist().unwrap();
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        session.persist().unwrap();
-        drop(session);
-        let mut h = Headless::new(
-            LightcraftApp::new(open(catalog, files), Services { companion_address: Some("192.0.2.1:18080".into()), ..Default::default() }),
-            [1100.0, 750.0],
-            1.0,
-        );
-        h.app.run("ai.open", json!({})).unwrap();
-        // Catches asynchronous diagnostic completion invalidating a held consent click;
-        // misses physical OS input. Fallback continuation gives a deterministic pending read.
-        let held = if !background {
-            frames(&mut h);
-            assert_eq!(h.app.run("ai.status", json!({})).unwrap()["historyLoading"], true);
-            let rect = h.app.widgets.iter().find(|(id, _)| id == "checkbox:aiConsent").unwrap().1;
-            let point = rect.center();
-            h.app.synthetic.extend([
-                egui::Event::PointerMoved(point),
-                egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-            ]);
-            h.step();
-            Some((rect, point))
-        } else {
-            None
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            frames(&mut h);
-            let status = h.app.run("ai.status", json!({})).unwrap();
-            if status["historyLoading"] == false {
-                assert_eq!(status["resultCards"], json!([]), "a pure answer does not gain an editing card");
-                assert!(status["text"].as_str().unwrap().contains("Saved failure remains readable."));
-                break;
-            }
-            assert!(Instant::now() < deadline, "{status}");
-            std::thread::yield_now();
-        }
-        let mut owned = None;
-        if let Some((before, point)) = held {
-            assert_eq!(
-                h.app.widgets.iter().find(|(id, _)| id == "checkbox:aiConsent").unwrap().1,
-                before,
-                "cold trace completion must not move a held consent control"
-            );
-            h.app.synthetic.push(egui::Event::PointerButton {
-                pos: point,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::NONE,
-            });
-            frames(&mut h);
-            let (connection, requests, events) = network::test_connection();
-            h.app.ai.connection = Some(connection);
-            h.app.ai.generation = h.app.session.library_generation();
-            owned = Some((requests, events));
-        }
-        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"));
-        assert_eq!(errors::diagnostic(h.app.ai.conversations.get(&photo).unwrap()), Some("abcdef012345-cold"));
-        if let Some((requests, _events)) = owned.as_ref() {
-            assert_eq!(h.app.run("ai.start", json!({"prompt":"new explicit request"})).unwrap()["started"], true);
-            assert_eq!(native_history_tests::outgoing(&mut h, requests, "/v1/rounds").path, "/v1/rounds");
-        }
-        h.app.run("library.select", json!({"ids":[other.0]})).unwrap();
-        frames(&mut h);
-        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"), "B cannot copy A's diagnostic");
-        h.app
-            .session
-            .open_library_in(
-                LibraryStores {
-                    catalog: Box::new(MemStore::new()),
-                    files: Box::new(MemStore::new()),
-                    dir: "other-cold-library".into(),
-                    on_disk: false,
-                },
-                true,
-            )
-            .unwrap();
-        h.app.run("ai.open", json!({})).unwrap();
-        frames(&mut h);
-        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiCopyTrace"), "same photo IDs in a new library cannot reuse old diagnostics");
-    }
-}
-
 #[test]
 fn invalid_client_plan_explains_untouched_start_and_manual_recovery() {
     let mut app = LightcraftApp::new(Session::with_demo(), Services::default());
@@ -979,7 +820,6 @@ fn invalid_client_plan_explains_untouched_start_and_manual_recovery() {
     let mut h = Headless::new(app, [1100.0, 750.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     frames(&mut h);
-    request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
     let photo = h.app.session.active().unwrap();
     let original = h.app.session.develop_of(photo).unwrap();
     h.app.run("ai.start", json!({"prompt":"Improve my photo"})).unwrap();
@@ -1051,7 +891,6 @@ fn omitted_history_navigation_follows_readonly_task_without_changing_selected_ph
         h.app.run(if language == crate::i18n::Locale::En { "app.language.english" } else { "app.language.simplifiedChinese" }, json!({})).unwrap();
         h.app.run("ai.open", json!({})).unwrap();
         frames(&mut h);
-        request(&mut h, "ui.clickWidget", json!({"id":"checkbox:aiConsent"}));
         h.app.run("ai.start", json!({"prompt":"Explain original A"})).unwrap();
         let creation = outgoing(&mut h, &requests, "/v1/rounds");
         events.send(network::Event::Server {kind:"round.state".into(),data:json!({"round_id":"readonly-history-round","payload":{"submission_seq":creation.submission,"photo_ref":creation.body["photo_ref"],"state":"analyzing_initial"}})}).unwrap();

@@ -49,7 +49,6 @@ fn service_overflow_refuses_submission_and_retains_all_local_records() {
     h.app.run("ai.open", json!({})).unwrap();
     h.step();
     h.step();
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(5))["ok"], true);
     h.app.run("ai.start", json!({"prompt":"new explicit request"})).unwrap();
     let status = native_history_tests::wait_idle(&mut h, &requests);
     assert!(status["text"].as_str().unwrap().contains("service limit"), "{status}");
@@ -159,7 +158,7 @@ fn cancelling_blocked_native_style_history_preflight_never_enqueues_creation_or_
         .unwrap();
     let initial = app.session.develop_of(photo).unwrap();
     let (connection, requests, _) = network::test_connection();
-    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    let mut state = State { generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
     // Suppress the independent read-only panel request so this barrier names the model worker.
     state.paging.alive.store(true, Ordering::Relaxed);
     let response = state.start(&mut app).unwrap();
@@ -173,8 +172,7 @@ fn cancelling_blocked_native_style_history_preflight_never_enqueues_creation_or_
     assert!(state.jobs.is_empty());
     assert!(app.session.companion_task_photo().is_none());
     release_tx.send(()).unwrap();
-    // A manually delivered old completion is equally rejected, even after consent returns.
-    state.consent = true;
+    // A manually delivered old completion is equally rejected after a stop.
     state
         .prepared(
             &mut app,
@@ -220,7 +218,8 @@ fn bounded_history_buttons_show_older_and_newer_pages_in_both_languages() {
         for _ in 0..4 {
             h.step();
         }
-        assert!(h.painted_text().iter().any(|s| s == language.tr("Older AI history")));
+        assert!(h.painted_text().iter().any(|s| s == super::i18n::tr("Earlier page")));
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiHistoryNewer"), "no disabled Newer button at the tail");
         assert_eq!(h.app.ai.conversations[&photo].view.as_ref().unwrap().cursor.record, 228);
         let timeout = Duration::from_secs(10);
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryOlder"}), timeout)["ok"], true);
@@ -229,11 +228,13 @@ fn bounded_history_buttons_show_older_and_newer_pages_in_both_languages() {
         }
         assert_eq!(h.app.ai.conversations[&photo].view.as_ref().unwrap().cursor.record, 196);
         assert!(h.app.ai.conversations[&photo].messages.is_empty());
+        assert!(h.painted_text().iter().any(|s| s == super::i18n::tr("Newer page")));
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryNewer"}), timeout)["ok"], true);
         for _ in 0..3 {
             h.step();
         }
         assert_eq!(h.app.ai.conversations[&photo].view.as_ref().unwrap().cursor.record, 228);
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiHistoryNewer"), "returning to the tail removes Newer");
         if let Ok(dir) = std::env::var("UX08_SCREENSHOT_DIR") {
             let response = h.request("ui.screenshot", json!({"path":format!("{dir}/history-{}.png",language.code()),"headless":true}), timeout);
             assert_eq!(response["ok"], true, "{response}");
@@ -260,7 +261,7 @@ fn async_preflight_enqueue_failure_releases_the_local_lease_without_uncertain_ad
         .unwrap();
     let initial = app.session.develop_of(photo).unwrap();
     let (connection, requests, _) = network::test_connection();
-    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    let mut state = State { generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
     state.paging.alive.store(true, Ordering::Relaxed);
     state.start(&mut app).unwrap();
     let identity = state.jobs[&photo].identity.clone();
@@ -305,7 +306,7 @@ fn retired_history_worker_with_lost_completion_releases_the_local_lease() {
         .save_companion_tail(photo, None, &[json!({"role":"user","text":"old exact history"})], &[], &[], &json!({"schema_version":2}))
         .unwrap();
     let (connection, requests, _) = network::test_connection();
-    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    let mut state = State { generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
     state.paging.alive.store(true, Ordering::Relaxed);
     state.start(&mut app).unwrap();
     // Model a disconnected/full completion channel after the worker has really retired.
@@ -565,7 +566,6 @@ fn public_poll_preserves_initial_correction_feedback_and_stop_before_completed_r
         h.step();
     }
     let timeout = Duration::from_secs(10);
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
     h.app.ai.prompt = "Review this photo.".into();
     super::drafts::capture(&mut h.app);
     h.step();
@@ -647,25 +647,32 @@ fn narrow_tools_paints_complete_paging_labels_and_navigates_a_long_message() {
             h.step();
         }
         let tools = h.app.widgets.iter().find(|(id, _)| id == "panel:right_panel").unwrap().1;
-        for label in ["Older AI history", "Newer AI history"] {
-            let shape = h
-                .view
+        let paint_label = |h: &crate::headless::Headless, label: &str| {
+            h.view
                 .painted_shapes()
                 .into_iter()
                 .find_map(|s| match s {
-                    egui::epaint::Shape::Text(text) if text.galley.job.text == language.tr(label) => Some(text),
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == super::i18n::tr(label) => Some(text),
                     _ => None,
                 })
-                .unwrap();
-            assert!(tools.contains_rect(shape.visual_bounding_rect()), "{label} is clipped outside Tools");
-        }
+                .unwrap_or_else(|| panic!("missing {label}"))
+        };
+        let shape = paint_label(&h, "Newer page");
+        assert!(tools.contains_rect(shape.visual_bounding_rect()), "Newer page is clipped outside Tools");
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryNewer"}), Duration::from_secs(10))["ok"], true);
         for _ in 0..3 {
             h.step();
         }
+        let shape = paint_label(&h, "Earlier page");
+        assert!(tools.contains_rect(shape.visual_bounding_rect()), "Earlier page is clipped outside Tools");
         let status = h.app.run("ai.status", json!({})).unwrap();
         let text = status["text"].as_str().unwrap();
         assert!(text.find("OLD_MESSAGE_END").unwrap() < text.find("NEWER_MESSAGE").unwrap());
+        assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryOlder"}), Duration::from_secs(10))["ok"], true);
+        for _ in 0..3 {
+            h.step();
+        }
+        paint_label(&h, "Newer page");
     }
 }
 

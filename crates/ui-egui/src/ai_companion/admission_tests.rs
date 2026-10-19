@@ -1,17 +1,6 @@
 use super::*;
 
 #[test]
-fn command_cannot_grant_consent() {
-    let mut app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), crate::Services::default());
-    let (connection, requests, _) = network::test_connection();
-    app.ai.connection = Some(connection);
-    app.ai.generation = app.session.library_generation();
-    assert!(app.run("ai.start", json!({"consent":true})).is_err());
-    assert!(!app.ai.consent);
-    assert!(requests.try_recv().is_err());
-}
-
-#[test]
 fn submission_is_global_and_explicit_photo_matches_selection() {
     let (mut app, state, photo, requests, _) = super::identity_tests::started();
     app.ai = state;
@@ -29,7 +18,7 @@ fn invalid_selection_and_unavailable_photos_never_enqueue() {
         let photo = app.session.active().unwrap();
         let other = app.session.catalog.photos().find(|p| p.id != photo).unwrap().id;
         let (connection, requests, _) = network::test_connection();
-        app.ai = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+        app.ai = State { generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
         match case {
             "multi" => app.session.selection.ids.push(other),
             "deleted" => {
@@ -65,7 +54,7 @@ fn clicked_start_is_locked_before_admission_and_failed_enqueue_releases() {
 }
 
 #[test]
-fn real_checkbox_submission_and_other_photo_editing_headless() {
+fn default_preview_send_and_other_photo_editing_headless() {
     for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
         let mut app = LightcraftApp::new(
             lightcraft_engine::Session::with_demo(),
@@ -94,10 +83,8 @@ fn real_checkbox_submission_and_other_photo_editing_headless() {
         h.app.run("ai.open", json!({})).unwrap();
         h.step();
         h.step();
-        assert!(!h.app.ai.consent);
-        let clicked = h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
-        assert_eq!(clicked["ok"], true, "{clicked}");
-        assert!(h.app.ai.consent);
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "checkbox:aiConsent"), "no consent widget");
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiConsentRevoke"), "no revoke widget");
         h.app.ai.prompt = "Review this photo.".into();
         super::drafts::capture(&mut h.app);
         h.step();

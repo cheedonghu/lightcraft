@@ -67,12 +67,12 @@ impl WriteStatus {
         match self {
             Self::Preparing => ("Preparing adjustments", "Preparing edits"),
             Self::Applying => ("Applying adjustments", "Applying edits"),
-            Self::Applied => ("Adjustments applied", "Edits applied"),
-            Self::AwaitingConfirmation => ("Adjustments applied; awaiting confirmation", "Applied; confirming"),
-            Self::Unconfirmed => ("Adjustments applied; feedback unconfirmed", "Applied; no receipt"),
-            Self::FeedbackNotDelivered => ("Adjustments applied; feedback not delivered", "Applied; send failed"),
-            Self::PlanRejected => ("Adjustments were not applied: plan rejected", "Plan rejected"),
-            Self::RenderFailed => ("Adjustments were not applied: rendering failed", "Render failed"),
+            Self::Applied => ("Adjustments applied", "Adjustments applied"),
+            Self::AwaitingConfirmation => ("Adjustments applied; awaiting confirmation", "Adjustments applied"),
+            Self::Unconfirmed => ("Adjustments applied; feedback unconfirmed", "Adjustments applied; feedback unconfirmed"),
+            Self::FeedbackNotDelivered => ("Adjustments applied; feedback not delivered", "Adjustments applied; feedback failed"),
+            Self::PlanRejected => ("Adjustments were not applied: plan rejected", "Adjustments not applied"),
+            Self::RenderFailed => ("Adjustments were not applied: rendering failed", "Adjustments failed"),
             Self::NotApplied => ("Adjustments were not applied", "Not applied"),
             Self::Unknown => ("Adjustment activity", "Adjustment activity"),
         }
@@ -214,16 +214,29 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
         activities.iter().filter(|activity| complete && activity.succeeded()).filter_map(|activity| category(activity.name())).collect();
     let pending = activities.iter().find(|activity| activity.result.is_none());
     let write = activities.iter().rev().find(|activity| activity.name() == "apply_edit_plan");
+    let count = categories.len();
+    let short_count = || tr(if count == 1 { "Viewed 1 info type" } else { "Viewed {count} info types" }).replace("{count}", &count.to_string());
+    let write_count = || tr(if count == 1 { "1 type" } else { "{count} types" }).replace("{count}", &count.to_string());
+    let duration = if count == 0 {
+        None
+    } else {
+        activities
+            .iter()
+            .try_fold(0u64, |total, activity| total.checked_add(activity.elapsed_us()?))
+            .map(|total| format!("{:.1}s", total as f64 / 1_000_000.0))
+    };
     let label = if let Some(activity) = pending.filter(|_| continuing) {
-        tr(planned(activity.name())).to_owned()
-    } else if !categories.is_empty() {
-        let template = match (categories.len() == 1, continuing) {
-            (true, true) => "Viewed 1 type of photo information; continuing analysis",
-            (false, true) => "Viewed {count} types of photo information; continuing analysis",
-            (true, false) => "Viewed 1 type of photo information",
-            (false, false) => "Viewed {count} types of photo information",
-        };
-        tr(template).replace("{count}", &categories.len().to_string())
+        match activity.name() {
+            name if category(name).is_some() => tr("Viewing photo information…"),
+            "apply_edit_plan" => tr("Preparing adjustments…"),
+            "skill" => tr("Reading photography guidance…"),
+            "read_skill_resource" => tr("Reading reference material…"),
+            _ => tr("Working on the photo…"),
+        }
+        .to_owned()
+    } else if count > 0 {
+        tr(if count == 1 { "Viewed 1 type of photo information" } else { "Viewed {count} types of photo information" })
+            .replace("{count}", &count.to_string())
     } else if activities.iter().any(|activity| category(activity.name()).is_some()) {
         tr(if ending.is_some() { "Photo information reading incomplete" } else { "Photo information activity" }).to_owned()
     } else if let Some(activity) = activities.iter().rev().find(|activity| matches!(activity.name(), "skill" | "read_skill_resource")) {
@@ -231,16 +244,16 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
             "Tool was not executed"
         } else {
             match (activity.name(), activity.result.is_some(), continuing) {
-                ("skill", true, true) => "Photography guidance response recorded; continuing analysis",
-                ("skill", true, false) => "Photography guidance response recorded",
-                ("read_skill_resource", true, true) => "Reference material response recorded; continuing analysis",
-                ("read_skill_resource", true, false) => "Reference material response recorded",
+                ("skill", true, true) => "Reading photography guidance…",
+                ("skill", true, false) => "Read photography guidance",
+                ("read_skill_resource", true, true) => "Reading reference material…",
+                ("read_skill_resource", true, false) => "Read reference material",
                 _ => planned(activity.name()),
             }
         };
         tr(source).to_owned()
     } else {
-        tr("Tool activity").to_owned()
+        tr("Working on the photo").to_owned()
     };
     let write = write.filter(|activity| {
         activity.result.is_some_and(|result| result["display_write_state"] == "applying")
@@ -249,37 +262,24 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     let write_status = write.and_then(|activity| activity.write_status(continuing, running));
     let mut label = if let Some(status) = write_status {
         let write_label = tr(status.full_label());
-        if categories.is_empty() {
-            write_label.to_owned()
-        } else {
-            let viewed = tr(if categories.len() == 1 { "Viewed 1 type of photo information" } else { "Viewed {count} types of photo information" })
-                .replace("{count}", &categories.len().to_string());
-            format!("{viewed} · {write_label}")
-        }
+        if count == 0 { write_label.to_owned() } else { format!("{label} · {write_label}") }
     } else {
         label
     };
-    let mut caption = if let Some(status) = write_status.filter(|_| !categories.is_empty()) {
-        format!(
-            "{} · {}",
-            tr(if categories.len() == 1 { "1 type" } else { "{count} types" }).replace("{count}", &categories.len().to_string()),
-            tr(status.compact_label())
-        )
+    let mut caption = if let Some(status) = write_status {
+        let write_label = tr(status.compact_label());
+        if count == 0 { write_label.to_owned() } else { format!("{} · {write_label}", write_count()) }
+    } else if count > 0 {
+        short_count()
     } else {
         label.clone()
     };
-    if !categories.is_empty()
-        && let Some(total) = activities.iter().try_fold(0u64, |total, activity| total.checked_add(activity.elapsed_us()?))
-    {
-        let duration = format!("{:.1}s", total as f64 / 1_000_000.0);
+    if let Some(duration) = &duration {
         label.push_str(&format!(" · {duration}"));
-        // Keep the count and time visible in a narrow pane. The full, precise
-        // description (including the waiting phase) remains the tooltip.
-        caption = tr(if categories.len() == 1 { "Viewed 1 info type · {time}" } else { "Viewed {count} info types · {time}" })
-            .replace("{count}", &categories.len().to_string())
-            .replace("{time}", &duration);
-        if continuing {
-            caption.push_str(tr("; analyzing"));
+        if count > 0 && write_status.is_none() {
+            caption = tr(if count == 1 { "Viewed 1 info type · {time}" } else { "Viewed {count} info types · {time}" })
+                .replace("{count}", &count.to_string())
+                .replace("{time}", duration);
         }
     }
     let failure = activities.iter().find(|activity| activity.failed());

@@ -1,7 +1,8 @@
 //! Historical execution facts, presented without confusing proposals with publication.
 //! Callers pass one bounded round record. The module owns grouping, labels and values;
 //! it never mutates a photo or derives historical display values from today's source.
-use crate::i18n::{tr, tr_format};
+use super::tr;
+use crate::i18n::tr_format;
 use lightcraft_catalog::PhotoId;
 use lightcraft_develop::{DevelopSettings, controls};
 use serde::Serialize;
@@ -179,30 +180,46 @@ pub(super) fn show(ui: &mut egui::Ui, card: &Card, navigation_available: bool) -
     let mut action = None;
     let frame = egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.strong(tr("Round result"));
-        ui.small(tr("This card records the round; the editor shows the current photo."));
         if let Some(retained) = &card.retained_result {
             ui.label(tr(retained));
-        }
-        if card.reverted {
-            ui.strong(tr("This round was reverted."));
         }
         if card.current_photo_has_later_edits {
             ui.label(tr("The current photo has later edits."));
         }
-        for stage in &card.stages {
-            let row = ui.horizontal_wrapped(|ui| {
-                ui.strong(tr(if stage.kind == "correction" { "Review correction" } else { "Initial optimization" }));
-                ui.label(tr(if stage.status == "applied" { "Applied" } else { "Not applied" }));
+        if !card.stages.is_empty() {
+            let has_initial = card.stages.iter().any(|stage| stage.kind == "initial");
+            let has_correction = card.stages.iter().any(|stage| stage.kind == "correction");
+            let stage_label = match (has_initial, has_correction) {
+                (true, true) => format!("{} + {}", tr("Initial optimization"), tr("Review correction")),
+                (false, true) => tr("Review correction").to_owned(),
+                _ => tr("Initial optimization").to_owned(),
+            };
+            let applied = card.stages.iter().filter(|stage| stage.status == "applied").count();
+            let status = if card.reverted {
+                tr("Reverted").to_owned()
+            } else if applied == card.stages.len() {
+                tr("Applied").to_owned()
+            } else if applied == 0 {
+                tr("Not applied").to_owned()
+            } else {
+                tr("Partly applied").to_owned()
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(stage_label);
+                ui.label(status);
             });
-            super::composer_widget(ui, &format!("ai:stage:{}:{}", card.local_round_id, stage.kind), row.response.rect);
-            if stage.status == "applied" && stage.feedback == "unconfirmed" {
-                ui.label(tr("Applied result retained; feedback was not confirmed."));
+            if card.stages.iter().any(|stage| stage.status == "applied" && stage.feedback == "unconfirmed") {
+                ui.small(tr("Applied result retained; feedback was not confirmed."));
             }
-            if stage.parameter_details_unavailable {
-                ui.label(tr("Historical parameter details are unavailable."));
+            if card.stages.iter().any(|stage| stage.parameter_details_unavailable) {
+                ui.small(tr("Historical parameter details are unavailable."));
             }
-            if !stage.reason.is_empty() {
-                ui.label(&stage.reason);
+            let mut reasons = Vec::new();
+            for stage in &card.stages {
+                if !stage.reason.is_empty() && !reasons.contains(&stage.reason.as_str()) {
+                    reasons.push(stage.reason.as_str());
+                    ui.small(&stage.reason);
+                }
             }
         }
         let details = egui::CollapsingHeader::new(tr("View parameter changes")).id_salt(("ai-parameters", &card.local_round_id)).show(ui, |ui| {
@@ -237,25 +254,33 @@ pub(super) fn show(ui: &mut egui::Ui, card: &Card, navigation_available: bool) -
             }
         });
         super::composer_widget(ui, &format!("button:aiParameters:{}", card.local_round_id), details.header_response.rect);
-        if card.binding.is_some() {
-            let compare = ui.button(tr("Historical preview"));
-            super::composer_widget(ui, &format!("button:aiCompare:{}", card.local_round_id), compare.rect);
-            if compare.clicked() {
-                action = Some(Action::Compare);
-            }
-        }
-        let locate = ui.add_enabled(navigation_available, egui::Button::new(tr("Open ordinary History")));
-        super::composer_widget(ui, &format!("button:aiHistory:{}", card.local_round_id), locate.rect);
-        if locate.clicked() {
-            action = Some(Action::History);
-        }
-        let undo = ui.add_enabled(navigation_available && card.can_undo, egui::Button::new(tr("Undo AI Round")));
-        super::composer_widget(ui, &format!("button:aiUndo:{}", card.local_round_id), undo.rect);
-        if undo.clicked() {
-            action = Some(Action::Undo);
-        }
-        if !card.can_undo && !card.reverted {
-            ui.small(tr("Revert unavailable; use ordinary History."));
+        let show_compare = navigation_available && card.binding.is_some();
+        let show_history = navigation_available;
+        let show_undo = navigation_available && card.can_undo;
+        if show_compare || show_history || show_undo {
+            ui.horizontal(|ui| {
+                if show_compare {
+                    let compare = ui.add(egui::Button::new(tr("Compare")).frame(false)).on_hover_text(tr("Historical preview"));
+                    super::composer_widget(ui, &format!("button:aiCompare:{}", card.local_round_id), compare.rect);
+                    if compare.clicked() {
+                        action = Some(Action::Compare);
+                    }
+                }
+                if show_history {
+                    let locate = ui.add(egui::Button::new(tr("History")).frame(false)).on_hover_text(tr("Open ordinary History"));
+                    super::composer_widget(ui, &format!("button:aiHistory:{}", card.local_round_id), locate.rect);
+                    if locate.clicked() {
+                        action = Some(Action::History);
+                    }
+                }
+                if show_undo {
+                    let undo = ui.add(egui::Button::new(tr("Undo")).frame(false)).on_hover_text(tr("Undo AI Round"));
+                    super::composer_widget(ui, &format!("button:aiUndo:{}", card.local_round_id), undo.rect);
+                    if undo.clicked() {
+                        action = Some(Action::Undo);
+                    }
+                }
+            });
         }
     });
     super::composer_widget(ui, &format!("ai:card:{}", card.local_round_id), frame.response.rect);

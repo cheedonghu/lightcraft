@@ -9,6 +9,7 @@ pub(super) struct RoundSummary {
     pub legacy_completed: bool,
     pub final_message: Option<String>,
     pub notice: Option<String>,
+    pub has_card: bool,
     pub ending: Option<&'static str>,
 }
 impl RoundSummary {
@@ -19,6 +20,7 @@ impl RoundSummary {
             legacy_completed: terminal == Some("completed") && record.get("final_message_id").is_none(),
             final_message: record["final_message_id"].as_str().filter(|id| id.len() <= 512 && !id.chars().any(char::is_control)).map(str::to_owned),
             notice: record["terminal_notice"].as_str().map(|notice| notice.chars().take(1024).collect()),
+            has_card: record["stages"].as_array().is_some_and(|stages| !stages.is_empty()),
             ending: match (terminal, record.pointer("/backend_terminal/reason_code").and_then(Value::as_str)) {
                 (Some("completed"), _) | (None, _) => None,
                 (Some("cancelled"), _) | (_, Some("user_stop" | "execution_cancelled")) => Some("Stopped"),
@@ -137,7 +139,9 @@ pub(super) fn show(
             row.show(ui, attachments);
             if let Some(round) = row.round()
                 && !rows.get(index + 1).is_some_and(|next| next.round() == Some(round))
-                && let Some(notice) = summaries.get(round).and_then(|s| s.notice.as_deref()).filter(|notice| *notice != conversation.notice)
+                && let Some(notice) = summaries.get(round).and_then(|s| s.notice.as_deref()).filter(|notice| {
+                    *notice != conversation.notice && !(*notice == "This round is complete." && summaries.get(round).is_some_and(|s| s.has_card))
+                })
             {
                 ui.label(errors::display_notice(notice));
             }
@@ -215,7 +219,10 @@ pub(super) fn show(
         for row in group.iter().filter(|row| Some(row.id()) == final_id) {
             row.show(ui, attachments);
         }
-        if let Some(notice) = summary.and_then(|s| s.notice.as_deref()).filter(|notice| *notice != conversation.notice) {
+        if let Some(notice) = summary
+            .and_then(|s| s.notice.as_deref())
+            .filter(|notice| *notice != conversation.notice && !(*notice == "This round is complete." && summary.is_some_and(|s| s.has_card)))
+        {
             ui.label(errors::display_notice(notice));
         }
         if last_rows.get(round).is_some_and(|last| *last < end) {
@@ -230,7 +237,11 @@ pub(super) fn show(
             pending(ui, conversation);
         }
     }
-    if !conversation.notice.is_empty() {
+    let completed_card = conversation
+        .records
+        .iter()
+        .any(|record| record["local_terminal"] == "completed" && record["stages"].as_array().is_some_and(|stages| !stages.is_empty()));
+    if !conversation.notice.is_empty() && !(completed_card && conversation.notice == "This round is complete.") {
         ui.add_space(6.0);
         ui.label(egui::RichText::new(super::errors::display_notice(&conversation.notice)).weak());
     }
@@ -239,7 +250,7 @@ pub(super) fn show(
 fn process(ui: &mut egui::Ui, round: &str, running: bool, has_tools: bool, failures: usize, body: impl FnOnce(&mut egui::Ui)) {
     // Changing the terminal part of the ID resets even a manually opened active
     // group exactly once at completion; subsequent manual expansion is retained.
-    let title = if has_tools { tr("Processing · tool activity") } else { tr("Processing history") };
+    let title = if has_tools { tr("Processing") } else { tr("Processing history") };
     let open = progress::open_for_failure(ui, egui::Id::new(("ai-process-failure-open", round, failures)), failures > 0);
     let header = egui::CollapsingHeader::new(progress::single_line(ui, egui::RichText::new(title).weak()))
         .id_salt(("ai-process", round, running))

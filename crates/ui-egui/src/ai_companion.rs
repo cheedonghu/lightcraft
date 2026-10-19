@@ -95,7 +95,6 @@ pub struct State {
     task: Option<task_entry::Task>,
     readonly_task: Option<PhotoScope>,
     readonly_selection: Option<lightcraft_engine::Selection>,
-    consent: bool,
     exiting: bool,
     prompt: String,
     editor_photo: Option<PhotoId>,
@@ -140,7 +139,6 @@ impl Default for State {
             task: None,
             readonly_task: None,
             readonly_selection: None,
-            consent: false,
             exiting: false,
             prompt: String::new(),
             editor_photo: None,
@@ -379,7 +377,7 @@ impl State {
         cancel: Arc<AtomicBool>,
     ) -> Result<(), String> {
         let control = path.ends_with("/stop");
-        if !control && (!self.consent || cancel.load(Ordering::Relaxed)) {
+        if !control && cancel.load(Ordering::Relaxed) {
             return Err("已取消未完成的 AI 请求。".into());
         }
         let connection = self.connection.as_ref().ok_or("AI 事件连接尚未建立。")?;
@@ -438,9 +436,6 @@ impl State {
         }
         if cfg!(target_arch = "wasm32") {
             return Err(tr("AI Companion is currently available on desktop only.").into());
-        }
-        if !self.consent {
-            return Err(tr("Please consent to sending compressed previews first.").into());
         }
         if self.retiring_connection.as_ref().is_some_and(|alive| alive.load(Ordering::Relaxed))
             || self.connection.as_ref().is_some_and(|c| c.is_closing() && c.alive.load(Ordering::Relaxed))
@@ -644,17 +639,6 @@ impl State {
             })
             .map_err(|_| "无法启动 AI 渲染。")?;
         self.workers.insert(photo, alive);
-        Ok(())
-    }
-    fn set_consent(&mut self, consent: bool) -> Result<(), String> {
-        self.consent = consent;
-        if !consent {
-            let photos: Vec<_> = self.jobs.keys().copied().collect();
-            self.pending_local_saves.extend(photos.iter().copied());
-            for photo in photos {
-                self.stop(photo)?;
-            }
-        }
         Ok(())
     }
     fn request_feedback(&mut self) {
@@ -1212,7 +1196,6 @@ impl State {
                     || identity.scope.library_generation != app.session.library_generation()
                     || identity.connection_generation != self.connection_generation
                     || job.cancel.load(Ordering::Relaxed)
-                    || !self.consent
                 {
                     return Ok(());
                 }
@@ -1949,7 +1932,7 @@ pub fn cancel_for_library_change(app: &mut LightcraftApp) {
     // rounds whose actual effects must remain intact.
     state.close_connection();
 }
-/// A host or user has committed to exiting; consent/connection changes cannot
+/// A host or user has committed to exiting; connection changes cannot
 /// authorize content again. Cancellation itself performs no storage I/O.
 pub fn before_exit(app: &mut LightcraftApp) {
     app.ai.exiting = true;
@@ -2503,7 +2486,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 .id_salt(("ai-compact-composer", app.session.library_generation(), photo.0, app.ai.jobs.contains_key(&photo)))
                 .auto_shrink([false, false])
                 .min_scrolled_height(0.0)
-                .max_height(height)
+                .max_height(footer.available_height().max(0.0))
                 .show(&mut footer, |ui| {
                     // Keep an outer scroll gutter separate from the nested history.
                     egui::Frame::NONE.inner_margin(egui::Margin { right: 12, ..Default::default() }).show(ui, |ui| {
@@ -2555,11 +2538,11 @@ fn readonly_task_body(app: &mut LightcraftApp, ui: &mut egui::Ui, scope: PhotoSc
     {
         app.ai.text = error;
     }
-    save_recovery(app, ui, scope.photo);
+    save_recovery(app, ui, scope.photo, compact);
     let height = if compact { 240.0 } else { ui.available_height().max(0.0) };
     message_area(app, ui, scope.photo, height);
 }
-fn save_recovery(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
+fn save_recovery(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact: bool) {
     let sizing = ui.is_sizing_pass();
     let cleanup_id = egui::Id::new(("ai-cleanup-shown", app.session.library_generation(), photo.0));
     let hold_geometry = app.ai.feedback_needs_paint(ui.ctx()) || ui.input(|input| input.pointer.any_down() || input.pointer.any_released());
@@ -2600,14 +2583,27 @@ fn save_recovery(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
     if unsaved || app.ai.save_retry_feedback.contains_key(&photo) {
         // Retain the original cause and geometry until acknowledgment. An
         // automatic save between pointer press/release must not move the button.
-        ui.label(tr(app.ai.save_retry_feedback.get(&photo).copied().unwrap_or(cause)));
-        let retry = ui.button(tr("Retry Saving"));
-        composer_widget(ui, "button:aiRetrySave", retry.rect);
-        if !sizing
-            && retry.clicked()
-            && let Err(error) = app.run("ai.retrySave", json!({"photo":photo.0,"library_generation":app.session.library_generation()}))
-        {
-            app.ai.conversations.entry(photo).or_default().notice = error;
+        let cause = app.ai.save_retry_feedback.get(&photo).copied().unwrap_or(cause);
+        if compact {
+            let retry = ui.button(tr("Retry Saving"));
+            composer_widget(ui, "button:aiRetrySave", retry.rect);
+            ui.label(tr(cause));
+            if !sizing
+                && retry.clicked()
+                && let Err(error) = app.run("ai.retrySave", json!({"photo":photo.0,"library_generation":app.session.library_generation()}))
+            {
+                app.ai.conversations.entry(photo).or_default().notice = error;
+            }
+        } else {
+            ui.label(tr(cause));
+            let retry = ui.button(tr("Retry Saving"));
+            composer_widget(ui, "button:aiRetrySave", retry.rect);
+            if !sizing
+                && retry.clicked()
+                && let Err(error) = app.run("ai.retrySave", json!({"photo":photo.0,"library_generation":app.session.library_generation()}))
+            {
+                app.ai.conversations.entry(photo).or_default().notice = error;
+            }
         }
     } else if app.ai.conversations.get(&photo).is_some_and(|c| c.notice == "Saved. Retry the edit explicitly when ready.") {
         ui.label(tr("Saved. Retry the edit explicitly when ready."));
@@ -2835,8 +2831,7 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
         }
     });
     composer_widget(ui, "ai:stage", stage.response.rect);
-    save_recovery(app, ui, photo);
-    consent_control(app, ui, photo);
+    save_recovery(app, ui, photo, compact);
     ui.add_space(6.0);
     let _ = compact;
     egui::Frame::new()
@@ -2903,24 +2898,8 @@ fn composer(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, compact:
     ui.add_space(8.0);
 }
 
-fn consent_control(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
-    let sizing = ui.is_sizing_pass();
-    let mut consent = app.ai.consent;
-    let checkbox = ui
-        .checkbox(&mut consent, tr("Allow compressed previews to be sent to the cloud model"))
-        .on_hover_text(tr("Allow compressed previews to be sent to the cloud model"));
-    composer_widget(ui, "checkbox:aiConsent", checkbox.rect);
-    if !sizing && checkbox.changed() {
-        if let Err(error) = app.ai.set_consent(consent) {
-            app.ai.text = error.clone();
-            app.ai.conversations.entry(photo).or_default().notice = error;
-        }
-        app.ai.defer_local_saves_for_feedback(ui.ctx());
-        app.session.defer_companion_retry(true);
-    }
-}
-
 fn history_controls(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) {
+    let sizing = ui.is_sizing_pass();
     let paging = app.ai.conversations.get(&photo).and_then(|c| c.view.as_ref()).map(|v| (v.cursor, v.next));
     let Some((cursor, next)) = paging else {
         if app.ai.conversations.get(&photo).is_some_and(|c| c.prefix.is_some()) {
@@ -2928,25 +2907,30 @@ fn history_controls(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId) 
         }
         return;
     };
-    ui.horizontal_wrapped(|ui| {
-        let older = ui.add_enabled(cursor.record > 0 || cursor.offset > 0, egui::Button::new(tr("Older AI history")));
-        composer_widget(ui, "button:aiHistoryOlder", older.rect);
-        if !ui.is_sizing_pass() && older.clicked() {
-            // Return to the beginning of an oversize message, or move back a
-            // bounded page of records. Forward continuation preserves exact text.
-            let record = if cursor.offset > 0 { cursor.record } else { cursor.record.saturating_sub(32) };
-            let offset = 0;
-            let _ = app.run("ai.history", json!({"photo":photo.0,"record":record,"offset":offset}));
-        }
-        let newer = ui.add_enabled(next.is_some(), egui::Button::new(tr("Newer AI history")));
-        composer_widget(ui, "button:aiHistoryNewer", newer.rect);
-        if !ui.is_sizing_pass()
-            && newer.clicked()
-            && let Some(next) = next
-        {
-            let _ = app.run("ai.history", json!({"photo":photo.0,"record":next.record,"offset":next.offset}));
-        }
-    });
+    let has_older = cursor.record > 0 || cursor.offset > 0;
+    let has_newer = next.is_some();
+    if has_older || has_newer {
+        ui.horizontal_wrapped(|ui| {
+            if has_older {
+                let older = ui.add(egui::Button::new(tr("Earlier page")).frame(false));
+                composer_widget(ui, "button:aiHistoryOlder", older.rect);
+                if !sizing && older.clicked() {
+                    // Return to the beginning of an oversize message, or move back a
+                    // bounded page of records. Forward continuation preserves exact text.
+                    let record = if cursor.offset > 0 { cursor.record } else { cursor.record.saturating_sub(32) };
+                    let offset = 0;
+                    let _ = app.run("ai.history", json!({"photo":photo.0,"record":record,"offset":offset}));
+                }
+            }
+            if let Some(next) = next {
+                let newer = ui.add(egui::Button::new(tr("Newer page")).frame(false));
+                composer_widget(ui, "button:aiHistoryNewer", newer.rect);
+                if !sizing && newer.clicked() {
+                    let _ = app.run("ai.history", json!({"photo":photo.0,"record":next.record,"offset":next.offset}));
+                }
+            }
+        });
+    }
     if app.ai.paging.busy()
         || app.ai.paging.awaiting_page(photo)
         || app.ai.conversations.get(&photo).and_then(|c| c.view.as_ref()).is_some_and(|v| v.card_cursor.is_some())

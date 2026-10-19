@@ -73,7 +73,9 @@ fn cold_saved_unfinished_round_is_reported_without_resuming_or_granting_old_perm
                 _ => "上次任务已中断，未自动继续。",
             };
             assert!(h.painted_text().iter().any(|text| text == notice));
-            assert!(h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"));
+            assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"), "open Tools header owns the task strip");
+            let title = if language == crate::i18n::Locale::ZhHans { "AI 助手" } else { "AI Assistant" };
+            assert!(h.painted_text().iter().any(|text| text == title));
             assert!(outgoing.try_recv().is_err(), "loading a saved task never creates a backend request");
             assert!(h.app.session.verify_round_revert(photo, &round).is_err());
             let lease = h
@@ -213,7 +215,6 @@ fn client(files: Files) -> (Headless, mpsc::Receiver<network::Request>, mpsc::Sy
     h.app.run("ai.open", json!({})).unwrap();
     h.step();
     h.step();
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     (h, requests, events, retired)
 }
 fn queued(h: &mut Headless, requests: &mpsc::Receiver<network::Request>, events: &mpsc::SyncSender<network::Event>) -> network::Request {
@@ -365,7 +366,6 @@ fn successful_library_switch_saves_jobless_drafts_and_waits_for_old_transport_re
     h.app.run("ai.open", json!({})).unwrap();
     h.step();
     h.step();
-    h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10));
     let creation = queued(&mut h, &requests, &events);
     let jobless = h.app.session.catalog.photos().find(|p| p.id != shared).unwrap().id;
     h.app

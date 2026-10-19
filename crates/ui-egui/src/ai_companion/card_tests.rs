@@ -165,6 +165,34 @@ fn archived_round_has_one_result_card_with_absolute_initial_and_correction_value
     assert!(!h.app.widgets.iter().any(|(id, _)| id == "ai:card:pure-answer"));
 }
 #[test]
+fn result_card_keeps_one_summary_line_and_one_action_row() {
+    let (mut h, _) = headless(vec![json!({
+        "local_round_id":"compact-card",
+        "stages":[stage("initial",0.0,0.35),stage("correction",0.35,0.2)],
+        "local_terminal":"completed"
+    })]);
+    for _ in 0..4 {
+        h.step();
+    }
+    let texts = h.painted_text();
+    assert!(texts.iter().any(|text| text == "Round result"));
+    assert!(texts.iter().any(|text| text == "Applied"), "the card needs one explicit status");
+    assert!(!texts.iter().any(|text| text.contains("This card records")), "the card must not explain its own bookkeeping");
+    let summary = format!("{} + {}", crate::i18n::tr("Initial optimization"), crate::i18n::tr("Review correction"));
+    assert!(texts.iter().any(|text| text == &summary), "two stages must share one summary line: {texts:?}");
+    let row = |id: &str| h.app.widgets.iter().find(|(key, _)| key == id).unwrap().1;
+    let history = row("button:aiHistory:compact-card");
+    assert!(history.height() > 0.0, "history must stay visible and not clipped");
+    if let Some((_, undo)) = h.app.widgets.iter().find(|(key, _)| key == "button:aiUndo:compact-card") {
+        assert!(undo.height() > 0.0, "undo must not be clipped");
+        assert!((history.center().y - undo.center().y).abs() < 1.0, "history and undo must share one action row");
+    }
+    if let Some((_, compare)) = h.app.widgets.iter().find(|(key, _)| key == "button:aiCompare:compact-card") {
+        assert!((compare.center().y - history.center().y).abs() < 1.0, "compare must join the same action row");
+    }
+}
+
+#[test]
 fn result_card_distinguishes_failed_target_from_retained_and_unconfirmed_actual_results() {
     let mut failed = stage("correction", 0.35, 0.2);
     failed.as_object_mut().unwrap().remove("applied_state");
@@ -249,8 +277,6 @@ fn actual_wb(relative: bool) {
     for _ in 0..4 {
         h.step();
     }
-    let t = std::time::Duration::from_secs(10);
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), t)["ok"], true);
     if let Some(path) = &native {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while h.app.session.media.availability.exists(path) != Some(true) {

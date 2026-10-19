@@ -99,7 +99,6 @@ fn public_ai_result_stays_visible_and_unsaved_recovery_only_writes_storage() {
             h.step();
         }
         let timeout = Duration::from_secs(10);
-        assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
         h.app.ai.prompt = "Review this photo.".into();
         super::drafts::capture(&mut h.app);
         h.step();

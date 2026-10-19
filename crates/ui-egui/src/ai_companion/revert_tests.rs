@@ -44,8 +44,6 @@ fn actual_round_with_session(mut session: Session) -> RoundFixture {
     for _ in 0..4 {
         h.step();
     }
-    let timeout = Duration::from_secs(10);
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
     h.app.run("ai.start", json!({"prompt":"Naturally optimize this photo."})).unwrap();
     let creation = outgoing(&mut h, &requests, "/v1/rounds");
     let local = creation.identity.local_round_id.as_str().to_owned();
@@ -79,39 +77,11 @@ fn actual_round_with_session(mut session: Session) -> RoundFixture {
     }
     (h, photo, local, start, requests, events)
 }
-#[test]
-fn actual_round_card_reverts_its_whole_start_after_consent_is_revoked() {
-    let (mut h, photo, round, start, _requests, _events) = actual_round();
-    let timeout = Duration::from_secs(10);
-    assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.2);
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
-    for _ in 0..4 {
-        h.step();
-    }
-    assert!(h.app.widgets.iter().any(|(id, _)| id == &format!("button:aiUndo:{round}")), "the actual card owns the explicit action");
-    assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiUndo"), "no implicit latest-round footer action");
-    assert_eq!(h.request("ui.clickWidget", json!({"id":format!("button:aiUndo:{round}")}), timeout)["ok"], true);
-    assert_eq!(*h.app.session.develop_of(photo).unwrap(), start);
-    let status = h.app.run("ai.status", json!({})).unwrap();
-    assert_eq!(status["resultCards"][0]["reverted"], true);
-    assert_eq!(status["resultCards"][0]["canUndo"], false);
-    assert_eq!(
-        status["resultCards"][0]["currentPhotoHasLaterEdits"], false,
-        "the explicit round revert is reported as reverted, not as unrelated later editing"
-    );
-    assert!(status["text"].as_str().unwrap().contains("This round was reverted"));
-    h.app.run("develop.set", json!({"values":{"light.exposure":0.6}})).unwrap();
-    h.app.run("develop.set", json!({"values":{"light.exposure":-0.2}})).unwrap();
-    let later = h.app.run("ai.status", json!({})).unwrap();
-    assert_eq!(later["resultCards"][0]["reverted"], true);
-    assert_eq!(later["resultCards"][0]["currentPhotoHasLaterEdits"], true);
-    assert_eq!(later["resultCards"][0]["canUndo"], false);
-}
 
 #[test]
 fn native_reopen_qualified_round_restores_full_start_through_real_controls_in_both_languages_and_tools_sizes() {
     for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
-        for layout in ["normal", "narrow", "float120", "float240", "stack120", "stack240"] {
+        for layout in ["normal", "normal1280", "narrow", "narrow240", "float120", "float240", "stack120", "stack240"] {
             native_reopen(false, language, layout);
         }
     }
@@ -191,7 +161,7 @@ fn native_reopen(reverted: bool, language: crate::i18n::Locale, layout: &str) {
         if layout.starts_with("float") || layout.starts_with("stack") {
             super::panel_tests::short_tools(&mut h, layout.starts_with("stack"), if layout.ends_with("120") { 120.0 } else { 240.0 });
         }
-        show_label(&mut h, if language == crate::i18n::Locale::ZhHans { "撤回本轮" } else { "Undo AI Round" });
+        show_label(&mut h, if language == crate::i18n::Locale::ZhHans { "撤销" } else { "Undo" });
         let id = format!("button:aiUndo:{round}");
         let target = h.app.widgets.iter().find(|(name, _)| name == &id).unwrap().1;
         let tools = h.app.widgets.iter().find(|(name, _)| name == "panel:right_panel").unwrap().1;
@@ -207,7 +177,7 @@ fn native_reopen(reverted: bool, language: crate::i18n::Locale, layout: &str) {
         assert_eq!(status["resultCards"][0]["reverted"], true);
         assert_eq!(status["resultCards"][0]["canUndo"], false);
         if layout == "normal" {
-            show_label(&mut h, if language == crate::i18n::Locale::ZhHans { "已撤回本轮。" } else { "This round was reverted." });
+            show_label(&mut h, if language == crate::i18n::Locale::ZhHans { "已撤回" } else { "Reverted" });
             screen(&mut h, &format!("cold-reverted-{layout}-{}", language.code()));
         }
     }
@@ -269,14 +239,18 @@ fn screen(h: &mut Headless, name: &str) {
 #[test]
 fn real_round_revert_card_is_readable_and_clickable_in_both_languages_and_tools_sizes() {
     for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
-        for layout in ["normal", "narrow", "float120", "float240", "stack120", "stack240"] {
+        for layout in ["normal", "normal1280", "narrow", "narrow240", "float120", "float240", "stack120", "stack240"] {
             let (mut h, photo, round, start, _requests, _events) = actual_round();
             h.app.ui.language = language;
             let timeout = Duration::from_secs(10);
             let size = if layout == "normal" {
                 [1400, 1000]
+            } else if layout == "normal1280" {
+                [1280, 800]
             } else if layout == "narrow" {
                 [620, 520]
+            } else if layout == "narrow240" {
+                [620, 800]
             } else {
                 [1000, 680]
             };
@@ -285,13 +259,17 @@ fn real_round_revert_card_is_readable_and_clickable_in_both_languages_and_tools_
             if layout.starts_with("float") || layout.starts_with("stack") {
                 super::panel_tests::short_tools(&mut h, layout.starts_with("stack"), if layout.ends_with("120") { 120.0 } else { 240.0 });
             }
-            let literal = if language == crate::i18n::Locale::ZhHans { "撤回本轮" } else { "Undo AI Round" };
+            let literal = if language == crate::i18n::Locale::ZhHans { "撤销" } else { "Undo" };
             show_label(&mut h, literal);
             let id = format!("button:aiUndo:{round}");
             let target = h.app.widgets.iter().find(|(name, _)| name == &id).unwrap().1;
             let tools = h.app.widgets.iter().find(|(name, _)| name == "panel:right_panel").unwrap().1;
             let viewport = h.app.widgets.iter().find(|(name, _)| name == "ai:messages").unwrap().1;
             assert!(tools.contains_rect(target));
+            if layout == "narrow240" {
+                assert!((tools.width() - 240.0).abs() < 8.0, "AI panel should be about 240px wide, got {}", tools.width());
+                assert!(!h.painted_text().iter().any(|text| text.contains("本轮已完成")), "the card owns the completion state");
+            }
             assert!(viewport.contains_rect(target));
             let zoom = h.app.ui.zoom;
             screen(&mut h, &format!("card-{layout}-{}", language.code()));
@@ -302,7 +280,7 @@ fn real_round_revert_card_is_readable_and_clickable_in_both_languages_and_tools_
             assert_eq!(status["resultCards"][0]["reverted"], true);
             assert_eq!(status["resultCards"][0]["canUndo"], false);
             if layout == "normal" {
-                show_label(&mut h, if language == crate::i18n::Locale::ZhHans { "已撤回本轮。" } else { "This round was reverted." });
+                show_label(&mut h, if language == crate::i18n::Locale::ZhHans { "已撤回" } else { "Reverted" });
                 screen(&mut h, &format!("reverted-{layout}-{}", language.code()));
             }
         }

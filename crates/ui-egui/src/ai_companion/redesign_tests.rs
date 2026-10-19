@@ -46,7 +46,6 @@ fn welcome_prompts_only_fill_drafts_empty_send_is_disabled_and_diagnostics_live_
         assert!(!h.painted_text().iter().any(|text| text == "Ready for your request" || text == "可以输入要求"));
         assert!(!has(&h, "button:aiCopyTrace") && !has(&h, "button:aiHealthRetry"));
         screenshots(&mut h, &format!("welcome-{}", language.code()));
-        click(&mut h, "checkbox:aiConsent");
         click(&mut h, "button:aiStart");
         assert!(requests.try_recv().is_err(), "empty arrow must not submit");
         click(&mut h, "button:aiReviewPrompt");
@@ -80,7 +79,6 @@ fn live_process_expands_then_auto_collapses_preserving_final_answer_and_reopenin
     let mut h = Headless::new(app, [1400.0, 1000.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     frames(&mut h);
-    click(&mut h, "checkbox:aiConsent");
     h.app.run("ai.start", json!({"prompt":"点评这张照片"})).unwrap();
     let create = requests.recv_timeout(Duration::from_secs(1)).unwrap();
     let photo = h.app.session.active().unwrap();

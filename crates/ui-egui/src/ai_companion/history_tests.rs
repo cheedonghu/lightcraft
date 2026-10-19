@@ -55,7 +55,7 @@ fn stopped_multi_tool_batch_reopens_and_next_real_input_has_all_true_results() {
     let mut app = make_app();
     let photo = app.session.active().unwrap();
     let (connection, requests, _) = network::test_connection();
-    let mut state = State { consent: true, connection: Some(connection), ..Default::default() };
+    let mut state = State { connection: Some(connection), ..Default::default() };
     state.start(&mut app).unwrap();
     requests.try_recv().unwrap();
     let identity = state.jobs[&photo].identity.clone();
@@ -93,7 +93,6 @@ fn stopped_multi_tool_batch_reopens_and_next_real_input_has_all_true_results() {
     h.app.run("ai.open", json!({})).unwrap();
     h.step();
     h.step();
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(5))["ok"], true);
     h.app.run("ai.start", json!({"prompt":"next explicit request"})).unwrap();
     let creation = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
     let identity = creation.identity;
@@ -123,7 +122,7 @@ fn current_actual_state_budget_refuses_before_create_and_keeps_every_local_byte(
     let photo = app.session.active().unwrap();
     let text = "x".repeat(256 * 1024 - 16);
     let (connection, requests, _) = network::test_connection();
-    let mut state = State { consent: true, prompt: "user request".into(), connection: Some(connection), ..Default::default() };
+    let mut state = State { prompt: "user request".into(), connection: Some(connection), ..Default::default() };
     state.conversations.insert(photo, Conversation { messages: vec![json!({"role":"user","text":text})], ..Default::default() });
     assert!(state.start(&mut app).is_err());
     assert!(requests.try_recv().is_err());
@@ -196,7 +195,6 @@ fn invalid_history_rejection_is_visible_and_localized_from_real_start_widget() {
         h.app.run("ai.open", json!({})).unwrap();
         h.step();
         h.step();
-        assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
         h.app.ai.prompt = "Review this photo.".into();
         super::drafts::capture(&mut h.app);
         h.step();
@@ -316,7 +314,6 @@ fn start_command_refuses_ambiguous_legacy_image_and_allows_next_ordinary_edit() 
     h.app.run("ai.open", json!({})).unwrap();
     h.step();
     h.step();
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     let started = h.app.run("ai.start", json!({"prompt":"current request"}));
     let error = match started {
         Err(error) => error,
@@ -370,7 +367,6 @@ fn start_refuses_truncated_historical_jpeg_and_keeps_valid_jpeg_usable() {
         h.app.run("ai.open", json!({})).unwrap();
         h.step();
         h.step();
-        assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
         let result = h.app.run("ai.start", json!({"prompt":"current request"}));
         if refused {
             let error = match result {
@@ -442,7 +438,6 @@ fn start_refuses_service_unsupported_lossless_jpeg_and_keeps_normal_jpeg_usable(
         h.app.run("ai.open", json!({})).unwrap();
         h.step();
         h.step();
-        assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
         let result = h.app.run("ai.start", json!({"prompt":"current request"}));
         if refused {
             let error = match result {

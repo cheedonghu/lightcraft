@@ -83,7 +83,6 @@ fn corrupt_owned_message_shows_a_localized_placeholder_keeps_neighbors_and_block
             assert!(h.painted_text().iter().any(|text| text == placeholder));
             assert!(!h.painted_text().iter().any(|text| text.contains("MIDDLE")));
             assert!(h.app.run("ai.status", json!({})).unwrap()["historyError"].is_string());
-            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
             assert_eq!(
                 h.app.run("ai.start", json!({"photo":photo.0})).unwrap_err(),
                 tr("The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.")
@@ -296,7 +295,6 @@ fn cold_damaged_inner_history_keeps_verified_text_blocks_submission_and_confirms
             assert!(h.painted_text().iter().any(|text| text == "Readable request from damaged history"));
             assert!(h.painted_text().iter().any(|text| text == "Readable response from damaged history"));
             assert!(h.painted_text().iter().any(|text| text == "Keep A unsent request"));
-            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
             assert_eq!(
                 h.app.run("ai.start", json!({"photo":a.0})).unwrap_err(),
                 tr("The AI history is incomplete or invalid. Local history is retained. Repair attachments or delete the conversation to retry.")

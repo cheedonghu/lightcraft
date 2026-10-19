@@ -111,97 +111,6 @@ fn long_messages_scroll_without_moving_the_composer() {
 }
 
 #[test]
-fn real_consent_start_revoke_and_strip_collapse_work_in_both_languages() {
-    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
-        let mut h = headless([1000.0, 680.0]);
-        h.app.services.write = Some(Box::new(lightcraft_engine::export::write_file));
-        h.app.services.png = Some(Box::new(|image| {
-            lightcraft_engine::export::encode_image(
-                image,
-                &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() },
-            )
-            .unwrap()
-        }));
-        h.app.ui.language = language;
-        h.app.ui.settings.gpu = false;
-        let (connection, requests, _events) = network::test_connection();
-        h.app.ai.connection = Some(connection);
-        h.app.ai.generation = h.app.session.library_generation();
-        h.app.run("ai.open", json!({})).unwrap();
-        frames(&mut h);
-        let timeout = Duration::from_secs(10);
-        assert!(h.painted_text().iter().any(|text| text == language.tr("AI Assistant")));
-        assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
-        assert!(h.app.ai.consent);
-        if h.app.ai.prompt.trim().is_empty() {
-            h.app.ai.prompt = "Review this photo.".into();
-            drafts::capture(&mut h.app);
-            frames(&mut h);
-        }
-        assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
-        assert_eq!(requests.try_recv().unwrap().path, "/v1/rounds");
-        assert!(requests.try_recv().is_err(), "measurement cannot submit another request");
-        let photo = h.app.session.active().unwrap();
-        let cancel = h.app.ai.jobs.get(&photo).unwrap().cancel.clone();
-        assert!(h.app.ui.docking.as_ref().unwrap().exposed(Panel::Tools));
-        rect(&h, "button:aiStop");
-        let checkbox = rect(&h, "checkbox:aiConsent");
-        assert!(rect(&h, "panel:right_panel").contains_rect(checkbox));
-        if let Ok(dir) = std::env::var("UX06_SCREENSHOT_DIR") {
-            let shot = h.request("ui.screenshot", json!({"path":format!("{dir}/active-{}.png",language.code()),"headless":true}), timeout);
-            assert_eq!(shot["ok"], true, "{shot}");
-            let inspect = h.request("ui.inspect", json!({}), timeout);
-            assert_eq!(inspect["ok"], true);
-            std::fs::write(format!("{dir}/inspect-{}.json", language.code()), serde_json::to_vec_pretty(&inspect).unwrap()).unwrap();
-        }
-        assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
-        assert!(!h.app.ai.consent);
-        assert!(cancel.load(Ordering::Relaxed));
-        h.app.ui.presets = true;
-        frames(&mut h);
-        assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiCollapse"}), timeout)["ok"], true);
-        assert!(h.app.ui.presets, "collapsing AI only closes Tools");
-        frames(&mut h);
-        assert!(!h.app.widgets.iter().any(|(id, _)| id == "field:aiPrompt"));
-        assert_eq!(h.request("ui.clickWidget", json!({"id":"icon:ai"}), timeout)["ok"], true);
-        rect(&h, "field:aiPrompt");
-    }
-}
-
-#[test]
-fn consent_is_above_input_and_fully_visible_at_normal_and_enlarged_ui_scales() {
-    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
-        for scale in [1.0, 1.25, 1.5] {
-            let mut h = headless([1400.0, 1000.0]);
-            h.app.ui.language = language;
-            h.view.ctx.set_zoom_factor(scale);
-            h.app.run("ai.open", json!({})).unwrap();
-            frames(&mut h);
-            let checkbox = rect(&h, "checkbox:aiConsent");
-            let input = rect(&h, "field:aiPrompt");
-            let send = rect(&h, "button:aiStart");
-            let tools = rect(&h, "panel:right_panel");
-            let composer = rect(&h, "ai:composer");
-            assert!(checkbox.bottom() < input.top(), "consent must precede the input");
-            assert!(send.height() >= 30.0, "the full send button must remain visible: {send:?}");
-            assert!(send.bottom() + 12.0 <= composer.bottom(), "keep space below the input: {send:?} in {composer:?}");
-            let label = language.tr("Allow compressed previews to be sent to the cloud model");
-            let text = h
-                .view
-                .painted_shapes()
-                .iter()
-                .find_map(|shape| match shape {
-                    egui::epaint::Shape::Text(text) if text.opacity_factor > 0.0 && text.galley.text() == label => Some(text.visual_bounding_rect()),
-                    _ => None,
-                })
-                .unwrap();
-            assert!(tools.contains_rect(text) && composer.contains_rect(text), "the complete consent label must be visible: {text:?}");
-            short_snapshot(&mut h, &format!("consent-above-input-{}-{scale}", language.code()));
-        }
-    }
-}
-
-#[test]
 fn narrow_shared_panel_keeps_all_composer_controls_inside_tools() {
     for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
         let mut h = headless([880.0, 600.0]);
@@ -218,7 +127,7 @@ fn narrow_shared_panel_keeps_all_composer_controls_inside_tools() {
         frames(&mut h);
         let tools = rect(&h, "panel:right_panel");
         assert!(!h.app.widgets.iter().any(|(id, _)| id == "ai:stage"), "idle input needs no status label");
-        for id in ["field:aiPrompt", "checkbox:aiConsent", "button:aiStart"] {
+        for id in ["field:aiPrompt", "button:aiStart"] {
             assert!(tools.contains_rect(rect(&h, id)), "{id} in {language:?}: {:?} within {tools:?}", rect(&h, id));
         }
         assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiUndo"), "Undo belongs to an explicit result card, not the composer");
@@ -231,7 +140,7 @@ fn narrow_shared_panel_keeps_all_composer_controls_inside_tools() {
 }
 
 #[test]
-fn queued_stage_is_truthful_and_checkbox_revocation_saves_its_terminal_record() {
+fn queued_stage_is_truthful_and_stop_saves_its_terminal_record() {
     for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
         let (mut app, state, photo, requests, events) = super::identity_tests::started();
         let identity = state.jobs.get(&photo).unwrap().identity.clone();
@@ -250,12 +159,11 @@ fn queued_stage_is_truthful_and_checkbox_revocation_saves_its_terminal_record() 
         frames(&mut h);
         let expected = if language == crate::i18n::Locale::En { "Waiting in the queue…" } else { "排队等待处理…" };
         assert!(h.painted_text().iter().any(|text| text == expected), "phase must reflect actual queued state");
-        let response = h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10));
+        let response = h.request("ui.clickWidget", json!({"id":"button:aiStop"}), Duration::from_secs(10));
         assert_eq!(response["ok"], true);
-        assert!(!h.app.ai.consent);
         assert!(requests.try_recv().unwrap().path.ends_with("/stop"));
         let archive = h.app.session.photo_companion(photo).unwrap().unwrap();
-        assert_eq!(archive["round_records"][0]["local_terminal"], "cancelled", "checkbox cancellation follows the normal durable stop path");
+        assert_eq!(archive["round_records"][0]["local_terminal"], "cancelled", "stop follows the normal durable path");
     }
 }
 
@@ -276,8 +184,8 @@ fn cancellation_save_waits_for_a_completed_feedback_frame() {
         .unwrap();
     let before = app.session.photo_companion(photo).unwrap().unwrap().clone();
     state.defer_local_saves_for_feedback(&ctx);
-    state.set_consent(false).unwrap();
-    assert!(!state.consent);
+    state.pending_local_saves.insert(photo);
+    state.stop(photo).unwrap();
     assert!(state.jobs.is_empty());
     assert!(requests.try_recv().unwrap().path.ends_with("/stop"));
     state.poll_inner(&mut app, &ctx);
@@ -309,7 +217,7 @@ fn multiline_draft_scrolls_inside_a_fixed_composer_without_sizing_consuming_inpu
     assert!(filled_input.height() <= 54.0, "the actual text edit stays inside its fixed scroll viewport");
     assert_eq!(rect(&h, "ai:composer"), composer);
     let tools = rect(&h, "panel:right_panel");
-    for id in ["field:aiPrompt", "checkbox:aiConsent", "button:aiStart"] {
+    for id in ["field:aiPrompt", "button:aiStart"] {
         assert_eq!(h.app.widgets.iter().filter(|(key, _)| key == id).count(), 1, "only the visible pass registers {id}");
         assert!(tools.contains_rect(rect(&h, id)));
     }
@@ -403,7 +311,6 @@ fn supported_short_floating_and_stacked_tools_keep_active_controls_on_their_own_
             h.app.run("ai.open", json!({})).unwrap();
             frames(&mut h);
             let timeout = Duration::from_secs(10);
-            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
             if h.app.ai.prompt.trim().is_empty() {
                 h.app.ai.prompt = "Review this photo.".into();
                 drafts::capture(&mut h.app);
@@ -421,19 +328,14 @@ fn supported_short_floating_and_stacked_tools_keep_active_controls_on_their_own_
             }) {
                 assert!(tools.contains_rect(*target), "{id} clips outside {tools:?}: {target:?}");
             }
-            let global_entry = rect(&h, "button:aiTaskEntry");
-            assert!(!global_entry.intersects(tools), "global task entry remains outside short Tools");
-            reachable(&mut h, "checkbox:aiConsent", -1.0);
+            assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:aiTaskEntry"), "open Tools header replaces the global task strip");
+            reachable(&mut h, "button:aiStop", -1.0);
             short_snapshot(&mut h, &format!("short-active-{}-{}-{}", if stacked { "stack" } else { "float" }, height as usize, language.code()));
-            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
-            assert!(!h.app.ai.consent);
+            reachable(&mut h, "button:aiStop", -1.0);
+            assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStop"}), timeout)["ok"], true);
             assert!(cancel.load(Ordering::Relaxed));
-            assert_eq!(h.app.ui.zoom, zoom, "AI consent cannot click/zoom the photo behind its pane");
-            reachable(&mut h, "checkbox:aiConsent", 1.0);
-            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
-            assert!(h.app.ai.consent);
-            assert!(cancel.load(Ordering::Relaxed), "re-consent never revives the stopped job");
-            reachable(&mut h, "button:aiStop", 1.0);
+            assert_eq!(h.app.ui.zoom, zoom, "AI stop cannot click/zoom the photo behind its pane");
+            reachable(&mut h, "button:aiStop", -1.0);
             assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStop"}), timeout)["ok"], true);
             assert_eq!(h.app.ui.zoom, zoom);
         }
@@ -468,8 +370,6 @@ fn supported_short_tools_allow_idle_draft_clear_and_start_through_visible_widget
             assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiClearConfirm"}), timeout)["ok"], true);
             assert!(h.app.session.photo_companion(photo).unwrap().is_none());
             assert_eq!(h.app.ai.prompt, "Please keep natural colors.");
-            reachable(&mut h, "checkbox:aiConsent", 1.0);
-            assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
             reachable(&mut h, "button:aiStart", -1.0);
             if h.app.ai.prompt.trim().is_empty() {
                 h.app.ai.prompt = "Review this photo.".into();
@@ -556,7 +456,6 @@ fn real_reading_offset_is_photo_scoped_and_user_scroll_stops_tail_following() {
     let timeout = Duration::from_secs(10);
     let (connection, requests, events) = network::test_connection();
     h.app.ai.next_connection = Some(connection);
-    h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
     if h.app.ai.prompt.trim().is_empty() {
         h.app.ai.prompt = "Review this photo.".into();
         drafts::capture(&mut h.app);
@@ -683,7 +582,6 @@ fn rejected_other_photo_submission_does_not_replace_the_visible_authored_draft()
     let timeout = Duration::from_secs(10);
     h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
     h.request("ui.text", json!({"text":"A authored draft"}), timeout);
-    h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
     assert!(h.app.run("ai.start", json!({"photo":b.0,"prompt":"wrong B request"})).is_err());
     frames(&mut h);
     assert_eq!(h.app.session.companion_editor(a).unwrap().draft, "A authored draft");
@@ -1084,7 +982,6 @@ fn first_stop_feedback_does_not_read_a_cold_other_photo_editor_or_show_the_task_
     h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
     h.request("ui.text", json!({"text":"A immutable stopped request"}), timeout);
     assert_eq!(h.app.ai.prompt, "A immutable stopped request");
-    h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
     h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout);
     let creation = requests.try_recv().unwrap();
     assert_eq!(creation.path, "/v1/rounds");

@@ -1288,7 +1288,6 @@ fn complete_legacy_tools_and_image_project_without_giant_additive_metadata() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     h.app.run("ai.start", json!({"prompt":"New complete request"})).unwrap();
     let creation = legacy_outgoing(&mut h, &requests, "/v1/rounds");
     events.send(network::Event::Server {kind:"round.state".into(),data:json!({"round_id":"legacy-projection-new","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"library_generation":creation.identity.scope.library_generation,"photo_id":creation.identity.scope.photo.0},"state":"awaiting_input"}})}).unwrap();
@@ -1740,7 +1739,6 @@ fn small_legacy_png_with_deep_additive_image_metadata_keeps_visible_text_and_ima
             if !native {
                 let (connection, requests, _) = network::test_connection();
                 h.app.ai.connection = Some(connection);
-                assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(5))["ok"], true);
                 let submitted = h.app.run("ai.start", json!({"prompt":"Continue from the complete original history"}));
                 assert!(submitted.is_ok(), "complete retained history must remain submit-capable: {submitted:?}");
                 native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
@@ -2051,7 +2049,6 @@ fn memory_history_submission_paints_and_stops_before_captured_record_reader_reti
     assert!(h.settle(Duration::from_secs(15)));
     let (connection, requests, _) = network::test_connection();
     h.app.ai.next_connection = Some(connection);
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(5))["ok"], true);
     {
         let mut state = gate.0.lock().unwrap();
         state.transaction = header.transaction_id.clone();

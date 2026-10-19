@@ -103,7 +103,7 @@ fn stopped_timed_out_and_disconnected_reads_keep_successes_without_failed_unexec
                 let painted = h.painted_text().join(" ");
                 assert!(painted.contains(expected_reason), "{cause} {partial}: {painted}");
                 let expected = match (language, partial) {
-                    (crate::i18n::Locale::En, true) => "Viewed 1 type of photo information",
+                    (crate::i18n::Locale::En, true) => "Viewed 1 info type",
                     (crate::i18n::Locale::En, false) => "Photo information reading incomplete",
                     (_, true) => "查看了 1 项照片信息",
                     (_, false) => "照片信息读取未完成",
@@ -245,7 +245,7 @@ fn rejected_read_guard_is_not_an_attempted_tool_failure() {
             h.step();
         }
         let paint = h.painted_text().join(" ");
-        assert!(paint.contains(if stale { "Photo information reading incomplete" } else { "Tool activity" }), "{paint}");
+        assert!(paint.contains(if stale { "Photo information reading incomplete" } else { "Working on the photo" }), "{paint}");
         assert!(!paint.contains("Reading histogram failed") && !paint.contains("Preparing to") && !paint.contains("Viewed 1"), "{paint}");
         let messages = h.app.session.companion_messages_page(photo, 0, 20).unwrap().records;
         let result = messages.iter().find(|message| message["tool_call_id"] == "hist").unwrap();

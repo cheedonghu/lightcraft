@@ -26,7 +26,6 @@ fn live_in(session: lightcraft_engine::Session) -> (Headless, mpsc::Receiver<net
             h.step();
         }
     }
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     h.app.run("ai.start", json!({"prompt":"Improve this photo"})).unwrap();
     let create = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
     events.send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"write-progress-round","payload":{"submission_seq":create.identity.submission_seq,"photo_ref":create.body["photo_ref"],"state":"awaiting_input"}}) }).unwrap();
@@ -65,7 +64,7 @@ fn proposed_adjustments_do_not_claim_local_execution_in_either_language() {
 fn continuous_read_and_write_progress_keeps_success_count_during_prepare_apply_and_publish() {
     fn mixed_caption(h: &mut Headless, name: &str, en: &str, zh: &str) {
         for (command, locale, state, count) in
-            [("app.language.english", "en", en, "2 types"), ("app.language.simplifiedChinese", "zh-hans", zh, "2 项信息")]
+            [("app.language.english", "en", en, "2 types"), ("app.language.simplifiedChinese", "zh-hans", zh, "2 类信息")]
         {
             h.app.run(command, json!({})).unwrap();
             for width in [1000.0, 1400.0] {
@@ -138,9 +137,9 @@ fn continuous_read_and_write_progress_keeps_success_count_during_prepare_apply_a
     for _ in 0..4 {
         h.step();
     }
-    let captions: Vec<_> = h.painted_text().into_iter().filter(|text| text.contains("Applied; confirming")).collect();
+    let captions: Vec<_> = h.painted_text().into_iter().filter(|text| text.contains("Adjustments applied")).collect();
     assert!(captions.iter().any(|text| text.contains("2 types")), "publication cannot erase completed reads: {captions:?}");
-    mixed_caption(&mut h, "published", "Applied; confirming", "已应用，待确认");
+    mixed_caption(&mut h, "published", "Adjustments applied", "调整已应用");
     assert_eq!(h.app.session.develop_of(photo).unwrap().light.exposure, 0.4);
     assert!(!h.painted_text().join(" ").contains("Viewed 3"), "writes are not another information category");
     // The published feedback closes that segment; review prose and its genuine

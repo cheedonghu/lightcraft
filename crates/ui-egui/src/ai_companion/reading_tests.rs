@@ -39,7 +39,6 @@ pub(super) fn progress_live() -> (Headless, mpsc::Receiver<network::Request>, mp
     let (connection, requests, events) = network::test_connection();
     h.app.ai.connection = Some(connection);
     h.app.ai.generation = h.app.session.library_generation();
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     h.app.run("ai.start", json!({"prompt":"Inspect the photo"})).unwrap();
     let creation = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
     events.send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"progress-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":creation.identity.scope.library_generation},"state":"awaiting_input"}}) }).unwrap();
@@ -56,18 +55,18 @@ fn photo_read_progress_replaces_paired_records_and_waits_truthfully_for_model() 
     for _ in 0..4 {
         h.step();
     }
-    assert!(h.painted_text().join(" ").contains("Preparing to view photo state"), "{:?}", h.painted_text());
+    assert!(h.painted_text().join(" ").contains("Viewing photo information…"), "{:?}", h.painted_text());
     events.send(network::Event::Server { kind:"tool.request".into(), data:json!({"round_id":"progress-round","payload":{"tool_call_id":"state","tool_request_id":"state-request","tool_name":"get_photo_state","expected_revision":h.app.session.photo_revision(photo)}}) }).unwrap();
     native_history_tests::outgoing(&mut h, &requests, "/tool-results");
     for _ in 0..4 {
         h.step();
     }
     let painted = h.painted_text().join(" ");
-    assert!(painted.contains("Viewed 1 info type · ") && painted.contains("; analyzing"), "{painted}");
+    assert!(painted.contains("Viewed 1 info type · "), "{painted}");
     assert!(!painted.contains("Viewing photo state") && !painted.contains("Tool response recorded."));
     let progress_widgets: Vec<_> = h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:aiToolSegment:")).collect();
     assert_eq!(progress_widgets.len(), 1, "request and result share one line");
-    assert!(h.painted_text().join(" ").contains("Processing · tool activity"));
+    assert!(h.painted_text().join(" ").contains(if crate::i18n::language() == crate::i18n::Locale::ZhHans { "处理过程" } else { "Processing" }));
     h.app.run("ai.stop", json!({})).unwrap();
 }
 
@@ -105,11 +104,7 @@ fn six_read_categories_deduplicate_and_new_body_preserves_separate_guidance_acti
     for _ in 0..4 {
         h.step();
     }
-    assert!(
-        h.painted_text().join(" ").contains("Viewed 6 info types · ") && h.painted_text().join(" ").contains("; analyzing"),
-        "{:?}",
-        h.painted_text()
-    );
+    assert!(h.painted_text().join(" ").contains("Viewed 6 info types · "), "{:?}", h.painted_text());
     events
         .send(network::Event::Server {
             kind: "text.delta".into(),
@@ -122,7 +117,7 @@ fn six_read_categories_deduplicate_and_new_body_preserves_separate_guidance_acti
         h.step();
     }
     let painted = h.painted_text().join(" ");
-    assert!(painted.contains("Photography guidance response recorded; continuing analysis"), "{painted}");
+    assert!(painted.contains("Reading photography guidance…"), "{painted}");
     assert!(painted.contains("Viewed 6 info types · ") && !painted.contains("Viewed 7"));
     assert_eq!(h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:aiToolSegment:")).count(), 2);
     assert!(!painted.contains("private_"));
@@ -148,7 +143,10 @@ fn six_read_categories_deduplicate_and_new_body_preserves_separate_guidance_acti
         h.step();
     }
     let painted = h.painted_text().join(" ");
-    assert!(painted.contains("Keep the natural colors.") && painted.contains("Processing · tool activity"));
+    assert!(
+        painted.contains("Keep the natural colors.")
+            && painted.contains(if crate::i18n::language() == crate::i18n::Locale::ZhHans { "处理过程" } else { "Processing" })
+    );
     assert!(!painted.contains("Viewed 6"), "normal completion folds the process");
     assert_eq!(h.request("ui.clickWidget", json!({"id":format!("button:aiProcess:{local_round}")}), Duration::from_secs(10))["ok"], true);
     for _ in 0..4 {
@@ -197,15 +195,15 @@ fn photo_tool_single_line_stays_within_bilingual_narrow_panel() {
             assert!(segment.height() < 30.0, "one line must stay one line");
             let expected = if language == crate::i18n::Locale::ZhHans { "查看了 1 项照片信息 · " } else { "Viewed 1 info type · " };
             assert!(h.painted_text().join(" ").contains(expected));
-            let tool_hint = if language == crate::i18n::Locale::ZhHans { "含工具记录" } else { "tool activity" };
-            let mut visible_outer_hint = false;
+            let process_title = if language == crate::i18n::Locale::ZhHans { "处理过程" } else { "Processing" };
+            let mut visible_process_heading = false;
             for shape in h.view.painted_shapes() {
                 if let egui::epaint::Shape::Text(ref text) = shape
-                    && text.galley.text().contains(tool_hint)
+                    && text.galley.text() == process_title
                 {
                     let glyphs: String = text.galley.rows.iter().flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr)).collect();
-                    assert!(glyphs.contains(tool_hint), "outer process must visibly disclose its tools: {glyphs}");
-                    visible_outer_hint = true;
+                    assert!(glyphs.contains(process_title), "outer process heading must be readable: {glyphs}");
+                    visible_process_heading = true;
                 }
                 if let egui::epaint::Shape::Text(text) = shape
                     && text.galley.text().starts_with(expected)
@@ -217,7 +215,7 @@ fn photo_tool_single_line_stays_within_bilingual_narrow_panel() {
                     );
                 }
             }
-            assert!(visible_outer_hint, "the tool hint must remain in the painted process heading");
+            assert!(visible_process_heading, "the process heading must remain visible");
             super::redesign_tests::screenshots(&mut h, &format!("tool-progress-{}-{width}", language.code()));
             let inspect = h.request("ui.inspect", json!({}), Duration::from_secs(10));
             assert!(inspect["result"]["perf"]["frameMs"].is_number(), "{inspect}");
@@ -484,7 +482,6 @@ fn upward_reading_survives_stream_completion_until_explicit_back_to_bottom() {
     let (connection, requests, events) = network::test_connection();
     h.app.ai.connection = Some(connection); // varying external transport adapter
     h.app.ai.generation = h.app.session.library_generation();
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     h.app.run("ai.start", json!({"prompt":"Read this photo"})).unwrap();
     let creation = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
     events.send(network::Event::Server{kind:"round.state".into(),data:json!({"round_id":"reading-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":creation.identity.scope.library_generation},"state":"queued"}})}).unwrap();
@@ -1078,7 +1075,6 @@ fn submitted_authored_state_json_survives_pre_input_stop_in_status_and_conversat
     for _ in 0..4 {
         h.step();
     }
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     let prompt = "Please explain this exact payload.\nActual photo state: {\"exposure\":0}";
     h.app.run("ai.start", json!({"prompt":prompt})).unwrap();
     let immediate = h.app.run("ai.status", json!({})).unwrap();
@@ -1102,7 +1098,6 @@ fn genuine_input_enrichment_hides_machine_state_and_preserves_authored_json() {
     h.app.ai.connection = Some(connection); // approved external transport adapter
     h.app.ai.generation = h.app.session.library_generation();
     let timeout = Duration::from_secs(20);
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
     let prompt = "Please explain this exact payload.\nActual photo state: {\"exposure\":0}";
     h.app.run("ai.start", json!({"prompt":prompt})).unwrap();
     let deadline = Instant::now() + timeout;

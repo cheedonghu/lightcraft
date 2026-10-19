@@ -29,7 +29,7 @@ impl Drop for NativeLibrary {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
-fn consent(app: LightcraftApp) -> (crate::headless::Headless, mpsc::Receiver<network::Request>, mpsc::SyncSender<network::Event>) {
+fn opened(app: LightcraftApp) -> (crate::headless::Headless, mpsc::Receiver<network::Request>, mpsc::SyncSender<network::Event>) {
     let mut app = app;
     let (connection, requests, events) = network::test_connection();
     app.ai.generation = app.session.library_generation();
@@ -38,7 +38,6 @@ fn consent(app: LightcraftApp) -> (crate::headless::Headless, mpsc::Receiver<net
     h.app.run("ai.open", json!({})).unwrap();
     h.step();
     h.step();
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
     (h, requests, events)
 }
 pub(super) fn wait_idle(h: &mut crate::headless::Headless, requests: &mpsc::Receiver<network::Request>) -> Value {
@@ -65,7 +64,7 @@ fn native_orphan_tool_history_refuses_before_create_and_retains_readable_records
     let before = app.session.companion_messages_page(photo, 0, 2).unwrap().records;
     app.session.close_library().unwrap();
     drop(app);
-    let (mut h, requests, _events) = consent(library.open());
+    let (mut h, requests, _events) = opened(library.open());
     assert_eq!(h.app.run("ai.start", json!({"prompt":"current native request"})).unwrap()["started"], true);
     let status = wait_idle(&mut h, &requests);
     assert!(status["text"].as_str().unwrap().contains("history is incomplete or invalid"), "{status}");
@@ -85,7 +84,7 @@ fn native_current_photo_envelope_overflow_refuses_before_create_without_dropping
     let before = app.session.companion_messages_page(photo, 0, 1).unwrap().records;
     app.session.close_library().unwrap();
     drop(app);
-    let (mut h, requests, _events) = consent(library.open());
+    let (mut h, requests, _events) = opened(library.open());
     assert_eq!(h.app.run("ai.start", json!({"prompt":"actual current request"})).unwrap()["started"], true);
     let status = wait_idle(&mut h, &requests);
     assert!(status["text"].as_str().unwrap().contains("service limit"), "{status}");
@@ -131,7 +130,7 @@ fn native_legal_projection_keeps_all_complete_records_and_reserves_frozen_photo_
     assert_eq!(stored, 1033);
     app.session.close_library().unwrap();
     drop(app);
-    let (mut h, requests, events) = consent(library.open());
+    let (mut h, requests, events) = opened(library.open());
     h.app.run("develop.set", json!({"control":"light.exposure","value":0.3})).unwrap();
     h.app.run("ai.start", json!({"prompt":"immutable current request"})).unwrap();
     // A subsequent draft-changing invocation is refused but must not replace the leased prompt.
@@ -196,7 +195,7 @@ fn native_historical_images_validate_bytes_owner_and_digest_before_create() {
         }
         app.session.close_library().unwrap();
         drop(app);
-        let (mut h, requests, _events) = consent(library.open());
+        let (mut h, requests, _events) = opened(library.open());
         h.app.run("ai.start", json!({"prompt":"real native image request"})).unwrap();
         if case == "valid" {
             outgoing(&mut h, &requests, "/v1/rounds");
@@ -275,7 +274,7 @@ impl Store for GatedFiles {
     }
 }
 #[test]
-fn native_stop_during_preview_read_prevents_old_input_after_reconsent_and_allows_fresh_submission() {
+fn native_stop_during_preview_read_prevents_old_input_and_allows_fresh_submission() {
     let library = NativeLibrary::new();
     let mut app = library.open();
     let photo = app.session.active().unwrap();
@@ -296,7 +295,7 @@ fn native_stop_during_preview_read_prevents_old_input_after_reconsent_and_allows
         reads: std::sync::Mutex::new(Vec::new()),
     });
     let (mut h, requests, events) =
-        consent(library.open_with(Box::new(GatedFiles { inner: FsStore::open(&library.dir).unwrap(), gate: gate.clone(), background: false })));
+        opened(library.open_with(Box::new(GatedFiles { inner: FsStore::open(&library.dir).unwrap(), gate: gate.clone(), background: false })));
     // Opening the panel now reads the visible original preview too. Finish that
     // public view load before arming the actual filesystem pause for Start.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -315,13 +314,8 @@ fn native_stop_during_preview_read_prevents_old_input_after_reconsent_and_allows
     h.app.run("ai.stop", json!({})).unwrap();
     h.step();
     h.step();
-    let timeout = Duration::from_secs(10);
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
-    let revoked = h.app.run("ai.start", json!({})).unwrap_err();
-    assert!(revoked.contains("Please consent"), "{revoked}");
     h.step();
     h.step();
-    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout)["ok"], true);
     let refused = h.app.run("ai.start", json!({"prompt":"must not overtake retiring reader"})).unwrap_err();
     assert!(refused.contains("Another AI task"), "{refused}");
     assert_eq!(h.app.run("ai.status", json!({})).unwrap()["workerBusy"], true);
@@ -350,7 +344,7 @@ fn native_stop_during_preview_read_prevents_old_input_after_reconsent_and_allows
 fn native_stop_and_failure_reopen_next_input_with_every_true_tool_result_in_original_order() {
     for terminal in ["cancelled", "failed"] {
         let library = NativeLibrary::new();
-        let (mut h, requests, events) = consent(library.open());
+        let (mut h, requests, events) = opened(library.open());
         let photo = h.app.session.active().unwrap();
         h.app.run("ai.start", json!({"prompt":"first real native round"})).unwrap();
         let creation = outgoing(&mut h, &requests, "/v1/rounds");
@@ -397,7 +391,7 @@ fn native_stop_and_failure_reopen_next_input_with_every_true_tool_result_in_orig
         drop(h);
         drop(events);
         drop(requests);
-        let (mut h, requests, events) = consent(library.open());
+        let (mut h, requests, events) = opened(library.open());
         h.app.run("ai.start", json!({"prompt":"new request after reopening"})).unwrap();
         let creation = outgoing(&mut h, &requests, "/v1/rounds");
         phase(&events, &creation, "awaiting_input");
@@ -429,7 +423,7 @@ fn native_stop_and_failure_reopen_next_input_with_every_true_tool_result_in_orig
 fn unexecuted_photo_and_knowledge_tools_reopen_as_unexecuted_without_rewriting_model_results() {
     for names in [vec!["get_photo_histogram", "skill", "apply_edit_plan"], vec!["read_skill_resource"]] {
         let library = NativeLibrary::new();
-        let (mut h, requests, events) = consent(library.open());
+        let (mut h, requests, events) = opened(library.open());
         let photo = h.app.session.active().unwrap();
         h.app.run("ai.start", json!({"prompt":"Inspect this photo"})).unwrap();
         let creation = outgoing(&mut h, &requests, "/v1/rounds");
@@ -461,7 +455,7 @@ fn unexecuted_photo_and_knowledge_tools_reopen_as_unexecuted_without_rewriting_m
         before_library_change(&mut h.app).unwrap();
         h.app.session.close_library().unwrap();
         drop(h);
-        let (mut h, requests, events) = consent(library.open());
+        let (mut h, requests, events) = opened(library.open());
         let deadline = Instant::now() + Duration::from_secs(10);
         while h.app.run("ai.status", json!({})).unwrap()["historyLoading"] == true {
             assert!(Instant::now() < deadline);
@@ -555,7 +549,7 @@ fn unexecuted_photo_and_knowledge_tools_reopen_as_unexecuted_without_rewriting_m
 #[test]
 fn native_invalid_plan_reopens_as_proposal_and_separate_actual_failure_without_fake_effect() {
     let library = NativeLibrary::new();
-    let (mut h, requests, events) = consent(library.open());
+    let (mut h, requests, events) = opened(library.open());
     let photo = h.app.session.active().unwrap();
     h.app.run("ai.start", json!({"prompt":"real plan validation round"})).unwrap();
     let creation = outgoing(&mut h, &requests, "/v1/rounds");
@@ -576,7 +570,7 @@ fn native_invalid_plan_reopens_as_proposal_and_separate_actual_failure_without_f
     drop(h);
     drop(events);
     drop(requests);
-    let (mut h, requests, events) = consent(library.open());
+    let (mut h, requests, events) = opened(library.open());
     h.app.run("ai.start", json!({"prompt":"continue after validation failure"})).unwrap();
     let creation = outgoing(&mut h, &requests, "/v1/rounds");
     phase(&events, &creation, "awaiting_input");

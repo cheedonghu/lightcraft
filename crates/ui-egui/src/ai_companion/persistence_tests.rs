@@ -24,7 +24,7 @@ fn real_initial_correction_save_reopen_retains_associations_previews_and_actual_
     let mut app = app(catalog.clone(), files.clone());
     let photo = app.session.active().unwrap();
     let (connection, requests, events) = network::test_connection();
-    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    let mut state = State { generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
     state.start(&mut app).unwrap();
     requests.try_recv().unwrap();
     let local = state.jobs[&photo].identity.local_round_id.clone();
@@ -144,7 +144,7 @@ fn pure_explanation_round_is_saved_and_reopens_without_a_result_or_resumed_job()
     let mut app = app(catalog.clone(), files.clone());
     let photo = app.session.active().unwrap();
     let (connection, requests, _) = network::test_connection();
-    let mut state = State { consent: true, connection: Some(connection), ..Default::default() };
+    let mut state = State { connection: Some(connection), ..Default::default() };
     state.start(&mut app).unwrap();
     requests.try_recv().unwrap();
     phase(&mut state, &mut app, photo, "awaiting_input");
@@ -206,7 +206,7 @@ fn failed_render_saves_true_failure_and_late_receipt_cannot_claim_a_successful_p
     let original = app.session.develop_of(photo).unwrap();
     let revision = app.session.photo_revision(photo);
     let (connection, requests, events) = network::test_connection();
-    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    let mut state = State { generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
     state.start(&mut app).unwrap();
     requests.try_recv().unwrap();
     phase(&mut state, &mut app, photo, "awaiting_input");
@@ -263,7 +263,7 @@ fn invalid_plan_failure_reopens_as_failed_without_claiming_user_cancellation() {
     let photo = app.session.active().unwrap();
     let original = app.session.develop_of(photo).unwrap();
     let (connection, requests, events) = network::test_connection();
-    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    let mut state = State { generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
     state.start(&mut app).unwrap();
     requests.try_recv().unwrap();
     let identity = state.jobs[&photo].identity.clone();
@@ -296,7 +296,7 @@ fn post_failure_and_explicit_stop_preserve_published_result_but_have_distinct_te
         let mut app = app(catalog.clone(), files.clone());
         let photo = app.session.active().unwrap();
         let (connection, requests, events) = network::test_connection();
-        let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+        let mut state = State { generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
         state.start(&mut app).unwrap();
         requests.try_recv().unwrap();
         let identity = state.jobs[&photo].identity.clone();
@@ -350,7 +350,6 @@ fn real_stop_or_failure_recovers_the_owning_request_and_preserves_another_photo_
         h.app.ai.next_connection = Some(connection);
         h.request("ui.clickWidget", json!({"id":"field:aiPrompt"}), timeout);
         h.request("ui.text", json!({"text":"A submitted immutable request"}), timeout);
-        h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), timeout);
         assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiStart"}), timeout)["ok"], true);
         let creation = requests.try_recv().unwrap();
         assert_eq!(h.app.session.companion_editor(a).unwrap().draft, "");
@@ -409,7 +408,7 @@ fn a_new_round_seals_saved_history_but_old_late_confirmation_survives_later_tail
     let mut app = app(catalog.clone(), files.clone());
     let photo = app.session.active().unwrap();
     let (connection, requests, events) = network::test_connection();
-    let mut state = State { consent: true, generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
+    let mut state = State { generation: app.session.library_generation(), connection: Some(connection), ..Default::default() };
     state.start(&mut app).unwrap();
     requests.try_recv().unwrap();
     phase(&mut state, &mut app, photo, "awaiting_input");

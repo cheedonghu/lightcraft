@@ -4,7 +4,7 @@ use super::*;
 #[test]
 fn real_read_timing_survives_reopen_and_replay_without_entering_model_input() {
     let library = NativeLibrary::new();
-    let (mut h, requests, events) = consent(library.open());
+    let (mut h, requests, events) = opened(library.open());
     let photo = h.app.session.active().unwrap();
     h.app.run("ai.start", json!({"prompt":"Read photo information"})).unwrap();
     let creation = outgoing(&mut h, &requests, "/v1/rounds");
@@ -39,7 +39,7 @@ fn real_read_timing_survives_reopen_and_replay_without_entering_model_input() {
     before_library_change(&mut h.app).unwrap();
     h.app.session.close_library().unwrap();
     drop(h);
-    let (mut h, requests, events) = consent(library.open());
+    let (mut h, requests, events) = opened(library.open());
     for _ in 0..6 {
         h.step();
     }
@@ -61,7 +61,7 @@ fn real_read_timing_survives_reopen_and_replay_without_entering_model_input() {
 #[test]
 fn reused_tool_request_with_different_arguments_does_not_claim_a_cached_execution() {
     let library = NativeLibrary::new();
-    let (mut h, requests, events) = consent(library.open());
+    let (mut h, requests, events) = opened(library.open());
     let photo = h.app.session.active().unwrap();
     h.app.run("ai.start", json!({"prompt":"Inspect once"})).unwrap();
     let creation = outgoing(&mut h, &requests, "/v1/rounds");
@@ -130,7 +130,7 @@ fn saved_progress(messages: &[Value]) -> crate::headless::Headless {
             &json!({"schema_version":2}),
         )
         .unwrap();
-    let (mut h, _, _) = consent(app);
+    let (mut h, _, _) = opened(app);
     let deadline = Instant::now() + Duration::from_secs(10);
     while h.app.run("ai.status", json!({})).unwrap()["historyLoading"] != false {
         h.step();
@@ -202,9 +202,9 @@ fn historical_summary_uses_complete_measured_calls_and_rejects_mismatched_facts(
         } else if case == "repeated-category" {
             assert!(painted.contains("Viewed 1 info type · 2.1s"), "{case}: {painted}");
         } else if matches!(case, "partial" | "untimed-guidance") {
-            assert!(h.painted_text().iter().any(|line| line == "Viewed 2 types of photo information"), "{case}: {painted}");
+            assert!(h.painted_text().iter().any(|line| line == "Viewed 2 info types"), "{case}: {painted}");
         } else if case == "wrong-round" {
-            assert!(h.painted_text().iter().any(|line| line == "Viewed 1 type of photo information"), "{case}: {painted}");
+            assert!(h.painted_text().iter().any(|line| line == "Viewed 1 info type"), "{case}: {painted}");
         } else {
             assert!(h.painted_text().iter().any(|line| line == "Photo information activity") && !painted.contains("2.1s"), "{case}: {painted}");
         }
