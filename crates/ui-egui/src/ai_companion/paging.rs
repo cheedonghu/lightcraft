@@ -240,6 +240,16 @@ impl State {
                                                     | "legacy_hidden_text"
                                                     | "local_message_id"
                                                     | "local_round_id"
+                                                    | "tool_call_id"
+                                                    | "tool_request_id"
+                                                    | "tool_name"
+                                                    | "stage"
+                                                    | "model_call_id"
+                                                    | "display_outcome"
+                                                    | "display_elapsed_us"
+                                                    | "display_write_state"
+                                                    | "display_delivery_state"
+                                                    | "display_plan_id"
                                                     | "images"
                                             )
                                         });

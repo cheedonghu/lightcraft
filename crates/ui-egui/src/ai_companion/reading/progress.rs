@@ -25,14 +25,21 @@ impl Activity<'_> {
         self.call["name"].as_str().or_else(|| self.call["function"]["name"].as_str()).unwrap_or_default()
     }
     fn matches(&self, result: &Value) -> bool {
-        result["tool_call_id"] == self.call["id"]
-            && result["local_round_id"] == self.owner["local_round_id"]
+        self.call["id"].as_str().is_some_and(|id| !id.is_empty() && result["tool_call_id"].as_str() == Some(id))
+            && self.owner["local_round_id"].as_str().is_some_and(|round| !round.is_empty() && result["local_round_id"].as_str() == Some(round))
             && result["stage"] == self.owner["stage"]
             && result["model_call_id"] == self.owner["model_call_id"]
+            && result.get("tool_name").is_none_or(|name| name.as_str() == Some(self.name()))
     }
     fn succeeded(&self) -> bool {
         // Completion alone also describes cancelled/unexecuted protocol results.
         self.result.is_some_and(|result| result["display_outcome"] == "succeeded")
+    }
+    fn elapsed_us(&self) -> Option<u64> {
+        let result = self.result?;
+        // A stored duration alone cannot prove execution. Writes record their
+        // actual publication separately from the proposal's protocol response.
+        (self.succeeded() || result["display_write_state"] == "published").then(|| result["display_elapsed_us"].as_u64()).flatten()
     }
 }
 
@@ -84,7 +91,7 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     let categories: BTreeSet<_> =
         activities.iter().filter(|activity| activity.succeeded()).filter_map(|activity| category(activity.name())).collect();
     let pending = activities.iter().find(|activity| activity.result.is_none());
-    let label = if let Some(activity) = pending.filter(|_| continuing) {
+    let mut label = if let Some(activity) = pending.filter(|_| continuing) {
         tr(planned(activity.name())).to_owned()
     } else if !categories.is_empty() {
         let template = match (categories.len() == 1, continuing) {
@@ -108,7 +115,22 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     } else {
         tr("Tool activity").to_owned()
     };
-    let header = egui::CollapsingHeader::new(single_line(ui, label.as_str()))
+    let mut caption = label.clone();
+    if !categories.is_empty()
+        && let Some(total) = activities.iter().try_fold(0u64, |total, activity| total.checked_add(activity.elapsed_us()?))
+    {
+        let duration = format!("{:.1}s", total as f64 / 1_000_000.0);
+        label.push_str(&format!(" · {duration}"));
+        // Keep the count and time visible in a narrow pane. The full, precise
+        // description (including the waiting phase) remains the tooltip.
+        caption = tr(if categories.len() == 1 { "Viewed 1 info type · {time}" } else { "Viewed {count} info types · {time}" })
+            .replace("{count}", &categories.len().to_string())
+            .replace("{time}", &duration);
+        if continuing {
+            caption.push_str(tr("; analyzing"));
+        }
+    }
+    let header = egui::CollapsingHeader::new(single_line(ui, caption.as_str()))
         .id_salt(("ai-tool-segment", first.round(), first.id()))
         .default_open(false)
         .show(ui, |ui| {
