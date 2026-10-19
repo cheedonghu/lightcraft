@@ -170,9 +170,31 @@ pub(super) fn show(
         let has_pending = running && !conversation.pending.is_empty();
         if group.iter().any(|row| Some(row.id()) != final_id) || has_pending {
             let has_tools = group.iter().any(|row| row.message.is_some_and(progress::has_tools));
+            let adjacent_start = !(index == history_len && history_continues);
+            let start_known = if index == 0 {
+                conversation.prefix.is_none() || conversation.view.as_ref().is_some_and(|view| view.cursor.record == 0 && view.cursor.offset == 0)
+            } else {
+                adjacent_start
+                    && rows.get(index - 1).is_some_and(|previous| {
+                        previous.fragment.is_none()
+                            && previous.message.is_some_and(|message| {
+                                message["role"] == "user"
+                                    || execution_feedback(message)
+                                    || previous.round().is_some_and(|previous| previous != round)
+                                    || (message["role"] == "assistant" && message["text"].as_str().is_some_and(|text| !text.trim().is_empty()))
+                            })
+                    })
+            };
+            let end_known = end != history_len || !history_continues;
             process(ui, round, running, has_tools, |ui| {
                 let process_rows: Vec<_> = group.iter().filter(|row| Some(row.id()) != final_id).collect();
-                progress::show(ui, &process_rows, attachments, running && conversation.pending.is_empty());
+                progress::show(
+                    ui,
+                    &process_rows,
+                    attachments,
+                    running && conversation.pending.is_empty(),
+                    progress::Range { start_known, end_known },
+                );
                 if has_pending {
                     pending(ui, conversation);
                 }

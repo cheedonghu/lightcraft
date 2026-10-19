@@ -203,8 +203,10 @@ fn historical_summary_uses_complete_measured_calls_and_rejects_mismatched_facts(
             assert!(painted.contains("Viewed 1 info type · 2.1s"), "{case}: {painted}");
         } else if matches!(case, "partial" | "untimed-guidance") {
             assert!(h.painted_text().iter().any(|line| line == "Viewed 2 types of photo information"), "{case}: {painted}");
-        } else {
+        } else if case == "wrong-round" {
             assert!(h.painted_text().iter().any(|line| line == "Viewed 1 type of photo information"), "{case}: {painted}");
+        } else {
+            assert!(h.painted_text().iter().any(|line| line == "Photo information activity") && !painted.contains("2.1s"), "{case}: {painted}");
         }
         assert!(!painted.contains("private_"), "{case}: {painted}");
         if case == "complete" {
@@ -255,7 +257,7 @@ fn paged_result_fragments_and_photo_switch_do_not_invent_complete_segment_time()
     let original = h.app.session.active().unwrap();
     let other = h.app.session.catalog.photos().find(|p| p.id != original).unwrap().id;
     let text = h.painted_text().join(" ");
-    assert!(text.contains("Viewed 1 type of photo information"), "{text}");
+    assert!(text.contains("Photo information activity"), "{text}");
     assert!(!text.contains("Viewed 2") && !text.contains("2.1s") && !text.contains("private_"), "{text}");
     assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiHistoryNewer"}), Duration::from_secs(10))["ok"], true);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -279,4 +281,35 @@ fn paged_result_fragments_and_photo_switch_do_not_invent_complete_segment_time()
     }
     assert!(!h.painted_text().join(" ").contains("2.1s"));
     assert_eq!(h.app.session.companion_messages_page(original, 0, 4).unwrap().records, messages);
+}
+
+#[test]
+fn complete_tool_batches_at_page_boundaries_never_claim_the_visible_subtotal_is_the_segment_total() {
+    let mut messages = Vec::new();
+    for n in 0..17 {
+        messages.push(json!({"role":"assistant","text":"","local_round_id":"timing","local_message_id":format!("batch-{n}"),"stage":"initial","model_call_id":n,"tool_calls":[{"id":format!("read-{n}"),"name":"get_photo_state","arguments":{}}]}));
+        messages.push(json!({"role":"tool","text":"private_complete_state","local_round_id":"timing","local_message_id":format!("result-{n}"),"stage":"initial","model_call_id":n,"tool_call_id":format!("read-{n}"),"tool_name":"get_photo_state","display_outcome":"succeeded","display_elapsed_us":100_000}));
+    }
+    let mut h = saved_progress(&messages);
+    for button in [None, Some("button:aiHistoryOlder"), Some("button:aiHistoryNewer")] {
+        if let Some(button) = button {
+            assert_eq!(h.request("ui.clickWidget", json!({"id":button}), Duration::from_secs(10))["ok"], true);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while h.app.run("ai.status", json!({})).unwrap()["historyLoading"] != false {
+                h.step();
+                assert!(Instant::now() < deadline);
+            }
+            for _ in 0..4 {
+                h.step();
+            }
+        }
+        let text = h.painted_text().join(" ");
+        assert!(text.contains("Photo information activity"), "unknown continuous segment range stays neutral: {text}");
+        assert!(
+            !text.contains("1.6s") && !text.contains("0.1s") && !text.contains("private_complete_state"),
+            "a complete visible call batch is not a complete segment: {text}"
+        );
+    }
+    let photo = h.app.session.active().unwrap();
+    assert_eq!(h.app.session.companion_messages_page(photo, 0, 34).unwrap().records, messages);
 }

@@ -41,17 +41,53 @@ impl Activity<'_> {
         // actual publication separately from the proposal's protocol response.
         (self.succeeded() || result["display_write_state"] == "published").then(|| result["display_elapsed_us"].as_u64()).flatten()
     }
+    fn write_label(&self, continuing: bool, running: bool) -> Option<&'static str> {
+        if self.name() != "apply_edit_plan" {
+            return None;
+        }
+        Some(match self.result.and_then(|result| result["display_write_state"].as_str()) {
+            Some("applying") => "Applying adjustments",
+            Some("published") => match self.result.and_then(|result| result["display_delivery_state"].as_str()) {
+                Some("failed") => "Adjustments applied; feedback not delivered",
+                Some("confirmed") => "Adjustments applied",
+                _ if running => "Adjustments applied; awaiting confirmation",
+                _ => "Adjustments applied; feedback unconfirmed",
+            },
+            Some("validation_failed") => "Adjustments were not applied: plan rejected",
+            Some("render_failed") => "Adjustments were not applied: rendering failed",
+            Some("not_executed" | "not_published") => "Adjustments were not applied",
+            _ if self.result.is_none() && continuing => "Preparing adjustments",
+            _ => "Adjustment activity",
+        })
+    }
 }
 
-pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attachments::Attachments, continuing: bool) {
+pub(super) struct Range {
+    pub start_known: bool,
+    pub end_known: bool,
+}
+
+fn boundary(row: &Row<'_>) -> bool {
+    row.fragment.is_none()
+        && row.message.is_some_and(|message| {
+            message["role"] == "user"
+                || execution_feedback(message)
+                || (message["role"] == "assistant" && message["text"].as_str().is_some_and(|text| !text.trim().is_empty()))
+        })
+}
+
+pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attachments::Attachments, continuing: bool, range: Range) {
     let mut index = 0;
+    let mut beginning_known = range.start_known;
     while let Some(row) = rows.get(index) {
         let Some(message) = row.message.filter(|message| row.fragment.is_none() && message["role"] == "assistant" && has_tools(message)) else {
+            beginning_known = boundary(row);
             row.show(ui, attachments);
             index += 1;
             continue;
         };
         if message["text"].as_str().is_some_and(|text| !text.trim().is_empty()) {
+            beginning_known = true;
             message_row(ui, message, &row.fallback, attachments, false);
         }
         let mut activities = Vec::<Activity<'_>>::new();
@@ -82,16 +118,20 @@ pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attac
             }
             end += 1;
         }
-        segment(ui, row, &activities, continuing && end == rows.len());
+        let ending_known = rows.get(end).map_or(range.end_known, |row| boundary(row));
+        segment(ui, row, &activities, continuing && end == rows.len(), beginning_known && ending_known);
+        beginning_known = false;
         index = end;
     }
 }
 
-fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], continuing: bool) {
+fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], continuing: bool, complete: bool) {
+    let running = ui.ctx().data(|data| data.get_temp::<bool>(egui::Id::new("ai-process-running"))).unwrap_or(false);
     let categories: BTreeSet<_> =
-        activities.iter().filter(|activity| activity.succeeded()).filter_map(|activity| category(activity.name())).collect();
+        activities.iter().filter(|activity| complete && activity.succeeded()).filter_map(|activity| category(activity.name())).collect();
     let pending = activities.iter().find(|activity| activity.result.is_none());
-    let mut label = if let Some(activity) = pending.filter(|_| continuing) {
+    let write = activities.iter().rev().find(|activity| activity.name() == "apply_edit_plan");
+    let label = if let Some(activity) = pending.filter(|_| continuing) {
         tr(planned(activity.name())).to_owned()
     } else if !categories.is_empty() {
         let template = match (categories.len() == 1, continuing) {
@@ -115,7 +155,31 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     } else {
         tr("Tool activity").to_owned()
     };
-    let mut caption = label.clone();
+    let write = write.filter(|activity| {
+        activity.result.is_some_and(|result| result["display_write_state"] == "applying")
+            || activities.last().is_some_and(|last| last.name() == "apply_edit_plan")
+    });
+    let mut label = if let Some(activity) = write {
+        let write_label = tr(activity.write_label(continuing, running).unwrap_or("Adjustment activity"));
+        if categories.is_empty() {
+            write_label.to_owned()
+        } else {
+            let viewed = tr(if categories.len() == 1 { "Viewed 1 type of photo information" } else { "Viewed {count} types of photo information" })
+                .replace("{count}", &categories.len().to_string());
+            format!("{viewed} · {write_label}")
+        }
+    } else {
+        label
+    };
+    let mut caption = if let Some(activity) = write.filter(|_| !categories.is_empty()) {
+        format!(
+            "{} · {}",
+            tr(if categories.len() == 1 { "1 type" } else { "{count} types" }).replace("{count}", &categories.len().to_string()),
+            tr(compact_write(activity.write_label(continuing, running).unwrap_or("Adjustment activity")))
+        )
+    } else {
+        label.clone()
+    };
     if !categories.is_empty()
         && let Some(total) = activities.iter().try_fold(0u64, |total, activity| total.checked_add(activity.elapsed_us()?))
     {
@@ -135,7 +199,9 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
         .default_open(false)
         .show(ui, |ui| {
             for activity in activities {
-                let label = if activity.succeeded() {
+                let label = if let Some(label) = activity.write_label(continuing, running) {
+                    label
+                } else if activity.succeeded() {
                     completed(activity.name())
                 } else if activity.result.is_none() {
                     planned(activity.name())
@@ -147,6 +213,21 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
         });
     composer_widget(ui, &format!("button:aiToolSegment:{}", first.id()), header.header_response.rect);
     let _ = header.header_response.on_hover_text(label);
+}
+
+fn compact_write(label: &str) -> &str {
+    match label {
+        "Preparing adjustments" => "Preparing edits",
+        "Applying adjustments" => "Applying edits",
+        "Adjustments applied" => "Edits applied",
+        "Adjustments applied; awaiting confirmation" => "Applied; confirming",
+        "Adjustments applied; feedback unconfirmed" => "Applied; no receipt",
+        "Adjustments applied; feedback not delivered" => "Applied; send failed",
+        "Adjustments were not applied: plan rejected" => "Plan rejected",
+        "Adjustments were not applied: rendering failed" => "Render failed",
+        "Adjustments were not applied" => "Not applied",
+        _ => label,
+    }
 }
 
 fn category(name: &str) -> Option<&str> {
@@ -167,6 +248,7 @@ fn planned(name: &str) -> &str {
         "sample_photo_color" => "Preparing to sample colors",
         "skill" => "Preparing to read photography guidance",
         "read_skill_resource" => "Preparing to read reference material",
+        "apply_edit_plan" => "Preparing adjustments",
         _ => tool_activity(name),
     }
 }

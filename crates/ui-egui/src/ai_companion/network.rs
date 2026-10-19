@@ -62,10 +62,12 @@ pub struct RequestFailure {
     message: String,
     pub code: Option<String>,
     pub trace: Option<String>,
+    /// Local request correlation; never sent to the backend or model.
+    pub execution_plan_id: Option<String>,
 }
 impl From<String> for RequestFailure {
     fn from(message: String) -> Self {
-        Self { rejected: false, cancelled_before_send: false, message, code: None, trace: None }
+        Self { rejected: false, cancelled_before_send: false, message, code: None, trace: None, execution_plan_id: None }
     }
 }
 impl From<&str> for RequestFailure {
@@ -259,6 +261,7 @@ fn check_round(round: Option<&AtomicBool>, sent: usize) -> Result<(), RequestFai
             message: "已取消未完成的 AI 请求。".into(),
             code: None,
             trace: None,
+            execution_plan_id: None,
         });
     }
     Ok(())
@@ -354,6 +357,7 @@ fn post_scoped(
             cancelled_before_send: false,
             code: result.get("code").and_then(Value::as_str).map(str::to_owned),
             trace: result.get("trace_id").and_then(Value::as_str).map(str::to_owned),
+            execution_plan_id: None,
             message: format!(
                 "{}; traceId={}",
                 result.get("code").and_then(Value::as_str).unwrap_or("request_failed"),
@@ -364,7 +368,12 @@ fn post_scoped(
     if (path.ends_with("/execution") || path.ends_with("/input")) && (status != 202 || result.get("accepted").and_then(Value::as_bool) != Some(true))
     {
         return Err(RequestFailure {
-            rejected: false, cancelled_before_send: false, message: "后端回复无效。".into(), code: None, trace: None
+            rejected: false,
+            cancelled_before_send: false,
+            message: "后端回复无效。".into(),
+            code: None,
+            trace: None,
+            execution_plan_id: None,
         });
     }
     Ok(result)
@@ -461,11 +470,20 @@ fn receive(
                                     (!control).then_some(request.cancel.as_ref()),
                                 );
                                 // Local receipt correlation is never part of the backend request/model history.
-                                if request.path.ends_with("/execution")
-                                    && let Ok(response) = &mut result
-                                    && let Some(object) = response.as_object_mut()
-                                {
-                                    object.insert("_client_execution_plan_id".into(), request.body.get("plan_id").cloned().unwrap_or(Value::Null));
+                                if request.path.ends_with("/execution") {
+                                    match &mut result {
+                                        Ok(response) => {
+                                            if let Some(object) = response.as_object_mut() {
+                                                object.insert(
+                                                    "_client_execution_plan_id".into(),
+                                                    request.body.get("plan_id").cloned().unwrap_or(Value::Null),
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            error.execution_plan_id = request.body.get("plan_id").and_then(Value::as_str).map(str::to_owned);
+                                        }
+                                    }
                                 }
                                 if emit(
                                     &tx,
