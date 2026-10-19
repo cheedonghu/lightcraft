@@ -45,6 +45,9 @@ are reused instead of duplicating each branch in a second suite.
 
 ## Verification results
 
+The following table records the initial delivery at `cb825780`. Post-review
+source changes and their final verification are recorded in Final review below.
+
 Commands use `CRAFT_FONTS_DIR` pointing to the existing craft-fonts checkout and
 an isolated `CARGO_TARGET_DIR=target/agent-tool-progress-05`. Rust compiler:
 `rustc 1.99.0 (b940084d7 2026-09-28)`, macOS Apple Silicon.
@@ -127,6 +130,61 @@ build outcomes are listed above separately.
 
 ## Final review
 
-Pending the parent implement-spec run's independent Standards and Spec review
-against the fixed baseline above. This section does not imply those reviews
-have already passed.
+Independent review at `6323d801` compared the delivery with the fixed baseline:
+Standards found **zero hard violations and three P3 heuristic findings**;
+Spec found **one P2 omission**. The implementation dispositions are:
+
+| Finding | Disposition |
+|---|---|
+| P2 synthetic closure omitted the explicit unexecuted display outcome | `close_pending_tools` now adds local `display_outcome:not_executed`; original model-facing result text is unchanged. Expanded details retain each readable activity name and the explicit unexecuted fact, including pending photo reads, knowledge and writes. A knowledge-only segment cannot claim a response was recorded. |
+| P3 repeated category/planned/completed/failure switches | One AI-private `ToolDescriptor` lookup owns those facts. Legacy generic fallbacks are retained. |
+| P3 English copy used as write-status identity | Private `WriteStatus` has full and compact label accessors. Persisted state and protocol strings do not change; changing full copy cannot silently choose a different compact state. |
+| P3 duplicate boundary predicates | Outer range proof reuses `progress::boundary` and separately retains the existing complete-row changed-round rule. Adjacent-page gaps, fragments, conservative Range proofs, folding and stable control IDs are unchanged. |
+
+The new public native regression
+`native_history_tests::unexecuted_photo_and_knowledge_tools_reopen_as_unexecuted_without_rewriting_model_results`
+stops before dispatch, saves/reopens the native library, expands both containers,
+and checks English/Chinese activity identity plus non-execution at both widths.
+It then submits the original paired tool text/order to the next model input
+and confirms local metadata is excluded. It covers a pending photo/knowledge/
+write batch and a knowledge-only batch. No additional test seam was introduced.
+
+The first behavioral red painted generic read labels rather than unexecuted
+outcomes (4.94 s). After the minimal outcome fix passed, screenshot inspection
+caught indistinguishable anonymous rows. Strengthening the same public test
+failed on the missing activity names (6.77 s); details now combine the existing
+human activity label and unexecuted result. These are actual UI regressions,
+rather than compile failures or tests against private presentation helpers.
+The three small refactors took place during review, after the first P2 green.
+
+The first affected-suite run exposed two older interruption tests that still
+required the local outcome to be absent. Those expectations were updated to
+require explicit `not_executed` and no execution duration, while retaining all
+their real UI/stop/timeout/disconnect and actual-result assertions. This is
+distinct from changing or weakening the model-facing tool result.
+
+| Post-review check | Actual result |
+|---|---|
+| Same eleven affected AI families, plus the new native case | First run: **109 passed, 2 failed**, 107.70 s. Both failures were exactly the old missing-outcome assertions described above; no other failure was observed. |
+| Final `ai_companion::interruption_progress_tests::` after expectation correction | **5 passed, 0 failed**, 2.69 s. Combined with the unchanged 109 passing cases, all **111 distinct affected UI cases** are covered. This is not claimed as one clean 111-case command. |
+| Strengthened native unexecuted regression | **1 passed, 0 failed**, 18.43 s after the activity-name fix, including eight actual screenshots, native reopen and next model input. It is included in the 109 above. |
+| Four representative existing screenshot cases | **4 passed, 0 failed**, 8.88 s; existing timed/count/write/failure/complete snapshots and actual glyph checks refreshed. They are subsets of the affected UI coverage. |
+| Incremental native desktop build | Passed, 1 m 05 s. |
+| Incremental WASM check | Passed, 10.56 s. Warnings remain in the same unchanged files described above; browser runtime remains untested. |
+| Final strict native clippy after expectation correction | Passed with `-p lightcraft-ui-egui -p lightcraft-engine --all-targets -- -D warnings`, 5.48 s; no warning exemption. Format and diff checks also passed. |
+
+Post-review logs use `/tmp/ai-tool-progress-05/review-*.log`; exact build/lint
+arguments are in `review-check-results.json`. The final evidence includes
+**36 PNGs**: the original 28 refreshed plus eight named unexecuted activity
+cases. Inspected new narrow English/Chinese three-tool details identify the
+histogram, guidance and adjustment activity beside their unexecuted outcome;
+English wraps naturally without eliding either fact. Knowledge-only details
+likewise identify the reference activity and contain no recorded-response
+claim. The existing mixed applying caption and measured Chinese history were
+also inspected after refactoring. Twenty-four observed final frameMs samples
+range **0.389–0.621 ms**, with the same non-benchmark limitation above.
+
+The unchanged engine pagination source reuses its two passing checks above;
+no whole-workspace, unrelated upstream or extreme-capacity suite was added.
+Parent final recheck of the four dispositions remains pending; the initial
+review findings are not represented as independently rechecked yet.

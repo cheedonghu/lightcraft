@@ -117,7 +117,7 @@ fn stopped_timed_out_and_disconnected_reads_keep_successes_without_failed_unexec
             let pending = records.iter().find(|message| message["tool_call_id"] == "hist").unwrap();
             let result: Value = serde_json::from_str(pending["text"].as_str().unwrap()).unwrap();
             assert_eq!(result["executed"], false);
-            assert!(pending.get("display_outcome").is_none());
+            assert_eq!(pending["display_outcome"], "not_executed");
         }
     }
 }
@@ -249,7 +249,8 @@ fn rejected_read_guard_is_not_an_attempted_tool_failure() {
         assert!(!paint.contains("Reading histogram failed") && !paint.contains("Preparing to") && !paint.contains("Viewed 1"), "{paint}");
         let messages = h.app.session.companion_messages_page(photo, 0, 20).unwrap().records;
         let result = messages.iter().find(|message| message["tool_call_id"] == "hist").unwrap();
-        assert!(result.get("display_outcome").is_none() && result.get("display_elapsed_us").is_none());
+        assert_eq!(result["display_outcome"], "not_executed");
+        assert!(result.get("display_elapsed_us").is_none());
         let text: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
         assert_eq!(text["executed"], false);
     }

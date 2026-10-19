@@ -426,6 +426,133 @@ fn native_stop_and_failure_reopen_next_input_with_every_true_tool_result_in_orig
 }
 
 #[test]
+fn unexecuted_photo_and_knowledge_tools_reopen_as_unexecuted_without_rewriting_model_results() {
+    for names in [vec!["get_photo_histogram", "skill", "apply_edit_plan"], vec!["read_skill_resource"]] {
+        let library = NativeLibrary::new();
+        let (mut h, requests, events) = consent(library.open());
+        let photo = h.app.session.active().unwrap();
+        h.app.run("ai.start", json!({"prompt":"Inspect this photo"})).unwrap();
+        let creation = outgoing(&mut h, &requests, "/v1/rounds");
+        let local = creation.identity.local_round_id.as_str().to_owned();
+        phase(&events, &creation, "awaiting_input");
+        outgoing(&mut h, &requests, "/input");
+        phase(&events, &creation, "analyzing_initial");
+        let round = format!("native-round-{}", creation.identity.submission_seq);
+        let calls: Vec<_> = names.iter().enumerate().map(|(n, name)| json!({"id":format!("pending-{n}"),"name":name,"arguments":{}})).collect();
+        events
+            .send(network::Event::Server {
+                kind: "message.completed".into(),
+                data: json!({"round_id":round,"stage":"initial","payload":{"message_id":"pending-tools","model_call_id":1,"tool_calls":calls}}),
+            })
+            .unwrap();
+        h.step();
+        h.app.run("ai.stop", json!({})).unwrap();
+        outgoing(&mut h, &requests, "/stop");
+        wait_idle(&mut h, &requests);
+        let saved = h.app.session.companion_messages_page(photo, 0, 20).unwrap().records;
+        let results: Vec<_> = saved.iter().filter(|message| message["role"] == "tool").cloned().collect();
+        assert_eq!(results.len(), names.len());
+        for result in &results {
+            assert_eq!(
+                serde_json::from_str::<Value>(result["text"].as_str().unwrap()).unwrap(),
+                json!({"outcome":"cancelled","executed":false,"reason_code":"ended_before_tool_execution"})
+            );
+        }
+        before_library_change(&mut h.app).unwrap();
+        h.app.session.close_library().unwrap();
+        drop(h);
+        let (mut h, requests, events) = consent(library.open());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.app.run("ai.status", json!({})).unwrap()["historyLoading"] == true {
+            assert!(Instant::now() < deadline);
+            h.step();
+        }
+        for _ in 0..4 {
+            h.step();
+        }
+        assert_eq!(h.request("ui.clickWidget", json!({"id":format!("button:aiProcess:{local}")}), Duration::from_secs(10))["ok"], true);
+        for _ in 0..4 {
+            h.step();
+        }
+        let segment = h.app.widgets.iter().find(|(id, _)| id.starts_with("button:aiToolSegment:")).unwrap().0.clone();
+        assert_eq!(h.request("ui.clickWidget", json!({"id":segment}), Duration::from_secs(10))["ok"], true);
+        for (command, locale, expected) in
+            [("app.language.english", "en", "Tool was not executed"), ("app.language.simplifiedChinese", "zh-hans", "未执行该工具")]
+        {
+            h.app.run(command, json!({})).unwrap();
+            for width in [1000.0, 1400.0] {
+                h.size.x = width;
+                for _ in 0..4 {
+                    h.step();
+                }
+                let paint = h.painted_text().join(" ");
+                assert!(paint.matches(expected).count() >= names.len(), "each expanded tool must show the actual unexecuted result: {paint}");
+                for forbidden in [
+                    "response recorded",
+                    "返回内容已记录",
+                    "Read histogram",
+                    "已读取直方图",
+                    "Adjustments applied",
+                    "调整已应用",
+                    "Reading histogram failed",
+                    "读取直方图失败",
+                    "Viewed 1",
+                    "查看了 1",
+                ] {
+                    assert!(!paint.contains(forbidden), "unexecuted is neither a read nor a failure: {paint}");
+                }
+                let glyphs: Vec<String> = h
+                    .view
+                    .painted_shapes()
+                    .into_iter()
+                    .filter_map(|shape| match shape {
+                        egui::epaint::Shape::Text(text) => {
+                            Some(text.galley.rows.iter().flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr)).collect())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for name in &names {
+                    let activity = match (*name, locale) {
+                        ("get_photo_histogram", "en") => "Read photo histogram",
+                        ("skill", "en") => "Read photography guidance",
+                        ("apply_edit_plan", "en") => "Prepare photo adjustments",
+                        ("read_skill_resource", "en") => "Read reference material",
+                        ("get_photo_histogram", _) => "读取照片直方图",
+                        ("skill", _) => "读取摄影指导",
+                        ("apply_edit_plan", _) => "准备照片调整方案",
+                        ("read_skill_resource", _) => "读取参考资料",
+                        _ => panic!("test fixture must name its readable activity"),
+                    };
+                    let detail = format!("{activity} · {expected}");
+                    assert!(paint.contains(&detail), "an unexecuted result must identify its own activity: {paint}");
+                    let visible_detail: String = detail.chars().filter(|ch| !ch.is_whitespace()).collect();
+                    assert!(
+                        glyphs.iter().any(|text| text.chars().filter(|ch| !ch.is_whitespace()).collect::<String>().contains(&visible_detail)),
+                        "activity and non-execution must both actually remain visible"
+                    );
+                }
+                super::redesign_tests::screenshots(&mut h, &format!("unexecuted-{}-{locale}-{width}", names.len()));
+                let inspect = h.request("ui.inspect", json!({}), Duration::from_secs(10));
+                eprintln!("unexecuted {} {locale} {width}: {}", names.len(), inspect["result"]["perf"]);
+            }
+        }
+        h.app.run("ai.start", json!({"prompt":"Continue from the retained history"})).unwrap();
+        let creation = outgoing(&mut h, &requests, "/v1/rounds");
+        phase(&events, &creation, "awaiting_input");
+        let input = outgoing(&mut h, &requests, "/input");
+        let tools: Vec<_> = input.body["history"].as_array().unwrap().iter().filter(|message| message["role"] == "tool").collect();
+        assert_eq!(tools.len(), results.len());
+        for (model, saved) in tools.iter().zip(&results) {
+            assert_eq!(model["tool_call_id"], saved["tool_call_id"]);
+            assert_eq!(model["text"], saved["text"]);
+        }
+        assert!(!input.body.to_string().contains("display_outcome"));
+        h.app.run("ai.stop", json!({})).unwrap();
+    }
+}
+
+#[test]
 fn native_invalid_plan_reopens_as_proposal_and_separate_actual_failure_without_fake_effect() {
     let library = NativeLibrary::new();
     let (mut h, requests, events) = consent(library.open());

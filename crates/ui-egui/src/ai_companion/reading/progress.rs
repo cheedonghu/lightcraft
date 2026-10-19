@@ -48,6 +48,43 @@ struct Activity<'a> {
     call: &'a Value,
     result: Option<&'a Value>,
 }
+
+#[derive(Clone, Copy)]
+enum WriteStatus {
+    Preparing,
+    Applying,
+    Applied,
+    AwaitingConfirmation,
+    Unconfirmed,
+    FeedbackNotDelivered,
+    PlanRejected,
+    RenderFailed,
+    NotApplied,
+    Unknown,
+}
+impl WriteStatus {
+    fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Preparing => ("Preparing adjustments", "Preparing edits"),
+            Self::Applying => ("Applying adjustments", "Applying edits"),
+            Self::Applied => ("Adjustments applied", "Edits applied"),
+            Self::AwaitingConfirmation => ("Adjustments applied; awaiting confirmation", "Applied; confirming"),
+            Self::Unconfirmed => ("Adjustments applied; feedback unconfirmed", "Applied; no receipt"),
+            Self::FeedbackNotDelivered => ("Adjustments applied; feedback not delivered", "Applied; send failed"),
+            Self::PlanRejected => ("Adjustments were not applied: plan rejected", "Plan rejected"),
+            Self::RenderFailed => ("Adjustments were not applied: rendering failed", "Render failed"),
+            Self::NotApplied => ("Adjustments were not applied", "Not applied"),
+            Self::Unknown => ("Adjustment activity", "Adjustment activity"),
+        }
+    }
+    fn full_label(self) -> &'static str {
+        self.labels().0
+    }
+    fn compact_label(self) -> &'static str {
+        self.labels().1
+    }
+}
+
 impl Activity<'_> {
     fn name(&self) -> &str {
         self.call["name"].as_str().or_else(|| self.call["function"]["name"].as_str()).unwrap_or_default()
@@ -66,6 +103,9 @@ impl Activity<'_> {
     fn failed(&self) -> bool {
         self.result.is_some_and(failed)
     }
+    fn not_executed(&self) -> bool {
+        self.result.is_some_and(|result| result["display_outcome"] == "not_executed")
+    }
     fn elapsed_us(&self) -> Option<u64> {
         let result = self.result?;
         // A stored duration alone cannot prove execution. Writes record their
@@ -74,23 +114,26 @@ impl Activity<'_> {
             .then(|| result["display_elapsed_us"].as_u64())
             .flatten()
     }
-    fn write_label(&self, continuing: bool, running: bool) -> Option<&'static str> {
+    fn write_status(&self, continuing: bool, running: bool) -> Option<WriteStatus> {
         if self.name() != "apply_edit_plan" {
             return None;
         }
+        if self.not_executed() {
+            return Some(WriteStatus::NotApplied);
+        }
         Some(match self.result.and_then(|result| result["display_write_state"].as_str()) {
-            Some("applying") => "Applying adjustments",
+            Some("applying") => WriteStatus::Applying,
             Some("published") => match self.result.and_then(|result| result["display_delivery_state"].as_str()) {
-                Some("failed") => "Adjustments applied; feedback not delivered",
-                Some("confirmed") => "Adjustments applied",
-                _ if running => "Adjustments applied; awaiting confirmation",
-                _ => "Adjustments applied; feedback unconfirmed",
+                Some("failed") => WriteStatus::FeedbackNotDelivered,
+                Some("confirmed") => WriteStatus::Applied,
+                _ if running => WriteStatus::AwaitingConfirmation,
+                _ => WriteStatus::Unconfirmed,
             },
-            Some("validation_failed") => "Adjustments were not applied: plan rejected",
-            Some("render_failed") => "Adjustments were not applied: rendering failed",
-            Some("not_executed" | "not_published") => "Adjustments were not applied",
-            _ if self.result.is_none() && continuing => "Preparing adjustments",
-            _ => "Adjustment activity",
+            Some("validation_failed") => WriteStatus::PlanRejected,
+            Some("render_failed") => WriteStatus::RenderFailed,
+            Some("not_executed" | "not_published") => WriteStatus::NotApplied,
+            _ if self.result.is_none() && continuing => WriteStatus::Preparing,
+            _ => WriteStatus::Unknown,
         })
     }
 }
@@ -100,7 +143,7 @@ pub(super) struct Range {
     pub end_known: bool,
 }
 
-fn boundary(row: &Row<'_>) -> bool {
+pub(super) fn boundary(row: &Row<'_>) -> bool {
     row.fragment.is_none()
         && row.message.is_some_and(|message| {
             message["role"] == "user"
@@ -184,12 +227,16 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     } else if activities.iter().any(|activity| category(activity.name()).is_some()) {
         tr(if ending.is_some() { "Photo information reading incomplete" } else { "Photo information activity" }).to_owned()
     } else if let Some(activity) = activities.iter().rev().find(|activity| matches!(activity.name(), "skill" | "read_skill_resource")) {
-        let source = match (activity.name(), activity.result.is_some(), continuing) {
-            ("skill", true, true) => "Photography guidance response recorded; continuing analysis",
-            ("skill", true, false) => "Photography guidance response recorded",
-            ("read_skill_resource", true, true) => "Reference material response recorded; continuing analysis",
-            ("read_skill_resource", true, false) => "Reference material response recorded",
-            _ => planned(activity.name()),
+        let source = if activity.not_executed() {
+            "Tool was not executed"
+        } else {
+            match (activity.name(), activity.result.is_some(), continuing) {
+                ("skill", true, true) => "Photography guidance response recorded; continuing analysis",
+                ("skill", true, false) => "Photography guidance response recorded",
+                ("read_skill_resource", true, true) => "Reference material response recorded; continuing analysis",
+                ("read_skill_resource", true, false) => "Reference material response recorded",
+                _ => planned(activity.name()),
+            }
         };
         tr(source).to_owned()
     } else {
@@ -199,8 +246,9 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
         activity.result.is_some_and(|result| result["display_write_state"] == "applying")
             || activities.last().is_some_and(|last| last.name() == "apply_edit_plan")
     });
-    let mut label = if let Some(activity) = write {
-        let write_label = tr(activity.write_label(continuing, running).unwrap_or("Adjustment activity"));
+    let write_status = write.and_then(|activity| activity.write_status(continuing, running));
+    let mut label = if let Some(status) = write_status {
+        let write_label = tr(status.full_label());
         if categories.is_empty() {
             write_label.to_owned()
         } else {
@@ -211,11 +259,11 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     } else {
         label
     };
-    let mut caption = if let Some(activity) = write.filter(|_| !categories.is_empty()) {
+    let mut caption = if let Some(status) = write_status.filter(|_| !categories.is_empty()) {
         format!(
             "{} · {}",
             tr(if categories.len() == 1 { "1 type" } else { "{count} types" }).replace("{count}", &categories.len().to_string()),
-            tr(compact_write(activity.write_label(continuing, running).unwrap_or("Adjustment activity")))
+            tr(status.compact_label())
         )
     } else {
         label.clone()
@@ -236,7 +284,7 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     }
     let failure = activities.iter().find(|activity| activity.failed());
     if let Some(activity) = failure {
-        let reason = tr(activity.write_label(false, running).unwrap_or_else(|| failure_label(activity.name())));
+        let reason = tr(activity.write_status(false, running).map(WriteStatus::full_label).unwrap_or_else(|| failure_label(activity.name())));
         let photo_reads = activities.iter().any(|activity| category(activity.name()).is_some());
         if photo_reads {
             if categories.is_empty() && complete {
@@ -262,15 +310,19 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
         .open(open)
         .show(ui, |ui| {
             for activity in activities {
-                let label = if let Some(label) = activity.write_label(continuing, running) {
-                    label
+                if activity.not_executed() {
+                    ui.label(format!("{} · {}", tr(tool_activity(activity.name())), tr("Tool was not executed")));
+                    continue;
+                }
+                let label = if let Some(status) = activity.write_status(continuing, running) {
+                    status.full_label()
                 } else if activity.failed() {
                     failure_label(activity.name())
                 } else if activity.succeeded() {
                     completed(activity.name())
                 } else if activity.result.is_none() && continuing {
                     planned(activity.name())
-                } else if activity.result.is_none() || activity.result.is_some_and(|result| result["display_outcome"] == "not_executed") {
+                } else if activity.result.is_none() {
                     "Tool was not executed"
                 } else {
                     tool_activity(activity.name())
@@ -282,65 +334,40 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     let _ = header.header_response.on_hover_text(label);
 }
 
-fn compact_write(label: &str) -> &str {
-    match label {
-        "Preparing adjustments" => "Preparing edits",
-        "Applying adjustments" => "Applying edits",
-        "Adjustments applied" => "Edits applied",
-        "Adjustments applied; awaiting confirmation" => "Applied; confirming",
-        "Adjustments applied; feedback unconfirmed" => "Applied; no receipt",
-        "Adjustments applied; feedback not delivered" => "Applied; send failed",
-        "Adjustments were not applied: plan rejected" => "Plan rejected",
-        "Adjustments were not applied: rendering failed" => "Render failed",
-        "Adjustments were not applied" => "Not applied",
-        _ => label,
-    }
+struct ToolDescriptor {
+    photo_information: bool,
+    planned: &'static str,
+    completed: &'static str,
+    failure: &'static str,
+}
+
+fn descriptor(name: &str) -> Option<ToolDescriptor> {
+    let (photo_information, planned, completed, failure) = match name {
+        "get_photo_state" => (true, "Preparing to view photo state", "Viewed photo state", "Reading photo state failed"),
+        "list_edit_controls" => {
+            (true, "Preparing to view adjustable parameters", "Viewed adjustable parameters", "Reading adjustable parameters failed")
+        }
+        "get_current_preview" => (true, "Preparing to view current appearance", "Viewed current appearance", "Reading current appearance failed"),
+        "get_photo_histogram" => (true, "Preparing to read histogram", "Read histogram", "Reading histogram failed"),
+        "list_manual_masks" => (true, "Preparing to view local masks", "Viewed local masks", "Reading local masks failed"),
+        "sample_photo_color" => (true, "Preparing to sample colors", "Sampled colors", "Color sampling failed"),
+        "skill" => (false, "Preparing to read photography guidance", "Read photography guidance", "Photography guidance unavailable"),
+        "read_skill_resource" => (false, "Preparing to read reference material", "Read reference material", "Reference material unavailable"),
+        "apply_edit_plan" => (false, "Preparing adjustments", "Prepare photo adjustments", "Tool execution failed"),
+        _ => return None,
+    };
+    Some(ToolDescriptor { photo_information, planned, completed, failure })
 }
 
 fn category(name: &str) -> Option<&str> {
-    match name {
-        "get_photo_state" | "list_edit_controls" | "get_current_preview" | "get_photo_histogram" | "list_manual_masks" | "sample_photo_color" => {
-            Some(name)
-        }
-        _ => None,
-    }
+    descriptor(name).is_some_and(|tool| tool.photo_information).then_some(name)
 }
 fn planned(name: &str) -> &str {
-    match name {
-        "get_photo_state" => "Preparing to view photo state",
-        "list_edit_controls" => "Preparing to view adjustable parameters",
-        "get_current_preview" => "Preparing to view current appearance",
-        "get_photo_histogram" => "Preparing to read histogram",
-        "list_manual_masks" => "Preparing to view local masks",
-        "sample_photo_color" => "Preparing to sample colors",
-        "skill" => "Preparing to read photography guidance",
-        "read_skill_resource" => "Preparing to read reference material",
-        "apply_edit_plan" => "Preparing adjustments",
-        _ => tool_activity(name),
-    }
+    descriptor(name).map(|tool| tool.planned).unwrap_or_else(|| tool_activity(name))
 }
 fn completed(name: &str) -> &str {
-    match name {
-        "get_photo_state" => "Viewed photo state",
-        "list_edit_controls" => "Viewed adjustable parameters",
-        "get_current_preview" => "Viewed current appearance",
-        "get_photo_histogram" => "Read histogram",
-        "list_manual_masks" => "Viewed local masks",
-        "sample_photo_color" => "Sampled colors",
-        _ => tool_activity(name),
-    }
+    descriptor(name).map(|tool| tool.completed).unwrap_or_else(|| tool_activity(name))
 }
-
 fn failure_label(name: &str) -> &str {
-    match name {
-        "get_photo_state" => "Reading photo state failed",
-        "list_edit_controls" => "Reading adjustable parameters failed",
-        "get_current_preview" => "Reading current appearance failed",
-        "get_photo_histogram" => "Reading histogram failed",
-        "list_manual_masks" => "Reading local masks failed",
-        "sample_photo_color" => "Color sampling failed",
-        "skill" => "Photography guidance unavailable",
-        "read_skill_resource" => "Reference material unavailable",
-        _ => "Tool execution failed",
-    }
+    descriptor(name).map_or("Tool execution failed", |tool| tool.failure)
 }

@@ -1890,7 +1890,7 @@ fn close_pending_tools(messages: &mut Vec<Value>, outcome: &str) {
         }
     }
     for (id, owner) in pending {
-        messages.push(json!({"role":"tool","tool_call_id":id,"text":json!({"outcome":if outcome=="cancelled" {"cancelled"} else {"failed"},"executed":false,"reason_code":"ended_before_tool_execution"}).to_string(),"local_round_id":owner.get("local_round_id"),"stage":owner.get("stage"),"model_call_id":owner.get("model_call_id"),"complete_state":"complete","display_kind":"tool_result"}));
+        messages.push(json!({"role":"tool","tool_call_id":id,"text":json!({"outcome":if outcome=="cancelled" {"cancelled"} else {"failed"},"executed":false,"reason_code":"ended_before_tool_execution"}).to_string(),"local_round_id":owner.get("local_round_id"),"stage":owner.get("stage"),"model_call_id":owner.get("model_call_id"),"complete_state":"complete","display_kind":"tool_result","display_outcome":"not_executed"}));
     }
 }
 
