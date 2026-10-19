@@ -1075,7 +1075,7 @@ impl State {
             .get_mut(&photo)
             .ok_or("AI 会话不存在。")?
             .messages
-            .push(json!({"role":"tool","text":result["text"],"images":result["images"],"tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":request,"stage":stage,"model_call_id":model_call,"complete_state":"complete","local_message_id":format!("{}-tool-{request}",local_round_id.as_str())}));
+            .push(json!({"role":"tool","text":result["text"],"images":result["images"],"tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":request,"stage":stage,"model_call_id":model_call,"display_outcome":"succeeded","tool_name":name,"complete_state":"complete","local_message_id":format!("{}-tool-{request}",local_round_id.as_str())}));
         if let Some(record) =
             self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == local_round_id.as_str()))
             && let Some(fact) = record
