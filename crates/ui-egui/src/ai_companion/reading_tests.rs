@@ -33,7 +33,7 @@ fn history_with_rounds(messages: &[Value], rounds: &[Value]) -> Headless {
     h
 }
 
-fn progress_live() -> (Headless, mpsc::Receiver<network::Request>, mpsc::SyncSender<network::Event>, String) {
+pub(super) fn progress_live() -> (Headless, mpsc::Receiver<network::Request>, mpsc::SyncSender<network::Event>, String) {
     let mut h = history(&[]);
     let photo = h.app.session.active().unwrap();
     let (connection, requests, events) = network::test_connection();

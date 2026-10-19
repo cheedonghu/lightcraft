@@ -22,8 +22,15 @@ pub(super) fn append_result(messages: &mut Vec<Value>, payload: &Value, round: &
     if let Some(previous) = messages.iter().find(|m| m["role"] == "tool" && m["tool_call_id"] == id) {
         return if previous["text"] == text { Ok(()) } else { Err(invalid()) };
     }
-    messages.push(json!({"role":"tool","text":text,"tool_call_id":id,"local_round_id":round,"stage":stage,
-        "model_call_id":model_call,"complete_state":"complete","display_kind":"tool_result","local_message_id":format!("{round}-knowledge-{id}")}));
+    let failure = serde_json::from_str::<Value>(text)
+        .ok()
+        .is_some_and(|result| matches!(result["error"].as_str(), Some("knowledge_unavailable" | "knowledge_limit")));
+    let mut result = json!({"role":"tool","text":text,"tool_call_id":id,"local_round_id":round,"stage":stage,
+        "model_call_id":model_call,"complete_state":"complete","display_kind":"tool_result","tool_name":name,"local_message_id":format!("{round}-knowledge-{id}")});
+    if failure {
+        result["display_outcome"] = json!("failed");
+    }
+    messages.push(result);
     Ok(())
 }
 

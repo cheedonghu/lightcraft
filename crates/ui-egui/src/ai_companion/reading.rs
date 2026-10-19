@@ -9,6 +9,7 @@ pub(super) struct RoundSummary {
     pub legacy_completed: bool,
     pub final_message: Option<String>,
     pub notice: Option<String>,
+    pub ending: Option<&'static str>,
 }
 impl RoundSummary {
     pub(super) fn from_record(record: &Value) -> Self {
@@ -18,6 +19,15 @@ impl RoundSummary {
             legacy_completed: terminal == Some("completed") && record.get("final_message_id").is_none(),
             final_message: record["final_message_id"].as_str().filter(|id| id.len() <= 512 && !id.chars().any(char::is_control)).map(str::to_owned),
             notice: record["terminal_notice"].as_str().map(|notice| notice.chars().take(1024).collect()),
+            ending: match (terminal, record.pointer("/backend_terminal/reason_code").and_then(Value::as_str)) {
+                (Some("completed"), _) | (None, _) => None,
+                (Some("cancelled"), _) | (_, Some("user_stop" | "execution_cancelled")) => Some("Stopped"),
+                (Some("timed_out"), _) | (_, Some("round_timed_out" | "delivery_timed_out")) => Some("Timed out"),
+                (Some("disconnected"), _) | (_, Some("client_disconnected" | "backend_stopped" | "network_failure")) => {
+                    Some("Connection interrupted")
+                }
+                _ => Some("Processing incomplete"),
+            },
         }
     }
     pub(super) fn bytes(&self) -> usize {
@@ -170,13 +180,19 @@ pub(super) fn show(
         let has_pending = running && !conversation.pending.is_empty();
         if group.iter().any(|row| Some(row.id()) != final_id) || has_pending {
             let has_tools = group.iter().any(|row| row.message.is_some_and(progress::has_tools));
-            process(ui, round, running, has_tools, |ui| {
+            let failures = group.iter().filter(|row| row.message.is_some_and(progress::failed)).count();
+            process(ui, round, running, has_tools, failures, |ui| {
                 let process_rows: Vec<_> = group.iter().filter(|row| Some(row.id()) != final_id).collect();
-                progress::show(ui, &process_rows, attachments, running && conversation.pending.is_empty());
+                progress::show(ui, &process_rows, attachments, running && conversation.pending.is_empty(), summary.and_then(|s| s.ending));
                 if has_pending {
                     pending(ui, conversation);
                 }
             });
+        }
+        // Human failure facts remain visible even if the user folds the process again.
+        let notices: BTreeSet<_> = group.iter().filter_map(|row| row.message.and_then(progress::failure_notice)).collect();
+        for notice in notices {
+            ui.label(tr(notice));
         }
         pending_shown |= has_pending;
         for row in group.iter().filter(|row| Some(row.id()) == final_id) {
@@ -192,7 +208,7 @@ pub(super) fn show(
     }
     if !pending_shown && !conversation.pending.is_empty() {
         if let Some(round) = active {
-            process(ui, round, true, false, |ui| pending(ui, conversation));
+            process(ui, round, true, false, 0, |ui| pending(ui, conversation));
         } else {
             pending(ui, conversation);
         }
@@ -203,13 +219,15 @@ pub(super) fn show(
     }
 }
 
-fn process(ui: &mut egui::Ui, round: &str, running: bool, has_tools: bool, body: impl FnOnce(&mut egui::Ui)) {
+fn process(ui: &mut egui::Ui, round: &str, running: bool, has_tools: bool, failures: usize, body: impl FnOnce(&mut egui::Ui)) {
     // Changing the terminal part of the ID resets even a manually opened active
     // group exactly once at completion; subsequent manual expansion is retained.
     let title = if has_tools { tr("Processing history · contains tool activity") } else { tr("Processing history") };
+    let open = progress::open_for_failure(ui, egui::Id::new(("ai-process-failure-open", round, failures)), failures > 0);
     let header = egui::CollapsingHeader::new(progress::single_line(ui, egui::RichText::new(title).weak()))
         .id_salt(("ai-process", round, running))
         .default_open(running)
+        .open(open)
         .show(ui, |ui| {
             ui.scope(|ui| {
                 ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("ai-process-running"), running));

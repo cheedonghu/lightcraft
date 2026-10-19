@@ -15,6 +15,34 @@ pub(super) fn has_tools(message: &Value) -> bool {
     message["role"] == "tool" || message["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty())
 }
 
+pub(super) fn failed(message: &Value) -> bool {
+    message["display_outcome"] == "failed"
+        || matches!(message["display_write_state"].as_str(), Some("validation_failed" | "render_failed"))
+        || message["display_delivery_state"] == "failed"
+}
+
+pub(super) fn failure_notice(message: &Value) -> Option<&str> {
+    if !failed(message) {
+        return None;
+    }
+    Some(match message["display_write_state"].as_str() {
+        Some("validation_failed") => "Adjustments were not applied: plan rejected",
+        Some("render_failed") => "Adjustments were not applied: rendering failed",
+        Some("published") if message["display_delivery_state"] == "failed" => "Adjustments applied; feedback not delivered",
+        _ => failure_label(message["tool_name"].as_str().unwrap_or_default()),
+    })
+}
+
+/// Set an existing egui fold once for each newly observed failure, preserving later manual choices.
+pub(super) fn open_for_failure(ui: &egui::Ui, id: egui::Id, failed: bool) -> Option<bool> {
+    if failed && !ui.ctx().data(|data| data.get_temp::<bool>(id)).unwrap_or(false) {
+        ui.ctx().data_mut(|data| data.insert_temp(id, true));
+        Some(true)
+    } else {
+        None
+    }
+}
+
 struct Activity<'a> {
     owner: &'a Value,
     call: &'a Value,
@@ -33,6 +61,9 @@ impl Activity<'_> {
     fn succeeded(&self) -> bool {
         // Completion alone also describes cancelled/unexecuted protocol results.
         self.result.is_some_and(|result| result["display_outcome"] == "succeeded")
+    }
+    fn failed(&self) -> bool {
+        self.result.is_some_and(failed)
     }
     fn write_label(&self, continuing: bool, running: bool) -> Option<&'static str> {
         if self.name() != "apply_edit_plan" {
@@ -55,7 +86,7 @@ impl Activity<'_> {
     }
 }
 
-pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attachments::Attachments, continuing: bool) {
+pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attachments::Attachments, continuing: bool, ending: Option<&str>) {
     let mut index = 0;
     while let Some(row) = rows.get(index) {
         let Some(message) = row.message.filter(|message| row.fragment.is_none() && message["role"] == "assistant" && has_tools(message)) else {
@@ -94,12 +125,12 @@ pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attac
             }
             end += 1;
         }
-        segment(ui, row, &activities, continuing && end == rows.len());
+        segment(ui, row, &activities, continuing && end == rows.len(), ending);
         index = end;
     }
 }
 
-fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], continuing: bool) {
+fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], continuing: bool, ending: Option<&str>) {
     let running = ui.ctx().data(|data| data.get_temp::<bool>(egui::Id::new("ai-process-running"))).unwrap_or(false);
     let categories: BTreeSet<_> =
         activities.iter().filter(|activity| activity.succeeded()).filter_map(|activity| category(activity.name())).collect();
@@ -116,7 +147,7 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
         };
         tr(template).replace("{count}", &categories.len().to_string())
     } else if activities.iter().any(|activity| category(activity.name()).is_some()) {
-        tr("Photo information activity").to_owned()
+        tr(if ending.is_some() { "Photo information reading incomplete" } else { "Photo information activity" }).to_owned()
     } else if let Some(activity) = activities.iter().rev().find(|activity| matches!(activity.name(), "skill" | "read_skill_resource")) {
         let source = match (activity.name(), activity.result.is_some(), continuing) {
             ("skill", true, true) => "Photography guidance response recorded; continuing analysis",
@@ -142,17 +173,34 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     } else {
         label
     };
+    let failure = activities.iter().find(|activity| activity.failed());
+    let label = if let Some(activity) = failure {
+        let reason = tr(activity.write_label(false, running).unwrap_or_else(|| failure_label(activity.name())));
+        let photo_reads = activities.iter().any(|activity| category(activity.name()).is_some());
+        let info = if categories.is_empty() && photo_reads { tr("Photo information reading incomplete") } else { &label };
+        if photo_reads { format!("{info} · {reason}") } else { reason.to_owned() }
+    } else {
+        label
+    };
+    let label = if let Some(ending) = ending { format!("{label} · {}", tr(ending)) } else { label };
+    let failures = activities.iter().filter(|activity| activity.failed()).count();
+    let open = open_for_failure(ui, egui::Id::new(("ai-tool-failure-open", first.round(), first.id(), failures)), failure.is_some());
     let header = egui::CollapsingHeader::new(single_line(ui, label.as_str()))
         .id_salt(("ai-tool-segment", first.round(), first.id()))
         .default_open(false)
+        .open(open)
         .show(ui, |ui| {
             for activity in activities {
                 let label = if let Some(label) = activity.write_label(continuing, running) {
                     label
+                } else if activity.failed() {
+                    failure_label(activity.name())
                 } else if activity.succeeded() {
                     completed(activity.name())
-                } else if activity.result.is_none() {
+                } else if activity.result.is_none() && continuing {
                     planned(activity.name())
+                } else if activity.result.is_none() || activity.result.is_some_and(|result| result["display_outcome"] == "not_executed") {
+                    "Tool was not executed"
                 } else {
                     tool_activity(activity.name())
                 };
@@ -194,5 +242,19 @@ fn completed(name: &str) -> &str {
         "list_manual_masks" => "Viewed local masks",
         "sample_photo_color" => "Sampled colors",
         _ => tool_activity(name),
+    }
+}
+
+fn failure_label(name: &str) -> &str {
+    match name {
+        "get_photo_state" => "Reading photo state failed",
+        "list_edit_controls" => "Reading adjustable parameters failed",
+        "get_current_preview" => "Reading current appearance failed",
+        "get_photo_histogram" => "Reading histogram failed",
+        "list_manual_masks" => "Reading local masks failed",
+        "sample_photo_color" => "Color sampling failed",
+        "skill" => "Photography guidance unavailable",
+        "read_skill_resource" => "Reference material unavailable",
+        _ => "Tool execution failed",
     }
 }
