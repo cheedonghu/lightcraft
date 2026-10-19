@@ -34,6 +34,8 @@ mod i18n;
 #[path = "ai_companion/identity_tests.rs"]
 mod identity_tests;
 mod interrupted;
+#[cfg(test)]
+mod interruption_progress_tests;
 mod knowledge;
 mod legacy;
 #[cfg(test)]
@@ -732,7 +734,16 @@ impl State {
             }
             return Ok(Value::Null);
         }
-        self.finish(photo, "Stopped generating. Keeping the latest complete result.");
+        let published = self.jobs.get(&photo).is_some_and(|job| {
+            self.conversations.get(&photo).is_some_and(|conversation| {
+                conversation
+                    .records
+                    .iter()
+                    .any(|record| record["local_round_id"] == job.identity.local_round_id.as_str() && errors::published(record))
+            })
+        });
+        let photo_state = if published { "The latest complete edit is kept." } else { "The photo remains at this round's starting settings." };
+        self.finish(photo, &format!("Stopped generating. Keeping the latest complete result.\n{photo_state}"));
         Ok(Value::Null)
     }
     fn disconnected(&mut self, photo: PhotoId, diagnostic: &str) {
@@ -1110,35 +1121,47 @@ impl State {
             return Err("AI 读取版本不匹配。".into());
         }
         let snapshot = job.snapshot.as_ref().ok_or("实际照片预览尚未就绪。")?;
+        if !matches!(
+            name,
+            "get_photo_state" | "list_edit_controls" | "get_current_preview" | "get_photo_histogram" | "list_manual_masks" | "sample_photo_color"
+        ) {
+            return Err("AI 请求了未开放的工具。".into());
+        }
         let mut images = json!([]);
-        // Only dispatch is timed: persistence, network delivery and model waiting
-        // happen after this interval and cannot inflate a saved historical value.
+        // Time only actual tool dispatch, including an attempted failure.
         let started = Instant::now();
-        let text = match name {
-            "get_photo_state" => json!({"photo_revision":job.checkpoint.revision,"settings":job.checkpoint.expected}),
-            "list_edit_controls" => {
-                json!({"controls":lightcraft_engine::companion::control_list(&job.checkpoint.expected,&snapshot.context.info),"edit_schemas":lightcraft_engine::companion::operation_schemas(&job.checkpoint.expected),"frame_id":snapshot.context.frame_id})
-            }
-            "get_current_preview" => {
-                images = json!([{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]);
-                json!({"photo_revision":job.checkpoint.revision,"width":snapshot.preview["width"],"height":snapshot.preview["height"],"frame_id":snapshot.context.frame_id})
-            }
-            "get_photo_histogram" => {
-                let rendered = snapshot.result.rendered.as_ref().map_err(Clone::clone)?;
-                let (shadow, highlight) = rendered.histogram.clipping();
-                json!({"photo_revision":job.checkpoint.revision,"space":"display_srgb","histogram":rendered.histogram,"mean_luma":rendered.histogram.mean_luma(),"shadow_clipped":shadow,"highlight_clipped":highlight})
-            }
-            "list_manual_masks" => {
-                json!({"masks":job.checkpoint.expected.masks.iter().filter(|m|lightcraft_engine::companion::is_manual(m)).map(|m|json!({"ref":format!("mask-{}",m.id),"mask":m})).collect::<Vec<_>>(),"frame_id":snapshot.context.frame_id,"coordinate_space":"native_normalized"})
-            }
-            "sample_photo_color" => {
-                let args = payload.get("args").ok_or("取样参数缺失。")?;
-                lightcraft_engine::companion::sample(&snapshot.context, &job.checkpoint.expected, args)?
-            }
-            _ => return Err("AI 请求了未开放的工具。".into()),
-        };
+        let text = (|| -> Result<Value, String> {
+            Ok(match name {
+                "get_photo_state" => json!({"photo_revision":job.checkpoint.revision,"settings":job.checkpoint.expected}),
+                "list_edit_controls" => {
+                    json!({"controls":lightcraft_engine::companion::control_list(&job.checkpoint.expected,&snapshot.context.info),"edit_schemas":lightcraft_engine::companion::operation_schemas(&job.checkpoint.expected),"frame_id":snapshot.context.frame_id})
+                }
+                "get_current_preview" => {
+                    images = json!([{"mime_type":"image/jpeg","data":snapshot.preview["data_base64"]}]);
+                    json!({"photo_revision":job.checkpoint.revision,"width":snapshot.preview["width"],"height":snapshot.preview["height"],"frame_id":snapshot.context.frame_id})
+                }
+                "get_photo_histogram" => {
+                    let rendered = snapshot.result.rendered.as_ref().map_err(Clone::clone)?;
+                    let (shadow, highlight) = rendered.histogram.clipping();
+                    json!({"photo_revision":job.checkpoint.revision,"space":"display_srgb","histogram":rendered.histogram,"mean_luma":rendered.histogram.mean_luma(),"shadow_clipped":shadow,"highlight_clipped":highlight})
+                }
+                "list_manual_masks" => {
+                    json!({"masks":job.checkpoint.expected.masks.iter().filter(|m|lightcraft_engine::companion::is_manual(m)).map(|m|json!({"ref":format!("mask-{}",m.id),"mask":m})).collect::<Vec<_>>(),"frame_id":snapshot.context.frame_id,"coordinate_space":"native_normalized"})
+                }
+                "sample_photo_color" => {
+                    let args = payload.get("args").ok_or("取样参数缺失。")?;
+                    lightcraft_engine::companion::sample(&snapshot.context, &job.checkpoint.expected, args)?
+                }
+                _ => return Err("AI 请求了未开放的工具。".into()),
+            })
+        })();
         let elapsed_us = u64::try_from(started.elapsed().as_micros()).ok();
-        let result = json!({"text":text.to_string(),"images":images});
+        let result = match &text {
+            Ok(text) => json!({"text":text.to_string(),"images":images}),
+            Err(error) => {
+                json!({"text":json!({"outcome":"failed","executed":true,"reason_code":"tool_failed","message":error}).to_string(),"images":[]})
+            }
+        };
         let round = job.round.clone();
         let revision = job.checkpoint.revision;
         let local_round_id = job.identity.local_round_id.clone();
@@ -1160,7 +1183,7 @@ impl State {
             .get_mut(&photo)
             .ok_or("AI 会话不存在。")?
             .messages
-            .push(json!({"role":"tool","text":result["text"],"images":result["images"],"tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":request,"stage":stage,"model_call_id":model_call,"display_outcome":"succeeded","display_elapsed_us":elapsed_us,"tool_name":name,"complete_state":"complete","local_message_id":format!("{}-tool-{request}",local_round_id.as_str())}));
+            .push(json!({"role":"tool","text":result["text"],"images":result["images"],"tool_call_id":id,"local_round_id":local_round_id,"tool_request_id":request,"stage":stage,"model_call_id":model_call,"display_outcome":if text.is_ok(){"succeeded"}else{"failed"},"display_elapsed_us":elapsed_us,"tool_name":name,"complete_state":"complete","local_message_id":format!("{}-tool-{request}",local_round_id.as_str())}));
         if let Some(record) =
             self.conversations.get_mut(&photo).and_then(|c| c.records.iter_mut().find(|r| r["local_round_id"] == local_round_id.as_str()))
             && let Some(fact) = record
@@ -1168,10 +1191,11 @@ impl State {
                 .and_then(Value::as_array_mut)
                 .and_then(|requests| requests.iter_mut().find(|r| r["tool_request_id"] == request))
         {
-            fact["outcome"] = json!("succeeded");
+            fact["outcome"] = json!(if text.is_ok() { "succeeded" } else { "failed" });
             fact["result_message_id"] = json!(format!("{}-tool-{request}", local_round_id.as_str()));
         }
         self.save(app, photo)?;
+        text?;
         self.send(
             format!("/v1/rounds/{round}/tool-results"),
             json!({"tool_request_id":request,"photo_revision":revision,"outcome":"succeeded","result":result}),

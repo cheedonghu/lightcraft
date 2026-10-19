@@ -331,7 +331,13 @@ fn uncorrelated_feedback_failure_cannot_claim_every_initial_and_correction_recei
 
 fn open_process(h: &mut Headless, round: &str) {
     if !h.app.widgets.iter().any(|(id, _)| id.starts_with("button:aiToolSegment:")) {
-        assert_eq!(h.request("ui.clickWidget", json!({"id":format!("button:aiProcess:{round}")}), Duration::from_secs(10))["ok"], true);
+        let id = format!("button:aiProcess:{round}");
+        // Automatic failure expansion adds readable content without changing the
+        // reader's scroll intent. Scroll to the actual process before toggling.
+        super::panel_tests::reachable(h, &id, 1.0);
+        if !h.app.widgets.iter().any(|(id, _)| id.starts_with("button:aiToolSegment:")) {
+            assert_eq!(h.request("ui.clickWidget", json!({"id":id}), Duration::from_secs(10))["ok"], true);
+        }
     }
     for _ in 0..4 {
         h.step();
