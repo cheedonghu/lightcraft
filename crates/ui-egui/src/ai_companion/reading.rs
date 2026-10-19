@@ -186,13 +186,7 @@ pub(super) fn show(
             } else {
                 adjacent_start
                     && rows.get(index - 1).is_some_and(|previous| {
-                        previous.fragment.is_none()
-                            && previous.message.is_some_and(|message| {
-                                message["role"] == "user"
-                                    || execution_feedback(message)
-                                    || previous.round().is_some_and(|previous| previous != round)
-                                    || (message["role"] == "assistant" && message["text"].as_str().is_some_and(|text| !text.trim().is_empty()))
-                            })
+                        progress::boundary(previous) || (previous.fragment.is_none() && previous.round().is_some_and(|previous| previous != round))
                     })
             };
             let end_known = end != history_len || !history_continues;
