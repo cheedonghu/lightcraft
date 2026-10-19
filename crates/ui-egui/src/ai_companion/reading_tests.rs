@@ -44,6 +44,7 @@ pub(super) fn progress_live() -> (Headless, mpsc::Receiver<network::Request>, mp
     let creation = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
     events.send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"progress-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":creation.identity.scope.library_generation},"state":"awaiting_input"}}) }).unwrap();
     native_history_tests::outgoing(&mut h, &requests, "/input");
+    events.send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"progress-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":creation.body["photo_ref"],"state":"analyzing_initial"}}) }).unwrap();
     (h, requests, events, creation.identity.local_round_id.as_str().to_owned())
 }
 
@@ -66,7 +67,7 @@ fn photo_read_progress_replaces_paired_records_and_waits_truthfully_for_model() 
     assert!(!painted.contains("Viewing photo state") && !painted.contains("Tool response recorded."));
     let progress_widgets: Vec<_> = h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:aiToolSegment:")).collect();
     assert_eq!(progress_widgets.len(), 1, "request and result share one line");
-    assert!(h.painted_text().join(" ").contains("contains tool activity"));
+    assert!(h.painted_text().join(" ").contains("Processing · tool activity"));
     h.app.run("ai.stop", json!({})).unwrap();
 }
 
@@ -147,7 +148,7 @@ fn six_read_categories_deduplicate_and_new_body_preserves_separate_guidance_acti
         h.step();
     }
     let painted = h.painted_text().join(" ");
-    assert!(painted.contains("Keep the natural colors.") && painted.contains("contains tool activity"));
+    assert!(painted.contains("Keep the natural colors.") && painted.contains("Processing · tool activity"));
     assert!(!painted.contains("Viewed 6"), "normal completion folds the process");
     assert_eq!(h.request("ui.clickWidget", json!({"id":format!("button:aiProcess:{local_round}")}), Duration::from_secs(10))["ok"], true);
     for _ in 0..4 {
@@ -196,7 +197,16 @@ fn photo_tool_single_line_stays_within_bilingual_narrow_panel() {
             assert!(segment.height() < 30.0, "one line must stay one line");
             let expected = if language == crate::i18n::Locale::ZhHans { "查看了 1 项照片信息 · " } else { "Viewed 1 info type · " };
             assert!(h.painted_text().join(" ").contains(expected));
+            let tool_hint = if language == crate::i18n::Locale::ZhHans { "含工具记录" } else { "tool activity" };
+            let mut visible_outer_hint = false;
             for shape in h.view.painted_shapes() {
+                if let egui::epaint::Shape::Text(ref text) = shape
+                    && text.galley.text().contains(tool_hint)
+                {
+                    let glyphs: String = text.galley.rows.iter().flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr)).collect();
+                    assert!(glyphs.contains(tool_hint), "outer process must visibly disclose its tools: {glyphs}");
+                    visible_outer_hint = true;
+                }
                 if let egui::epaint::Shape::Text(text) = shape
                     && text.galley.text().starts_with(expected)
                 {
@@ -207,6 +217,7 @@ fn photo_tool_single_line_stays_within_bilingual_narrow_panel() {
                     );
                 }
             }
+            assert!(visible_outer_hint, "the tool hint must remain in the painted process heading");
             super::redesign_tests::screenshots(&mut h, &format!("tool-progress-{}-{width}", language.code()));
             let inspect = h.request("ui.inspect", json!({}), Duration::from_secs(10));
             assert!(inspect["result"]["perf"]["frameMs"].is_number(), "{inspect}");
@@ -361,7 +372,7 @@ fn chat_requests_align_right_and_replies_left_without_role_labels() {
 #[test]
 fn chat_preview_appears_above_right_aligned_text_for_portrait_and_landscape_photos() {
     for (width, height) in [(80, 120), (160, 80)] {
-        let rgba = lightcraft_raster::Rgba8 { width, height, data: vec![[70, 120, 90, 255]; (width * height) as usize] };
+        let rgba = lightcraft_raster::Rgba8 { width, height, data: vec![[70, 120, 90, 255]; width * height] };
         let jpeg = lightcraft_engine::export::encode_image(
             &rgba,
             &lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Jpeg, ..Default::default() },

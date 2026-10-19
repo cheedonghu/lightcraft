@@ -12,7 +12,7 @@ pub(super) fn tr(source: &str) -> &str {
             "Manage the AI conversation for the selected photo." => "管理当前照片的 AI 对话记录。",
             "Diagnostics" => "诊断",
             "Processing history" => "处理过程",
-            "Processing history · contains tool activity" => "处理过程 · 含工具记录",
+            "Processing · tool activity" => "处理过程 · 含工具记录",
             "Preparing to view photo state" => "准备查看照片状态",
             "Preparing adjustments" => "正在准备调整方案",
             "Applying adjustments" => "正在应用调整",
