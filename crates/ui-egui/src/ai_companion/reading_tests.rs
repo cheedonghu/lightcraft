@@ -4,6 +4,9 @@ use lightcraft_catalog::MemStore;
 use lightcraft_engine::library::LibraryStores;
 
 fn history(messages: &[Value]) -> Headless {
+    history_with_rounds(messages, &[])
+}
+fn history_with_rounds(messages: &[Value], rounds: &[Value]) -> Headless {
     let mut session = lightcraft_engine::Session::new();
     session
         .open_library_in(
@@ -12,7 +15,7 @@ fn history(messages: &[Value]) -> Headless {
         )
         .unwrap();
     let photo = session.active().unwrap();
-    session.save_companion_tail(photo, None, messages, &[], &[], &json!({"schema_version":2})).unwrap();
+    session.save_companion_tail(photo, None, messages, &[], rounds, &json!({"schema_version":2})).unwrap();
     let mut h = Headless::new(LightcraftApp::new(session, crate::Services::default()), [1400.0, 1000.0], 1.0);
     h.app.run("ai.open", json!({})).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -28,6 +31,189 @@ fn history(messages: &[Value]) -> Headless {
         h.step();
     }
     h
+}
+
+fn progress_live() -> (Headless, mpsc::Receiver<network::Request>, mpsc::SyncSender<network::Event>, String) {
+    let mut h = history(&[]);
+    let photo = h.app.session.active().unwrap();
+    let (connection, requests, events) = network::test_connection();
+    h.app.ai.connection = Some(connection);
+    h.app.ai.generation = h.app.session.library_generation();
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"checkbox:aiConsent"}), Duration::from_secs(10))["ok"], true);
+    h.app.run("ai.start", json!({"prompt":"Inspect the photo"})).unwrap();
+    let creation = native_history_tests::outgoing(&mut h, &requests, "/v1/rounds");
+    events.send(network::Event::Server { kind:"round.state".into(), data:json!({"round_id":"progress-round","payload":{"submission_seq":creation.identity.submission_seq,"photo_ref":{"photo_id":photo.0,"library_generation":creation.identity.scope.library_generation},"state":"awaiting_input"}}) }).unwrap();
+    native_history_tests::outgoing(&mut h, &requests, "/input");
+    (h, requests, events, creation.identity.local_round_id.as_str().to_owned())
+}
+
+#[test]
+fn photo_read_progress_replaces_paired_records_and_waits_truthfully_for_model() {
+    let (mut h, requests, events, _) = progress_live();
+    let photo = h.app.session.active().unwrap();
+    events.send(network::Event::Server { kind:"message.completed".into(), data:json!({"round_id":"progress-round","stage":"initial","payload":{"message_id":"read","model_call_id":1,"tool_calls":[{"id":"state","name":"get_photo_state","arguments":{}}]}}) }).unwrap();
+    for _ in 0..4 {
+        h.step();
+    }
+    assert!(h.painted_text().join(" ").contains("Preparing to view photo state"), "{:?}", h.painted_text());
+    events.send(network::Event::Server { kind:"tool.request".into(), data:json!({"round_id":"progress-round","payload":{"tool_call_id":"state","tool_request_id":"state-request","tool_name":"get_photo_state","expected_revision":h.app.session.photo_revision(photo)}}) }).unwrap();
+    native_history_tests::outgoing(&mut h, &requests, "/tool-results");
+    for _ in 0..4 {
+        h.step();
+    }
+    let painted = h.painted_text().join(" ");
+    assert!(painted.contains("Viewed 1 type of photo information; continuing analysis"), "{painted}");
+    assert!(!painted.contains("Viewing photo state") && !painted.contains("Tool response recorded."));
+    let progress_widgets: Vec<_> = h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:aiToolSegment:")).collect();
+    assert_eq!(progress_widgets.len(), 1, "request and result share one line");
+    assert!(h.painted_text().join(" ").contains("contains tool activity"));
+    h.app.run("ai.stop", json!({})).unwrap();
+}
+
+#[test]
+fn six_read_categories_deduplicate_and_new_body_preserves_separate_guidance_activity() {
+    let (mut h, requests, events, local_round) = progress_live();
+    let photo = h.app.session.active().unwrap();
+    let mut frame = Value::Null;
+    for (n, name) in [
+        "get_photo_state",
+        "list_edit_controls",
+        "get_current_preview",
+        "get_photo_histogram",
+        "list_manual_masks",
+        "sample_photo_color",
+        "sample_photo_color",
+        "get_photo_histogram",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let args = if *name == "sample_photo_color" {
+            json!({"purpose":"point_color","point":{"x":if n==5 {0.4} else {0.6},"y":0.5},"frame_id":frame,"coordinate_space":"preview_normalized"})
+        } else {
+            json!({})
+        };
+        events.send(network::Event::Server { kind:"message.completed".into(), data:json!({"round_id":"progress-round","stage":"initial","payload":{"message_id":format!("read-{n}"),"model_call_id":n+1,"tool_calls":[{"id":format!("call-{n}"),"name":name,"arguments":args}]}}) }).unwrap();
+        events.send(network::Event::Server { kind:"tool.request".into(), data:json!({"round_id":"progress-round","payload":{"tool_call_id":format!("call-{n}"),"tool_request_id":format!("request-{n}"),"tool_name":name,"args":args,"expected_revision":h.app.session.photo_revision(photo)}}) }).unwrap();
+        let response = native_history_tests::outgoing(&mut h, &requests, "/tool-results");
+        assert_eq!(response.body["outcome"], "succeeded");
+        if *name == "list_edit_controls" {
+            frame = serde_json::from_str::<Value>(response.body["result"]["text"].as_str().unwrap()).unwrap()["frame_id"].clone();
+        }
+    }
+    for _ in 0..4 {
+        h.step();
+    }
+    assert!(h.painted_text().join(" ").contains("Viewed 6 types of photo information; continuing analysis"), "{:?}", h.painted_text());
+    events
+        .send(network::Event::Server {
+            kind: "text.delta".into(),
+            data: json!({"round_id":"progress-round","payload":{"message_id":"knowledge","delta":"I will consult photography guidance."}}),
+        })
+        .unwrap();
+    events.send(network::Event::Server { kind:"message.completed".into(), data:json!({"round_id":"progress-round","stage":"initial","payload":{"message_id":"knowledge","model_call_id":9,"tool_calls":[{"id":"guide","name":"skill","arguments":{"skill":"private_arguments"}}]}}) }).unwrap();
+    events.send(network::Event::Server { kind:"tool.result".into(), data:json!({"round_id":"progress-round","stage":"initial","payload":{"tool_call_id":"guide","tool_name":"skill","text":"private_guidance","model_call_id":9}}) }).unwrap();
+    for _ in 0..4 {
+        h.step();
+    }
+    let painted = h.painted_text().join(" ");
+    assert!(painted.contains("Photography guidance response recorded; continuing analysis"), "{painted}");
+    assert!(painted.contains("Viewed 6 types of photo information") && !painted.contains("Viewed 7"));
+    assert_eq!(h.app.widgets.iter().filter(|(id, _)| id.starts_with("button:aiToolSegment:")).count(), 2);
+    assert!(!painted.contains("private_"));
+    events
+        .send(network::Event::Server {
+            kind: "text.delta".into(),
+            data: json!({"round_id":"progress-round","payload":{"message_id":"answer","delta":"Keep the natural colors."}}),
+        })
+        .unwrap();
+    events
+        .send(network::Event::Server {
+            kind: "message.completed".into(),
+            data: json!({"round_id":"progress-round","stage":"initial","payload":{"message_id":"answer","model_call_id":10,"tool_calls":[]}}),
+        })
+        .unwrap();
+    events
+        .send(network::Event::Server {
+            kind: "round.ended".into(),
+            data: json!({"round_id":"progress-round","payload":{"terminal_state":"completed"}}),
+        })
+        .unwrap();
+    for _ in 0..5 {
+        h.step();
+    }
+    let painted = h.painted_text().join(" ");
+    assert!(painted.contains("Keep the natural colors.") && painted.contains("contains tool activity"));
+    assert!(!painted.contains("Viewed 6"), "normal completion folds the process");
+    assert_eq!(h.request("ui.clickWidget", json!({"id":format!("button:aiProcess:{local_round}")}), Duration::from_secs(10))["ok"], true);
+    for _ in 0..4 {
+        h.step();
+    }
+    assert!(h.painted_text().join(" ").contains("Viewed 6 types of photo information"));
+}
+
+#[test]
+fn historical_unknown_read_outcome_is_neutral_without_count_time_or_rewriting_context() {
+    let messages = vec![
+        json!({"role":"assistant","text":"Inspecting an older photo.","local_round_id":"old-read","local_message_id":"old-call","tool_calls":[{"id":"old-state","name":"get_photo_state","arguments":{}}]}),
+        json!({"role":"tool","text":"private_old_result","local_round_id":"old-read","local_message_id":"old-result","tool_call_id":"old-state","complete_state":"complete"}),
+        json!({"role":"assistant","text":"Keep the highlights.","local_round_id":"old-read","local_message_id":"old-answer"}),
+    ];
+    let rounds = [json!({"local_round_id":"old-read","stages":[],"local_terminal":"completed","final_message_id":"old-answer"})];
+    let mut h = history_with_rounds(&messages, &rounds);
+    assert_eq!(h.request("ui.clickWidget", json!({"id":"button:aiProcess:old-read"}), Duration::from_secs(10))["ok"], true);
+    for _ in 0..4 {
+        h.step();
+    }
+    let painted = h.painted_text().join(" ");
+    assert!(painted.contains("Photo information activity"), "{painted}");
+    assert!(!painted.contains("incomplete") && !painted.contains("Viewed 1") && !painted.contains("private_old_result"));
+    let photo = h.app.session.active().unwrap();
+    assert_eq!(h.app.session.companion_messages_page(photo, 0, 3).unwrap().records, messages);
+}
+
+#[test]
+fn photo_tool_single_line_stays_within_bilingual_narrow_panel() {
+    let (mut h, requests, events, _) = progress_live();
+    let photo = h.app.session.active().unwrap();
+    events.send(network::Event::Server { kind:"message.completed".into(), data:json!({"round_id":"progress-round","stage":"initial","payload":{"message_id":"narrow","model_call_id":1,"tool_calls":[{"id":"state","name":"get_photo_state","arguments":{}}]}}) }).unwrap();
+    events.send(network::Event::Server { kind:"tool.request".into(), data:json!({"round_id":"progress-round","payload":{"tool_call_id":"state","tool_request_id":"state-request","tool_name":"get_photo_state","expected_revision":h.app.session.photo_revision(photo)}}) }).unwrap();
+    native_history_tests::outgoing(&mut h, &requests, "/tool-results");
+    for language in [crate::i18n::Locale::En, crate::i18n::Locale::ZhHans] {
+        h.app.ui.language = language;
+        for width in [1000.0, 1400.0] {
+            h.size.x = width;
+            for _ in 0..5 {
+                h.step();
+            }
+            let pane = h.app.widgets.iter().find(|(id, _)| id == "ai:messages").unwrap().1;
+            let segment = h.app.widgets.iter().find(|(id, _)| id.starts_with("button:aiToolSegment:")).unwrap().1;
+            assert!(segment.right() <= pane.right() + 1.0, "single-line tool summary must fit: {segment:?} in {pane:?}");
+            assert!(segment.height() < 30.0, "one line must stay one line");
+            let expected = if language == crate::i18n::Locale::ZhHans {
+                "已查看 1 项照片信息，正在继续分析"
+            } else {
+                "Viewed 1 type of photo information; continuing analysis"
+            };
+            assert!(h.painted_text().join(" ").contains(expected));
+            for shape in h.view.painted_shapes() {
+                if let egui::epaint::Shape::Text(text) = shape
+                    && text.galley.text() == expected
+                {
+                    assert!(
+                        text.visual_bounding_rect().right() <= pane.right() + 1.0,
+                        "painted summary must elide rather than be clipped: {:?} in {pane:?}",
+                        text.visual_bounding_rect()
+                    );
+                }
+            }
+            super::redesign_tests::screenshots(&mut h, &format!("tool-progress-{}-{width}", language.code()));
+            let inspect = h.request("ui.inspect", json!({}), Duration::from_secs(10));
+            assert!(inspect["result"]["perf"]["frameMs"].is_number(), "{inspect}");
+            eprintln!("tool-progress {} {width}: {}", language.code(), inspect["result"]["perf"]);
+        }
+    }
+    h.app.run("ai.stop", json!({})).unwrap();
 }
 
 #[test]

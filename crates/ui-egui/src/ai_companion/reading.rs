@@ -1,6 +1,7 @@
 //! Presentation of caller-owned bounded history; never changes model records.
 use super::*;
 mod markdown;
+mod progress;
 
 #[derive(Clone, Default)]
 pub(super) struct RoundSummary {
@@ -43,7 +44,7 @@ impl Row<'_> {
     fn show(&self, ui: &mut egui::Ui, attachments: &mut attachments::Attachments) {
         match (self.message, self.fragment) {
             (Some(message), Some(fragment)) => fragment_row(ui, message, fragment, &self.fallback, attachments),
-            (Some(message), None) => message_row(ui, message, &self.fallback, attachments),
+            (Some(message), None) => message_row(ui, message, &self.fallback, attachments, true),
             (None, Some(fragment)) => {
                 let header = egui::CollapsingHeader::new(tr("Message details unavailable"))
                     .id_salt(("unverified-fragment", &self.fallback))
@@ -168,10 +169,10 @@ pub(super) fn show(
         let running = active == Some(round);
         let has_pending = running && !conversation.pending.is_empty();
         if group.iter().any(|row| Some(row.id()) != final_id) || has_pending {
-            process(ui, round, running, |ui| {
-                for row in group.iter().filter(|row| Some(row.id()) != final_id) {
-                    row.show(ui, attachments);
-                }
+            let has_tools = group.iter().any(|row| row.message.is_some_and(progress::has_tools));
+            process(ui, round, running, has_tools, |ui| {
+                let process_rows: Vec<_> = group.iter().filter(|row| Some(row.id()) != final_id).collect();
+                progress::show(ui, &process_rows, attachments, running && conversation.pending.is_empty());
                 if has_pending {
                     pending(ui, conversation);
                 }
@@ -191,7 +192,7 @@ pub(super) fn show(
     }
     if !pending_shown && !conversation.pending.is_empty() {
         if let Some(round) = active {
-            process(ui, round, true, |ui| pending(ui, conversation));
+            process(ui, round, true, false, |ui| pending(ui, conversation));
         } else {
             pending(ui, conversation);
         }
@@ -202,10 +203,11 @@ pub(super) fn show(
     }
 }
 
-fn process(ui: &mut egui::Ui, round: &str, running: bool, body: impl FnOnce(&mut egui::Ui)) {
+fn process(ui: &mut egui::Ui, round: &str, running: bool, has_tools: bool, body: impl FnOnce(&mut egui::Ui)) {
     // Changing the terminal part of the ID resets even a manually opened active
     // group exactly once at completion; subsequent manual expansion is retained.
-    let header = egui::CollapsingHeader::new(egui::RichText::new(tr("Processing history")).weak())
+    let title = if has_tools { tr("Processing history · contains tool activity") } else { tr("Processing history") };
+    let header = egui::CollapsingHeader::new(progress::single_line(ui, egui::RichText::new(title).weak()))
         .id_salt(("ai-process", round, running))
         .default_open(running)
         .show(ui, |ui| {
@@ -216,6 +218,7 @@ fn process(ui: &mut egui::Ui, round: &str, running: bool, body: impl FnOnce(&mut
             });
         });
     composer_widget(ui, &format!("button:aiProcess:{round}"), header.header_response.rect);
+    let _ = header.header_response.on_hover_text(title);
     ui.add_space(10.0);
 }
 fn pending(ui: &mut egui::Ui, conversation: &Conversation) {
@@ -224,7 +227,7 @@ fn pending(ui: &mut egui::Ui, conversation: &Conversation) {
     }
 }
 
-fn message_row(ui: &mut egui::Ui, message: &Value, fallback: &str, attachments: &mut attachments::Attachments) {
+fn message_row(ui: &mut egui::Ui, message: &Value, fallback: &str, attachments: &mut attachments::Attachments, show_tools: bool) {
     let id = message["local_message_id"].as_str().unwrap_or(fallback);
     let role = message["role"].as_str().unwrap_or("system");
     let text = message["text"].as_str().unwrap_or_default();
@@ -263,7 +266,7 @@ fn message_row(ui: &mut egui::Ui, message: &Value, fallback: &str, attachments: 
                     markdown(ui, if message["display_kind"] == "round_reverted" { tr(visible) } else { visible });
                 }
             }
-            if message["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty()) {
+            if show_tools && message["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty()) {
                 tool(ui, message, id);
             }
         });
