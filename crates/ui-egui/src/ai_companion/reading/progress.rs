@@ -25,14 +25,21 @@ impl Activity<'_> {
         self.call["name"].as_str().or_else(|| self.call["function"]["name"].as_str()).unwrap_or_default()
     }
     fn matches(&self, result: &Value) -> bool {
-        result["tool_call_id"] == self.call["id"]
-            && result["local_round_id"] == self.owner["local_round_id"]
+        self.call["id"].as_str().is_some_and(|id| !id.is_empty() && result["tool_call_id"].as_str() == Some(id))
+            && self.owner["local_round_id"].as_str().is_some_and(|round| !round.is_empty() && result["local_round_id"].as_str() == Some(round))
             && result["stage"] == self.owner["stage"]
             && result["model_call_id"] == self.owner["model_call_id"]
+            && result.get("tool_name").is_none_or(|name| name.as_str() == Some(self.name()))
     }
     fn succeeded(&self) -> bool {
         // Completion alone also describes cancelled/unexecuted protocol results.
         self.result.is_some_and(|result| result["display_outcome"] == "succeeded")
+    }
+    fn elapsed_us(&self) -> Option<u64> {
+        let result = self.result?;
+        // A stored duration alone cannot prove execution. Writes record their
+        // actual publication separately from the proposal's protocol response.
+        (self.succeeded() || result["display_write_state"] == "published").then(|| result["display_elapsed_us"].as_u64()).flatten()
     }
     fn write_label(&self, continuing: bool, running: bool) -> Option<&'static str> {
         if self.name() != "apply_edit_plan" {
@@ -55,15 +62,32 @@ impl Activity<'_> {
     }
 }
 
-pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attachments::Attachments, continuing: bool) {
+pub(super) struct Range {
+    pub start_known: bool,
+    pub end_known: bool,
+}
+
+fn boundary(row: &Row<'_>) -> bool {
+    row.fragment.is_none()
+        && row.message.is_some_and(|message| {
+            message["role"] == "user"
+                || execution_feedback(message)
+                || (message["role"] == "assistant" && message["text"].as_str().is_some_and(|text| !text.trim().is_empty()))
+        })
+}
+
+pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attachments::Attachments, continuing: bool, range: Range) {
     let mut index = 0;
+    let mut beginning_known = range.start_known;
     while let Some(row) = rows.get(index) {
         let Some(message) = row.message.filter(|message| row.fragment.is_none() && message["role"] == "assistant" && has_tools(message)) else {
+            beginning_known = boundary(row);
             row.show(ui, attachments);
             index += 1;
             continue;
         };
         if message["text"].as_str().is_some_and(|text| !text.trim().is_empty()) {
+            beginning_known = true;
             message_row(ui, message, &row.fallback, attachments, false);
         }
         let mut activities = Vec::<Activity<'_>>::new();
@@ -94,15 +118,17 @@ pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attac
             }
             end += 1;
         }
-        segment(ui, row, &activities, continuing && end == rows.len());
+        let ending_known = rows.get(end).map_or(range.end_known, |row| boundary(row));
+        segment(ui, row, &activities, continuing && end == rows.len(), beginning_known && ending_known);
+        beginning_known = false;
         index = end;
     }
 }
 
-fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], continuing: bool) {
+fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], continuing: bool, complete: bool) {
     let running = ui.ctx().data(|data| data.get_temp::<bool>(egui::Id::new("ai-process-running"))).unwrap_or(false);
     let categories: BTreeSet<_> =
-        activities.iter().filter(|activity| activity.succeeded()).filter_map(|activity| category(activity.name())).collect();
+        activities.iter().filter(|activity| complete && activity.succeeded()).filter_map(|activity| category(activity.name())).collect();
     let pending = activities.iter().find(|activity| activity.result.is_none());
     let write = activities.iter().rev().find(|activity| activity.name() == "apply_edit_plan");
     let label = if let Some(activity) = pending.filter(|_| continuing) {
@@ -129,20 +155,46 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     } else {
         tr("Tool activity").to_owned()
     };
-    let label = if let Some(activity) = write.filter(|activity| {
+    let write = write.filter(|activity| {
         activity.result.is_some_and(|result| result["display_write_state"] == "applying")
-            || (pending.is_none() && activities.last().is_some_and(|last| last.name() == "apply_edit_plan"))
-    }) {
+            || activities.last().is_some_and(|last| last.name() == "apply_edit_plan")
+    });
+    let mut label = if let Some(activity) = write {
         let write_label = tr(activity.write_label(continuing, running).unwrap_or("Adjustment activity"));
-        if categories.is_empty() || activity.result.is_some_and(|result| result["display_write_state"] == "applying") {
+        if categories.is_empty() {
             write_label.to_owned()
         } else {
-            format!("{label} · {write_label}")
+            let viewed = tr(if categories.len() == 1 { "Viewed 1 type of photo information" } else { "Viewed {count} types of photo information" })
+                .replace("{count}", &categories.len().to_string());
+            format!("{viewed} · {write_label}")
         }
     } else {
         label
     };
-    let header = egui::CollapsingHeader::new(single_line(ui, label.as_str()))
+    let mut caption = if let Some(activity) = write.filter(|_| !categories.is_empty()) {
+        format!(
+            "{} · {}",
+            tr(if categories.len() == 1 { "1 type" } else { "{count} types" }).replace("{count}", &categories.len().to_string()),
+            tr(compact_write(activity.write_label(continuing, running).unwrap_or("Adjustment activity")))
+        )
+    } else {
+        label.clone()
+    };
+    if !categories.is_empty()
+        && let Some(total) = activities.iter().try_fold(0u64, |total, activity| total.checked_add(activity.elapsed_us()?))
+    {
+        let duration = format!("{:.1}s", total as f64 / 1_000_000.0);
+        label.push_str(&format!(" · {duration}"));
+        // Keep the count and time visible in a narrow pane. The full, precise
+        // description (including the waiting phase) remains the tooltip.
+        caption = tr(if categories.len() == 1 { "Viewed 1 info type · {time}" } else { "Viewed {count} info types · {time}" })
+            .replace("{count}", &categories.len().to_string())
+            .replace("{time}", &duration);
+        if continuing {
+            caption.push_str(tr("; analyzing"));
+        }
+    }
+    let header = egui::CollapsingHeader::new(single_line(ui, caption.as_str()))
         .id_salt(("ai-tool-segment", first.round(), first.id()))
         .default_open(false)
         .show(ui, |ui| {
@@ -161,6 +213,21 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
         });
     composer_widget(ui, &format!("button:aiToolSegment:{}", first.id()), header.header_response.rect);
     let _ = header.header_response.on_hover_text(label);
+}
+
+fn compact_write(label: &str) -> &str {
+    match label {
+        "Preparing adjustments" => "Preparing edits",
+        "Applying adjustments" => "Applying edits",
+        "Adjustments applied" => "Edits applied",
+        "Adjustments applied; awaiting confirmation" => "Applied; confirming",
+        "Adjustments applied; feedback unconfirmed" => "Applied; no receipt",
+        "Adjustments applied; feedback not delivered" => "Applied; send failed",
+        "Adjustments were not applied: plan rejected" => "Plan rejected",
+        "Adjustments were not applied: rendering failed" => "Render failed",
+        "Adjustments were not applied" => "Not applied",
+        _ => label,
+    }
 }
 
 fn category(name: &str) -> Option<&str> {

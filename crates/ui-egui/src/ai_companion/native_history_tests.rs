@@ -1,5 +1,7 @@
 //! Caller-observable native history submission checks, using temporary real files.
 use super::*;
+#[path = "timing_tests.rs"]
+mod timing_tests;
 use lightcraft_catalog::{FsStore, MemStore, Store};
 use lightcraft_engine::library::LibraryStores;
 
