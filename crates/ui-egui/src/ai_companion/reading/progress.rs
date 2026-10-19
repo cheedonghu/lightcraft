@@ -34,6 +34,25 @@ impl Activity<'_> {
         // Completion alone also describes cancelled/unexecuted protocol results.
         self.result.is_some_and(|result| result["display_outcome"] == "succeeded")
     }
+    fn write_label(&self, continuing: bool, running: bool) -> Option<&'static str> {
+        if self.name() != "apply_edit_plan" {
+            return None;
+        }
+        Some(match self.result.and_then(|result| result["display_write_state"].as_str()) {
+            Some("applying") => "Applying adjustments",
+            Some("published") => match self.result.and_then(|result| result["display_delivery_state"].as_str()) {
+                Some("failed") => "Adjustments applied; feedback not delivered",
+                Some("confirmed") => "Adjustments applied",
+                _ if running => "Adjustments applied; awaiting confirmation",
+                _ => "Adjustments applied; feedback unconfirmed",
+            },
+            Some("validation_failed") => "Adjustments were not applied: plan rejected",
+            Some("render_failed") => "Adjustments were not applied: rendering failed",
+            Some("not_executed" | "not_published") => "Adjustments were not applied",
+            _ if self.result.is_none() && continuing => "Preparing adjustments",
+            _ => "Adjustment activity",
+        })
+    }
 }
 
 pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attachments::Attachments, continuing: bool) {
@@ -81,9 +100,11 @@ pub(super) fn show(ui: &mut egui::Ui, rows: &[&Row<'_>], attachments: &mut attac
 }
 
 fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], continuing: bool) {
+    let running = ui.ctx().data(|data| data.get_temp::<bool>(egui::Id::new("ai-process-running"))).unwrap_or(false);
     let categories: BTreeSet<_> =
         activities.iter().filter(|activity| activity.succeeded()).filter_map(|activity| category(activity.name())).collect();
     let pending = activities.iter().find(|activity| activity.result.is_none());
+    let write = activities.iter().rev().find(|activity| activity.name() == "apply_edit_plan");
     let label = if let Some(activity) = pending.filter(|_| continuing) {
         tr(planned(activity.name())).to_owned()
     } else if !categories.is_empty() {
@@ -108,12 +129,27 @@ fn segment(ui: &mut egui::Ui, first: &Row<'_>, activities: &[Activity<'_>], cont
     } else {
         tr("Tool activity").to_owned()
     };
+    let label = if let Some(activity) = write.filter(|activity| {
+        activity.result.is_some_and(|result| result["display_write_state"] == "applying")
+            || (pending.is_none() && activities.last().is_some_and(|last| last.name() == "apply_edit_plan"))
+    }) {
+        let write_label = tr(activity.write_label(continuing, running).unwrap_or("Adjustment activity"));
+        if categories.is_empty() || activity.result.is_some_and(|result| result["display_write_state"] == "applying") {
+            write_label.to_owned()
+        } else {
+            format!("{label} · {write_label}")
+        }
+    } else {
+        label
+    };
     let header = egui::CollapsingHeader::new(single_line(ui, label.as_str()))
         .id_salt(("ai-tool-segment", first.round(), first.id()))
         .default_open(false)
         .show(ui, |ui| {
             for activity in activities {
-                let label = if activity.succeeded() {
+                let label = if let Some(label) = activity.write_label(continuing, running) {
+                    label
+                } else if activity.succeeded() {
                     completed(activity.name())
                 } else if activity.result.is_none() {
                     planned(activity.name())
@@ -145,6 +181,7 @@ fn planned(name: &str) -> &str {
         "sample_photo_color" => "Preparing to sample colors",
         "skill" => "Preparing to read photography guidance",
         "read_skill_resource" => "Preparing to read reference material",
+        "apply_edit_plan" => "Preparing adjustments",
         _ => tool_activity(name),
     }
 }

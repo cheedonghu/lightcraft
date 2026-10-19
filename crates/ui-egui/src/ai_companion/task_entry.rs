@@ -109,7 +109,7 @@ pub(super) fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     } else if stopped {
         "Cancelling…"
     } else {
-        phase_text(&task.phase)
+        app.ai.jobs.get(&task.identity.scope.photo).map(|job| job.phase_text()).unwrap_or_else(|| phase_text(&task.phase))
     })
     .to_owned();
     let terminal = task.terminal.as_deref().map(|s| tr(terminal_text(s)).to_owned());
