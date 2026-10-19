@@ -195,3 +195,12 @@ the initial reports and independent final source rechecks.
 The merger separately reran the new native unexecuted regression (1 passed,
 13.01 s) and interruption family (5 passed, 2.75 s) on the same source tree;
 format and diff checks passed. Other unchanged-tree evidence above is reused.
+
+## Local delivery state
+
+The verified source and final review records are integrated into local `dev`;
+`codex/ai-tool-progress` retains the integration history. No remote push was
+performed. The five clean implementation worktrees were removed. The final
+build cache and native executable remain at
+`target/agent-tool-progress-05/debug/lightcraft` for subsequent local acceptance.
+Only documentation changed after the independently reviewed source tip.

@@ -45,11 +45,11 @@ The explicit local `not_executed` metadata, activity-labelled details, and new n
 
 Reviewed `73c005ecf3780f7a59808a29cbef58920ccde9d3...6323d801`, the originating Q31–Q38/state table/TP01–TP11, canonical client spec, tracker and delivery evidence. Source inspection was read-only; no competing build or real model/data call.
 
-## Implemented incorrectly / partial requirement
+#### Implemented incorrectly / partial requirement
 
 - **[P2] Unexecuted calls lose their actual outcome inside expanded details.** Spec Q34 says “区分失败、停止和未执行”; the state table says “工具明细使用可读活动及实际结果” (originating spec lines 39 and 70). New `crates/ui-egui/src/ai_companion/reading/progress.rs:273–276` recognizes unexecuted results only through `display_outcome == "not_executed"`. However the real termination producer, `ai_companion.rs:1893`, writes `executed:false` inside the retained tool text and no `display_outcome`. Consequently every synthetic closure falls through to generic `tool_activity`, such as “Read photo histogram” / “读取照片直方图”, rather than “Tool was not executed”. For knowledge calls, lines 187–191 additionally call the synthetic cancellation a “Photography guidance response recorded”. Reproduce with the existing stop fixture: emit `message.completed` containing `get_photo_histogram` (or `skill`), stop before its tool request/result, then expand both outer process and inner tool segment. The segment has the stop cause, but its individual activity cannot distinguish an unexecuted call from an actual read. Preserve the structured unexecuted fact in local display metadata (without changing original text/model history), and assert the expanded inner row through the public UI seam. Existing interruption tests open only the outer process, so miss this branch.
 
-## Missing requirements / scope
+#### Missing requirements / scope
 
 No other concrete missing requirement or unrequested behavior identified within the incremental scope. Fixed execution timing, conservative page summaries, category deduplication, actual publication state and normal final-answer/card placement are supported by the inspected implementation. These conclusions do not claim independent execution of the delivery tests.
 
